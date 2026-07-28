@@ -36,6 +36,55 @@
     return (bytes / 1024).toFixed(1) + ' КБ';
   }
 
+  // ---------- Копирование в буфер обмена ----------
+  async function copyTextToClipboard(text) {
+    // navigator.clipboard requires a secure context (https, or localhost) —
+    // the app is often opened over plain http from a LAN address, where
+    // that API is unavailable, so fall back to the older execCommand trick
+    // in that case instead of silently failing.
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      if (!document.execCommand('copy')) {
+        throw new Error('execCommand copy failed');
+      }
+    } finally {
+      document.body.removeChild(ta);
+    }
+  }
+
+  function makeCopyButton(getText, extraClass, title) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy-btn' + (extraClass ? ' ' + extraClass : '');
+    btn.title = title || 'Скопировать';
+    btn.textContent = '📋';
+    btn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      try {
+        await copyTextToClipboard(getText());
+        btn.textContent = '✓';
+        btn.classList.add('copied');
+      } catch (err) {
+        btn.textContent = '⚠';
+      }
+      setTimeout(() => {
+        btn.textContent = '📋';
+        btn.classList.remove('copied');
+      }, 1500);
+    });
+    return btn;
+  }
+
   // ---------- Рендер сообщений ----------
   function renderMessageBody(container, text) {
     const fenceRe = /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g;
@@ -57,6 +106,7 @@
       const code = document.createElement('code');
       code.textContent = match[2].replace(/\n$/, '');
       pre.appendChild(code);
+      pre.appendChild(makeCopyButton(() => code.textContent, 'code-copy-btn', 'Скопировать код'));
       container.appendChild(pre);
       lastIndex = fenceRe.lastIndex;
     }
@@ -124,6 +174,10 @@
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     renderMessageBody(bubble, record.content || '');
+
+    if (record.content && record.content.trim()) {
+      bubble.appendChild(makeCopyButton(() => record.content, 'msg-copy-btn', 'Скопировать сообщение'));
+    }
 
     if (record.files && record.files.length) {
       for (const f of record.files) {

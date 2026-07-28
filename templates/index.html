@@ -84,7 +84,7 @@
   .msg-wrap.user { align-self: flex-end; align-items: flex-end; }
   .msg-wrap.bot { align-self: flex-start; align-items: flex-start; }
 
-  .bubble { padding: 10px 14px; border-radius: 10px; line-height: 1.4; }
+  .bubble { position: relative; padding: 10px 14px; border-radius: 10px; line-height: 1.4; }
   .msg-wrap.user .bubble { background: #2563eb; color: #fff; }
   .msg-wrap.bot .bubble { background: #fff; border: 1px solid #ddd; }
   .msg-wrap.pending .bubble { color: #888; font-style: italic; }
@@ -93,6 +93,7 @@
   .msg-text { white-space: pre-wrap; }
   .msg-text + .msg-text { margin-top: 8px; }
   .code-block {
+    position: relative;
     background: #0d1117;
     color: #e6edf3;
     padding: 10px 12px;
@@ -102,6 +103,33 @@
     margin: 8px 0;
   }
   .code-block code { font-family: Consolas, Monaco, monospace; white-space: pre; }
+
+  /* ---------- Кнопка копирования (карточка целиком + отдельные блоки кода) ---------- */
+  .copy-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    border: none;
+    border-radius: 5px;
+    font-size: 0.78rem;
+    line-height: 1;
+    padding: 4px 6px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s;
+    background: rgba(0, 0, 0, 0.08);
+    color: inherit;
+  }
+  .bubble:hover .copy-btn,
+  .code-block:hover .copy-btn,
+  .copy-btn.copied {
+    opacity: 1;
+  }
+  .copy-btn:hover { background: rgba(0, 0, 0, 0.16); }
+  .msg-wrap.user .bubble .copy-btn { background: rgba(255, 255, 255, 0.28); }
+  .msg-wrap.user .bubble .copy-btn:hover { background: rgba(255, 255, 255, 0.42); }
+  .code-block .copy-btn { background: rgba(255, 255, 255, 0.12); color: #e6edf3; }
+  .code-block .copy-btn:hover { background: rgba(255, 255, 255, 0.22); }
 
   .file-card {
     display: flex;

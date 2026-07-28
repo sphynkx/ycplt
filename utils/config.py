@@ -69,3 +69,8 @@ IMAGE_SERVICE_URL = f"http://{IMAGE_SERVICE_HOST}:{IMAGE_SERVICE_PORT}"
 
 IMAGE_POLL_INTERVAL_SEC = int(os.environ.get("IMAGE_POLL_INTERVAL_SEC", "10"))  # how often the app polls ycplt_img
 IMAGE_HTTP_TIMEOUT_SEC = int(os.environ.get("IMAGE_HTTP_TIMEOUT_SEC", "10"))    # short-request timeout (not generation itself)
+
+# Note: no vision/captioning model config here on purpose — this app only
+# hosts the chat LLM. Image understanding (mode="caption") is a graphics-
+# service capability, submitted as a job to ycplt_img like generation/
+# editing; see utils/image_client.py and routes/chat.py._handle_image_question.

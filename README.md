@@ -25,9 +25,10 @@ utils/
   llm.py                      — loads and calls the GGUF model (llama-cpp-python)
   rag.py                      — optional RAG (FAISS + sentence-transformers)
   codeblocks.py                — extracts fenced code blocks from model replies
-  intent.py                    — LLM-based classifier: is this an image request?
+  intent.py                    — LLM-based classifiers: image request? edit vs question?
   image_client.py               — HTTP client for the ycplt_img job queue
   image_jobs.py                 — background poller resolving pending image jobs
+                                   (generation/edit results, and caption text answers)
   tools.py                      — registry of built-in tools (datetime, calculator, ...)
   tool_router.py                 — LLM-based classifier: does this need a tool?
 templates/
@@ -176,17 +177,25 @@ The unit file uses `EnvironmentFile=/opt/ycplt/.env` and intentionally has no
 - **Image requests** — no toggle needed. If a message asks to draw, generate,
   or edit an image (in any language), it's automatically detected and routed
   to ycplt_img instead of the chat model; see below.
-- **Attach an image to edit it** — the 📎 button next to the composer picks
-  a local image file; sending a message with an image attached always
-  treats it as an edit instruction for that image (see "Editing an uploaded
-  image" below), skipping the generate/chat/tool routing entirely.
+- **Attach an image** — the 📎 button next to the composer picks a local
+  image file; sending a message with an image attached always skips the
+  generate/chat/tool routing and instead classifies the accompanying text
+  as either an edit instruction ("make the background blue") or a
+  question about the image's content ("what's in this picture?") — see
+  "Editing an uploaded image" and "Understanding an uploaded image" below.
+- **Copy button** — hovering a message card reveals a 📋 button in its
+  corner that copies the message's raw text; each fenced code block gets
+  its own 📋 button too, copying just that block instead of the whole
+  message. Falls back to the legacy `execCommand('copy')` when the page
+  isn't a secure context (e.g. opened over plain `http://` from a LAN
+  address), since the modern Clipboard API refuses to work there.
 
 ## API
 
 | Method/path | Description |
 |---|---|
-| `POST /chat` | Send a message. Body: `{query, conversation_id?, use_rag?, max_tokens?, temperature?, image_data?, image_filename?, image_mime_type?, strength?}`. Without `conversation_id`, creates a new conversation. `max_tokens` defaults to `null` — no artificial cap; the model generates until it stops on its own or fills the context window (`N_CTX`). `image_data` is a base64-encoded image (no `data:...;base64,` prefix); if present, the message is always treated as an instruction to edit that image (see "Editing an uploaded image" below) — `strength` (0..1, default 0.75) controls how much the result may diverge from the input. If the message is classified as an image-generation or image-edit request, returns a `pending` placeholder immediately instead of chat text; otherwise returns the model's reply with `sent_at`/`responded_at` (ms), `thinking_ms`, and a `files` list. |
-| `GET /health` | Model/RAG-index status and the configured `image_service_url`. |
+| `POST /chat` | Send a message. Body: `{query, conversation_id?, use_rag?, max_tokens?, temperature?, image_data?, image_filename?, image_mime_type?, strength?}`. Without `conversation_id`, creates a new conversation. `max_tokens` defaults to `null` — no artificial cap; the model generates until it stops on its own or fills the context window (`N_CTX`). `image_data` is a base64-encoded image (no `data:...;base64,` prefix); if present, `utils/intent.py` classifies the accompanying text as an edit instruction (submits an img2img job — `strength`, 0..1, default 0.75, controls how much the result may diverge from the input) or a question about the image (submits a caption job) — see "Editing"/"Understanding an uploaded image" below. Any of image-generation, image-edit, or image-caption requests return a `pending` placeholder immediately instead of chat text; otherwise returns the model's reply with `sent_at`/`responded_at` (ms), `thinking_ms`, and a `files` list. |
+| `GET /health` | Model/RAG-index status and the configured `image_service_url`. For vision/generation model diagnostics, see ycplt_img's own `GET /health` — this app doesn't hold any of those models. |
 | `GET /api/conversations` | List conversations (id, title, updated_at), sorted by last activity. |
 | `POST /api/conversations` | Manually create an empty conversation (usually unnecessary — `/chat` creates one lazily). |
 | `GET /api/conversations/{id}/messages` | Message history for a conversation, including files, timestamps, and `status`. |
@@ -233,86 +242,92 @@ notes.
 ## Editing an uploaded image
 
 Attaching an image via the 📎 button and sending a message routes the whole
-request differently from a plain-text one: an attached image is treated as
-an unambiguous "edit this image" instruction (there's no captioning model
-in the loop to otherwise figure out why a picture was sent), so it bypasses
-the image-generation/tool/chat classifiers entirely.
+request differently from a plain-text one:
 
 1. The browser reads the picked file with `FileReader`, base64-encodes it,
    and sends it as `image_data` in the same `/chat` call as the typed
    instruction — no separate upload endpoint.
-2. `routes/chat.py` decodes it, stores it as a file attachment on the
+2. `routes/chat.py` decodes it and stores it as a file attachment on the
    user's own message (so it's visible in the chat history on reload, the
-   same generic image rendering as a generated result), and submits an
-   img2img job to ycplt_img via `utils/image_client.submit_job(prompt,
-   mode="img2img", strength=..., init_image=image_bytes)`.
-3. From there it's the identical pending → background-poller → complete
-   flow as image generation (`utils/image_jobs.py` doesn't distinguish
-   generate jobs from edit jobs — it just polls a job id and resolves it),
-   so no changes were needed there.
+   same generic image rendering as a generated result).
+3. `utils/intent.py`'s `is_edit_instruction_async` then classifies the
+   accompanying text: is it an instruction to edit the image ("make the
+   background blue", "remove the person"), or something else — most
+   commonly a question about the image's content ("what's in this
+   picture?"). A genuine edit instruction submits an img2img job to
+   ycplt_img via `utils/image_client.submit_job(prompt, mode="img2img",
+   strength=..., init_image=image_bytes)`; anything else is routed to
+   image *understanding* instead (see below) rather than sent into an
+   img2img job as a meaningless prompt.
+4. From there, an edit job follows the identical pending →
+   background-poller → complete flow as image generation
+   (`utils/image_jobs.py` doesn't distinguish generate jobs from edit jobs
+   — it just polls a job id and resolves it), so no changes were needed
+   there.
 
-**Current limitation:** this is the ycplt-side half of the feature.
-ycplt_img itself doesn't yet understand the `mode`/`init_image_b64`/
-`strength` fields — as of this writing it only implements plain txt2img, so
-an edit job silently generates a new image from the prompt alone rather
-than actually editing the attached one, until ycplt_img is updated to match
-(see the next section — this is the plan for that follow-up work).
+## Understanding an uploaded image
 
-## API contract for ycplt_img (next phase)
+This app has no vision model of its own — only the chat LLM. Image
+understanding, exactly like generation and editing, is a graphics-service
+capability: `_handle_image_question` (`routes/chat.py`) submits a
+`mode="caption"` job to ycplt_img (`prompt` = the question, `init_image_b64`
+= the attached image) and stores a `pending` placeholder, the same shape
+as a generation/edit job; `utils/image_jobs.py`'s background poller
+resolves it once ready — for `mode="caption"` that means writing the text
+answer straight into the message content, with no file attachment (see
+that module's docstring for the mode-aware resolution logic).
 
-`utils/image_client.py`'s `submit_job()` already builds the full request
-shape below — it was written generically up front, so no client-side
-changes were needed to start sending edit jobs. This is the exact `POST
-/jobs` payload ycplt_img needs to be updated to understand:
+ycplt_img hosts the actual vision model
+([moondream2](https://huggingface.co/vikhyatk/moondream2), via
+`llama-cpp-python`) and its GGUF files live in *its* `models/` directory,
+not this app's — see
+[its README](https://github.com/sphynkx/ycplt_img#understanding-an-uploaded-image-modecaption)
+for the download links and setup. It's optional there: if it isn't set
+up, a caption job simply comes back as an `error` status with a clear
+message, resolved the same way any other failed job would be
+(`repository.fail_image_message`) — this app doesn't need to know why a
+caption job failed, only that it did.
+
+If image questions keep failing, check ycplt_img's own `GET /health`
+(`vision` field: `files_found`, `loaded`, `load_error`) on that machine —
+not this app's `/health`, which has nothing to report about vision since
+it holds no vision model.
+
+## ycplt_img API contract (as implemented)
+
+`utils/image_client.py`'s `submit_job()` builds the request shape below
+for all three job kinds this app sends; see ycplt_img's own README for the
+authoritative API reference (this is a quick summary from the client side):
 
 ```jsonc
-// Plain generation (what ycplt_img already supports):
-{
-  "prompt": "a cat wearing a hat",
-  "mode": "txt2img",
-  "width": 512,
-  "height": 512,
-  "steps": 20,
-  "cfg_scale": 7.5
-  // + optional: negative_prompt, seed
+// Plain generation:
+{"prompt": "a cat wearing a hat", "mode": "txt2img",
+ "width": 512, "height": 512, "steps": 20, "cfg_scale": 7.5
+ // + optional: negative_prompt, seed
 }
 
-// Editing an uploaded image (new — not yet handled by ycplt_img):
-{
-  "prompt": "make the background blue",
-  "mode": "img2img",
-  "width": 512,
-  "height": 512,
-  "steps": 20,
-  "cfg_scale": 7.5,
-  "strength": 0.75,
-  "init_image_b64": "<base64-encoded source image>"
-  // + optional: negative_prompt, seed, mask_image_b64 (inpainting — not
-  //   sent by ycplt yet, but the client already has a parameter for it)
+// Editing an uploaded image:
+{"prompt": "make the background blue", "mode": "img2img",
+ "width": 512, "height": 512, "steps": 20, "cfg_scale": 7.5,
+ "strength": 0.75, "init_image_b64": "<base64-encoded source image>"
+ // + optional: negative_prompt, seed; mask_image_b64 for mode="inpaint"
+ //   (not currently sent by this app's UI, but the client already
+ //   supports it if a masked-inpainting UI is added later)
 }
+
+// Understanding an uploaded image:
+{"prompt": "what's in this picture?", "mode": "caption",
+ "width": 512, "height": 512, "steps": 20, "cfg_scale": 7.5,
+ // width/height/steps/cfg_scale are ignored for this mode but still
+ // required by the request shape — any value works
+ "init_image_b64": "<base64-encoded source image>"}
 ```
 
-`GET /jobs/{id}`, `GET /jobs/{id}/result`, and `DELETE /jobs/{id}` are
-unchanged — an edit job is a job like any other from the queue's point of
-view, it just carries a few extra fields the worker needs to read.
-
-On the ycplt_img side, `mode: "img2img"` maps directly to
-`stable-diffusion-cpp-python`'s `generate_image(..., init_image=...,
-strength=...)` (and `mask_image=...` for inpainting, later) — the
-underlying binding already supports this, per the earlier hardware/model
-research; `worker.py` currently only calls it with the txt2img arguments.
-
-**Planned for the same follow-up (not yet designed in detail):** a small
-"model factory" in ycplt_img so different job kinds can use different
-underlying models instead of forcing one checkpoint to do everything (e.g.
-a model or LoRA better suited to editing/inpainting than plain SD1.4, and
-eventually a captioning/vision model for describing an uploaded image
-rather than editing it). The rough shape: a registry keyed by job kind
-(`generate` / `edit` / later `caption`) mapping to a model-loading recipe,
-lazily loaded and cached — mirroring the `TOOL_REGISTRY` pattern already
-used in `utils/tools.py` on the ycplt side. Exact loading/eviction strategy
-(what stays resident given the box's RAM) is a decision for when this phase
-starts, not settled yet.
+`GET /jobs/{id}` (status), `GET /jobs/{id}/result` (image modes only),
+and `DELETE /jobs/{id}` are shared by all job kinds. For `mode="caption"`,
+the answer comes back as `result_text` directly on the `GET /jobs/{id}`
+status response instead of through `/result` — see
+`utils/image_jobs.py._resolve_caption_done`.
 
 ## Built-in tools (date/time, calculator, extensible)
 
@@ -438,9 +453,23 @@ server keeps working as a normal chat; `use_rag` simply has no effect (see
   prompt and the reply). Raise it in `.env` if you need longer answers;
   a bigger `N_CTX` costs more RAM and makes each token slightly slower to
   generate, so it's a deliberate trade-off, not a free change.
+- **Questions about an attached image resolve to an error** — the vision
+  model lives on ycplt_img, not here (see "Understanding an uploaded
+  image" above); check that service's own `GET /health` `vision` field
+  and make sure the two moondream2 GGUF files are in *its* `models/`
+  directory (a common mix-up: they don't belong in this app's `models/`,
+  which only holds the chat LLM).
+- **First question about an attached image is slow** — expected: ycplt_img
+  loads the vision model lazily on first `caption` job, not at its own
+  startup. Subsequent questions are fast, same as any other model after
+  its one-time load.
 
 ## Not done yet (but the architecture allows for it)
 
 - A RAG toggle in the browser UI itself (API-only for now).
 - More sidebar features (renaming a chat, searching history, etc.).
 - Pagination of message history for very long conversations.
+- Masked inpainting from the browser UI (mask drawing) — the API/ycplt_img
+  side already supports a mask (`mode="inpaint"`, see ycplt_img's own
+  README), but nothing in the browser UI produces one yet; today an
+  attached-image edit is always a whole-image img2img instruction.

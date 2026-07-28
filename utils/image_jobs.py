@@ -7,14 +7,23 @@ closed; the result is simply there next time the conversation is opened.
 For every message with status = 'pending' (see
 db/repository.py:list_pending_image_messages), this checks the job's status
 on ycplt_img (utils/image_client.py) on a fixed interval
-(config.IMAGE_POLL_INTERVAL_SEC):
-  - done             -> downloads the image, stores it as a file attachment
-                        (mime_type image/png), marks the message complete,
-                        and acknowledges the job (DELETE) so ycplt_img can
-                        drop it from its queue.
-  - error            -> marks the message as failed with the remote error.
-  - queued/processing -> left alone, checked again next tick.
-  - service unreachable -> left pending, retried next tick.
+(config.IMAGE_POLL_INTERVAL_SEC). GET /jobs/{id} always reports the job's
+`mode`, which is what distinguishes how "done" is resolved — no separate
+tracking is needed on this side for that:
+  - done, mode="caption"     -> writes the text answer (result_text,
+                                already included in the status response)
+                                as the message content directly — no file
+                                attachment, unlike every other mode.
+  - done, any other mode     -> downloads the image, stores it as a file
+                                attachment (mime_type image/png), marks the
+                                message complete.
+  - error                    -> marks the message as failed with the
+                                remote error (phrased per-mode).
+  - queued/processing        -> left alone, checked again next tick.
+  - service unreachable      -> left pending, retried next tick.
+
+Either way, once resolved (done or error) the job is acknowledged (DELETE)
+so ycplt_img can drop it from its queue.
 """
 import asyncio
 from typing import Optional
@@ -60,11 +69,16 @@ async def _poll_once() -> None:
             continue
 
         state = status.get("status")
+        is_caption = status.get("mode") == "caption"
         if state == "done":
-            await _resolve_done(message_id, job_id, loop)
+            if is_caption:
+                await _resolve_caption_done(message_id, job_id, status, loop)
+            else:
+                await _resolve_done(message_id, job_id, loop)
         elif state == "error":
             error_text = status.get("error_message") or "unknown error"
-            repository.fail_image_message(message_id, f"Ошибка генерации изображения: {error_text}")
+            label = "Ошибка распознавания изображения" if is_caption else "Ошибка генерации изображения"
+            repository.fail_image_message(message_id, f"{label}: {error_text}")
             await loop.run_in_executor(None, image_client.delete_job, job_id)
         # queued / processing: nothing to do yet, check again next tick
 
@@ -79,4 +93,16 @@ async def _resolve_done(message_id: int, job_id: int, loop: asyncio.AbstractEven
     filename = f"image_{job_id}.png"
     repository.add_file(message_id, filename, "image/png", image_bytes)
     repository.complete_image_message(message_id, "Готово!")
+    await loop.run_in_executor(None, image_client.delete_job, job_id)
+
+
+async def _resolve_caption_done(
+    message_id: int, job_id: int, status: dict, loop: asyncio.AbstractEventLoop
+) -> None:
+    """mode="caption": the answer is text, already included in the status
+    response as result_text (see ycplt_img's db.get_job_status) — no
+    separate result download and no file attachment, unlike every other
+    job mode."""
+    text = (status.get("result_text") or "").strip() or "(пустой ответ)"
+    repository.complete_image_message(message_id, text)
     await loop.run_in_executor(None, image_client.delete_job, job_id)

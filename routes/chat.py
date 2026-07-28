@@ -6,11 +6,16 @@ Every /chat call:
      (ChatRequest.image_data), it's decoded and stored as a file attachment
      on this same user message (so it shows up on reload, same as any other
      image file — see db/repository.py add_file).
-  3. If an image was attached, unconditionally treats the message as a
-     request to edit that image (an attachment is an unambiguous signal —
-     there's no captioning model yet to otherwise interpret "why did you
-     send me this picture") and routes to _handle_image_edit_request,
-     skipping steps 4-5 below.
+  3. If an image was attached, uses utils/intent.py's is_edit_instruction
+     to decide whether the accompanying text is an editing instruction
+     (routes to _handle_image_edit_request, mode="img2img"/"inpaint") or
+     something else — a question about the image, a request to describe
+     it, anything not about editing it (routes to _handle_image_question,
+     mode="caption"). Either way this app only classifies intent and
+     submits a job to ycplt_img (utils/image_client.py) — it has no vision
+     or image-generation model of its own, only the chat LLM; ycplt_img
+     hosts the moondream2 vision model used for captioning (see its
+     README). Steps 4-5 below are skipped either way.
   4. Otherwise, uses utils/intent.py to decide whether this is a request to
      generate a brand new image. If so, submits a job to ycplt_img
      (utils/image_client.py) and stores a 'pending' placeholder message
@@ -110,7 +115,9 @@ async def chat(req: ChatRequest):
         )
 
     if image_bytes is not None:
-        return await _handle_image_edit_request(conversation_id, req, image_bytes)
+        if await intent.is_edit_instruction_async(req.query):
+            return await _handle_image_edit_request(conversation_id, req, image_bytes)
+        return await _handle_image_question(conversation_id, req, image_bytes)
 
     if await intent.is_image_request_async(req.query):
         return await _handle_image_request(conversation_id, req.query)
@@ -120,6 +127,58 @@ async def chat(req: ChatRequest):
         return await _handle_tool_request(conversation_id, req, sent_at, tool_decision)
 
     return await _handle_chat_request(conversation_id, req, sent_at)
+
+
+async def _handle_image_question(
+    conversation_id: int, req: ChatRequest, image_bytes: bytes
+) -> dict:
+    """Called when an image is attached but utils/intent.py's
+    is_edit_instruction_async decided the accompanying text isn't an
+    editing instruction — most commonly a question about the image's
+    content ("what's in this picture?").
+
+    Image understanding is a graphics-service capability, exactly like
+    generation/editing: this chat app only classifies intent, it doesn't
+    run any vision model itself. A mode="caption" job is submitted to
+    ycplt_img (which hosts the moondream2 vision model — see its README),
+    and a 'pending' placeholder is stored, same shape as
+    _handle_image_request/_handle_image_edit_request; the background
+    poller (utils/image_jobs.py) resolves it into the actual text answer
+    once ready, or an error if the vision model isn't set up there.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        job_id = await loop.run_in_executor(
+            None,
+            lambda: image_client.submit_job(req.query, mode="caption", init_image=image_bytes),
+        )
+    except image_client.ImageServiceError as e:
+        raise HTTPException(status_code=502, detail=f"Сервис изображений недоступен: {e}")
+
+    placeholder_at = time.time()
+    placeholder_text = "Распознаю изображение…"
+    assistant_msg_id = repository.add_message(
+        conversation_id,
+        "assistant",
+        placeholder_text,
+        placeholder_at,
+        status="pending",
+        image_job_id=job_id,
+    )
+    repository.touch_conversation(conversation_id)
+
+    return {
+        "conversation_id": conversation_id,
+        "query": req.query,
+        "sent_at": int(placeholder_at * 1000),
+        "response": placeholder_text,
+        "responded_at": int(placeholder_at * 1000),
+        "thinking_ms": None,
+        "status": "pending",
+        "message_id": assistant_msg_id,
+        "contexts_used": 0,
+        "files": [],
+    }
 
 
 async def _handle_chat_request(conversation_id: int, req: ChatRequest, sent_at: float) -> dict:
