@@ -56,8 +56,16 @@ def submit_job(
     strength: Optional[float] = None,
     init_image: Optional[bytes] = None,
     mask_image: Optional[bytes] = None,
+    remove_target: Optional[str] = None,
 ) -> int:
-    """Queues a job on ycplt_img, returns job_id. Does not wait for the result."""
+    """Queues a job on ycplt_img, returns job_id. Does not wait for the result.
+
+    remove_target (mode="img2img" only): the English name of an object to
+    remove, from utils/intent.get_removal_target_async — when set,
+    ycplt_img automatically segments that object and inpaints just that
+    region with its inpainting-tuned checkpoint instead of running plain
+    img2img, which has no way to execute a removal instruction on its own
+    (see ycplt_img's README "Removing a named object")."""
     body: Dict[str, Any] = {
         "prompt": prompt,
         "mode": mode,
@@ -76,6 +84,8 @@ def submit_job(
         body["init_image_b64"] = base64.b64encode(init_image).decode("ascii")
     if mask_image is not None:
         body["mask_image_b64"] = base64.b64encode(mask_image).decode("ascii")
+    if remove_target:
+        body["remove_target"] = remove_target
 
     result = _request("POST", "/jobs", body)
     return result["job_id"]

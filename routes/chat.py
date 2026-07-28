@@ -318,25 +318,31 @@ async def _handle_image_edit_request(
     conversation_id: int, req: ChatRequest, image_bytes: bytes
 ) -> dict:
     """Submits an img2img job to ycplt_img using the attached image as the
-    starting point. utils/image_client.submit_job already accepts mode/
-    init_image/strength (mode="img2img" + an image encodes to
-    init_image_b64 in the job payload) — see its docstring — so no client
-    changes were needed for this.
+    starting point.
 
-    NOTE: as of this writing, ycplt_img itself only implements plain
-    txt2img and ignores the extra job fields, so an edit job currently
-    generates from the prompt alone rather than actually editing the
-    image — see README's "API contract for ycplt_img (next phase)" section.
-    This handler is the ycplt-side half of the feature; ycplt_img needs a
-    matching update before edits behave as expected end to end.
+    Plain img2img has no way to execute a "remove X" instruction — it just
+    partially re-renders the whole image guided by the prompt text, so the
+    named object doesn't actually disappear, it just gets restyled (see the
+    garbled results before this was added). For that specific case,
+    utils/intent.get_removal_target_async extracts the object being
+    removed (translated to English) and passes it along as
+    remove_target; ycplt_img uses it to automatically segment and inpaint
+    just that region instead (see its README "Removing a named object").
+    Any other kind of edit (color, style, additions, ...) leaves
+    remove_target unset and goes through plain img2img as before.
     """
     loop = asyncio.get_running_loop()
     strength = req.strength if req.strength is not None else DEFAULT_EDIT_STRENGTH
+    remove_target = await intent.get_removal_target_async(req.query)
     try:
         job_id = await loop.run_in_executor(
             None,
             lambda: image_client.submit_job(
-                req.query, mode="img2img", strength=strength, init_image=image_bytes
+                req.query,
+                mode="img2img",
+                strength=strength,
+                init_image=image_bytes,
+                remove_target=remove_target,
             ),
         )
     except image_client.ImageServiceError as e:

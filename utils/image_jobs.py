@@ -31,6 +31,7 @@ from typing import Optional
 from db import repository
 from utils import config
 from utils import image_client
+from utils import llm as llm_utils
 
 _task: Optional[asyncio.Task] = None
 
@@ -99,10 +100,40 @@ async def _resolve_done(message_id: int, job_id: int, loop: asyncio.AbstractEven
 async def _resolve_caption_done(
     message_id: int, job_id: int, status: dict, loop: asyncio.AbstractEventLoop
 ) -> None:
-    """mode="caption": the answer is text, already included in the status
+    """mode="caption": the raw answer is already included in the status
     response as result_text (see ycplt_img's db.get_job_status) — no
     separate result download and no file attachment, unlike every other
-    job mode."""
-    text = (status.get("result_text") or "").strip() or "(пустой ответ)"
+    job mode.
+
+    moondream2 (the vision model, hosted in ycplt_img) answers in English
+    regardless of the question's language — it's a small, English-centric
+    captioning model, not a general multilingual one. Rather than teach
+    ycplt_img to translate (which would mean giving it its own LLM, when
+    the main chat LLM already lives right here), a short follow-up
+    generation on the main chat model rephrases the raw caption into a
+    natural answer in the same language the user asked in — the same
+    "tool result -> natural-language answer" pattern _handle_tool_request
+    (routes/chat.py) already uses for datetime/calculator results. Falls
+    back to the raw caption if this step fails for any reason, rather than
+    failing the whole message over what's ultimately a phrasing nicety.
+    """
+    raw_caption = (status.get("result_text") or "").strip()
+    if not raw_caption:
+        text = "(пустой ответ)"
+    else:
+        question = status.get("prompt") or "Describe this image."
+        followup_prompt = (
+            f'The user asked about an attached image: "{question}"\n'
+            f"Visual analysis of the image (from a vision model): {raw_caption}\n\n"
+            "Using this analysis, answer the user's question naturally and "
+            "concisely, in the same language the user wrote in. Don't "
+            "mention that a separate analysis or tool was used."
+        )
+        try:
+            text = await llm_utils.generate_async(followup_prompt, temperature=0.3)
+        except Exception as e:
+            print(f"[image_jobs] caption rephrase failed for job {job_id}: {e}")
+            text = raw_caption
+
     repository.complete_image_message(message_id, text)
     await loop.run_in_executor(None, image_client.delete_job, job_id)

@@ -259,7 +259,19 @@ request differently from a plain-text one:
    strength=..., init_image=image_bytes)`; anything else is routed to
    image *understanding* instead (see below) rather than sent into an
    img2img job as a meaningless prompt.
-4. From there, an edit job follows the identical pending →
+4. For edit instructions specifically, `utils/intent.get_removal_target_async`
+   answers one more question: is this asking to *remove one specific named
+   object* ("remove the cat", "убери кота"), as opposed to a color/style/
+   addition edit? Plain img2img has no way to execute a removal command —
+   it just partially re-renders the whole image guided by the prompt text,
+   so the object doesn't actually disappear, it just gets restyled (this
+   was a real bug: "убери кота с фото" produced a warped image with the
+   cat still in it). If it *is* a removal instruction, the object's name
+   (translated to English) is sent along as `remove_target`; ycplt_img
+   then automatically segments and inpaints just that region instead of
+   running plain img2img — see its README "Removing a named object". Any
+   other kind of edit leaves `remove_target` unset.
+5. From there, an edit job follows the identical pending →
    background-poller → complete flow as image generation
    (`utils/image_jobs.py` doesn't distinguish generate jobs from edit jobs
    — it just polls a job id and resolves it), so no changes were needed
@@ -288,6 +300,14 @@ message, resolved the same way any other failed job would be
 (`repository.fail_image_message`) — this app doesn't need to know why a
 caption job failed, only that it did.
 
+moondream2 answers in English regardless of the question's language, so
+`_resolve_caption_done` does one short follow-up generation on the main
+chat LLM — the raw caption plus the original question in, a natural
+answer in the same language the user asked in out — the same "tool result
+→ natural-language answer" pattern already used for datetime/calculator
+results (see "Built-in tools" below). Falls back to the raw (English)
+caption if that step itself fails, rather than losing the answer entirely.
+
 If image questions keep failing, check ycplt_img's own `GET /health`
 (`vision` field: `files_found`, `loaded`, `load_error`) on that machine —
 not this app's `/health`, which has nothing to report about vision since
@@ -313,6 +333,16 @@ authoritative API reference (this is a quick summary from the client side):
  // + optional: negative_prompt, seed; mask_image_b64 for mode="inpaint"
  //   (not currently sent by this app's UI, but the client already
  //   supports it if a masked-inpainting UI is added later)
+}
+
+// Removing a named object (also mode="img2img", but with remove_target
+// set — see utils/intent.get_removal_target_async and ycplt_img's README
+// "Removing a named object"):
+{"prompt": "убери кота с фото", "mode": "img2img", "remove_target": "cat",
+ "width": 512, "height": 512, "steps": 20, "cfg_scale": 7.5,
+ "init_image_b64": "<base64-encoded source image>"
+ // strength/negative_prompt are ignored for this path — ycplt_img sets
+ // its own for the auto-mask + inpaint step
 }
 
 // Understanding an uploaded image:
