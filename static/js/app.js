@@ -6,9 +6,19 @@
   const errorBox = document.getElementById('error');
   const convListEl = document.getElementById('conv-list');
   const newChatBtn = document.getElementById('new-chat-btn');
+  const attachBtn = document.getElementById('attach-btn');
+  const imageInput = document.getElementById('image-input');
+  const attachmentPreviewEl = document.getElementById('attachment-preview');
+  const attachmentThumbEl = attachmentPreviewEl.querySelector('.attachment-thumb');
+  const attachmentNameEl = attachmentPreviewEl.querySelector('.attachment-name');
+  const attachmentRemoveEl = attachmentPreviewEl.querySelector('.attachment-remove');
 
   let currentConversationId = localStorage.getItem('currentConversationId');
   currentConversationId = currentConversationId ? parseInt(currentConversationId, 10) : null;
+
+  // An image picked via the attach button, staged until the next send.
+  // { dataUrl, base64, mimeType, filename } or null.
+  let pendingImage = null;
 
   // Polling for background-resolved messages (e.g. pending image jobs).
   const POLL_INTERVAL_MS = 5000;
@@ -73,7 +83,11 @@
     const wrap = document.createElement('div');
     wrap.className = 'image-attachment';
     const img = document.createElement('img');
-    img.src = '/api/files/' + f.id;
+    // f._localSrc is set only for the optimistic preview of an image the
+    // user just picked, before the server has assigned it a file id (see
+    // the submit handler below); every other case (including this same
+    // message after a page reload) uses the normal /api/files/{id} URL.
+    img.src = f._localSrc || ('/api/files/' + f.id);
     img.alt = f.filename;
     wrap.appendChild(img);
     return wrap;
@@ -271,24 +285,91 @@
 
   newChatBtn.addEventListener('click', newChat);
 
+  // ---------- Вложение изображения (для редактирования) ----------
+  function renderAttachmentPreview() {
+    if (!pendingImage) {
+      attachmentPreviewEl.style.display = 'none';
+      attachmentThumbEl.src = '';
+      attachmentNameEl.textContent = '';
+      return;
+    }
+    attachmentPreviewEl.style.display = 'flex';
+    attachmentThumbEl.src = pendingImage.dataUrl;
+    attachmentNameEl.textContent = pendingImage.filename;
+  }
+
+  function clearAttachedImage() {
+    pendingImage = null;
+    imageInput.value = '';
+    renderAttachmentPreview();
+  }
+
+  function handleImageSelected(file) {
+    if (!file || !file.type || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const base64 = String(dataUrl).split(',')[1] || '';
+      pendingImage = {
+        dataUrl,
+        base64,
+        mimeType: file.type || 'image/png',
+        filename: file.name || 'upload.png',
+      };
+      renderAttachmentPreview();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  attachBtn.addEventListener('click', () => imageInput.click());
+  imageInput.addEventListener('change', () => {
+    handleImageSelected(imageInput.files && imageInput.files[0]);
+  });
+  attachmentRemoveEl.addEventListener('click', clearAttachedImage);
+
   // ---------- Отправка сообщения ----------
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const query = textarea.value.trim();
     if (!query) return;
 
+    // Captured before clearAttachedImage() resets the composer, so the
+    // request still carries the image the user actually picked.
+    const imageToSend = pendingImage;
+
     errorBox.textContent = '';
     textarea.value = '';
     sendBtn.disabled = true;
 
-    addMessageFromRecord({ role: 'user', content: query, created_at: Date.now() });
+    const userRecord = { role: 'user', content: query, created_at: Date.now() };
+    if (imageToSend) {
+      // No server file id yet — renderImageAttachment() falls back to
+      // _localSrc (a data: URL) for this one render; after a reload the
+      // same attachment comes from the server with a real id and uses the
+      // normal /api/files/{id} URL instead.
+      userRecord.files = [{
+        id: null,
+        filename: imageToSend.filename,
+        mime_type: imageToSend.mimeType,
+        size: imageToSend.base64.length,
+        _localSrc: imageToSend.dataUrl,
+      }];
+    }
+    addMessageFromRecord(userRecord);
+    clearAttachedImage();
     const pending = addPending();
 
     try {
+      const body = { query, conversation_id: currentConversationId };
+      if (imageToSend) {
+        body.image_data = imageToSend.base64;
+        body.image_filename = imageToSend.filename;
+        body.image_mime_type = imageToSend.mimeType;
+      }
       const resp = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, conversation_id: currentConversationId })
+        body: JSON.stringify(body)
       });
       const data = await resp.json();
       pending.remove();

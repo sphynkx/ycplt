@@ -143,6 +143,16 @@
     border-radius: 8px;
     border: 1px solid #ccc;
   }
+  #attach-btn {
+    flex-shrink: 0;
+    width: 42px;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    background: #fff;
+    font-size: 1.1rem;
+    cursor: pointer;
+  }
+  #attach-btn:hover { background: #ececec; }
   button[type="submit"] {
     padding: 0 18px;
     border: none;
@@ -154,6 +164,35 @@
   }
   button[type="submit"]:disabled { background: #9db4e0; cursor: not-allowed; }
   #error { color: #c0392b; font-size: 0.85rem; margin-top: 8px; }
+
+  #attachment-preview {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    background: #fff;
+    font-size: 0.82rem;
+  }
+  #attachment-preview .attachment-thumb {
+    width: 36px;
+    height: 36px;
+    object-fit: cover;
+    border-radius: 6px;
+  }
+  #attachment-preview .attachment-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #444; }
+  #attachment-preview .attachment-hint { color: #999; }
+  #attachment-preview .attachment-remove {
+    background: none;
+    border: none;
+    color: #999;
+    cursor: pointer;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+  #attachment-preview .attachment-remove:hover { color: #c0392b; }
 </style>
 </head>
 <body>
@@ -175,7 +214,15 @@
 
     <div id="composer">
       <div id="composer-inner">
+        <div id="attachment-preview">
+          <img class="attachment-thumb" alt="">
+          <span class="attachment-name"></span>
+          <span class="attachment-hint">— изображение будет отредактировано согласно запросу</span>
+          <button type="button" class="attachment-remove" title="Убрать вложение">✕</button>
+        </div>
         <form id="chat-form">
+          <button id="attach-btn" type="button" title="Прикрепить изображение для редактирования">📎</button>
+          <input id="image-input" type="file" accept="image/*" hidden>
           <textarea id="query" rows="2" placeholder="Напиши сообщение..." required></textarea>
           <button id="send-btn" type="submit">Отправить</button>
         </form>
