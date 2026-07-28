@@ -48,7 +48,12 @@ def get_llm() -> Optional[Llama]:
     return _llm
 
 
-def generate_sync(prompt: str, max_tokens: int = 256, temperature: float = 0.7) -> str:
+def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
+    """Runs one generation. max_tokens=None (the default) means "no artificial
+    cap" — llama-cpp-python then generates until the model emits a stop token
+    or the context window (config.N_CTX) is full, whichever comes first.
+    Pass an explicit max_tokens only when a caller genuinely wants a shorter
+    answer (e.g. utils/intent.py's one-word classifier)."""
     if _llm is None:
         raise RuntimeError("Model is not loaded")
     out = _llm.create_chat_completion(
@@ -59,6 +64,6 @@ def generate_sync(prompt: str, max_tokens: int = 256, temperature: float = 0.7) 
     return out["choices"][0]["message"]["content"]
 
 
-async def generate_async(prompt: str, max_tokens: int = 256, temperature: float = 0.7) -> str:
+async def generate_async(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, generate_sync, prompt, max_tokens, temperature)

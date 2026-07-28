@@ -28,6 +28,8 @@ utils/
   intent.py                    — LLM-based classifier: is this an image request?
   image_client.py               — HTTP client for the ycplt_img job queue
   image_jobs.py                 — background poller resolving pending image jobs
+  tools.py                      — registry of built-in tools (datetime, calculator, ...)
+  tool_router.py                 — LLM-based classifier: does this need a tool?
 templates/
   index.html                  — sidebar + chat UI markup (fetch to /chat and /api/*)
 static/
@@ -79,7 +81,20 @@ cp install/.env.example .env
 
 All settings are read via `python-dotenv` in `utils/config.py`. Priority
 (highest first): a real process environment variable > a value from `.env` >
-the hardcoded default. Key variables:
+the hardcoded default.
+
+Path-valued settings (`MODEL_PATH`, `DB_PATH`, `RAG_DATA_DIR`, `INDEX_PATH`,
+`META_PATH`) may be relative or absolute. A relative value is resolved
+against the project root (the directory containing `app.py`), not against
+the current working directory the app happens to be launched from — so
+`data/chat.sqlite3` always means the same file whether you run
+`python app.py` from inside the project, from `cron`, or via the systemd
+unit below. (Earlier versions resolved these against the launch-time cwd,
+which could silently point at a different, empty database if the app was
+ever started a different way — looking exactly like "my chat history
+disappeared after a restart" even though nothing was deleted.)
+
+Key variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -102,8 +117,8 @@ the hardcoded default. Key variables:
 
 ## Model
 
-Download a GGUF model and place it at `models/` (or point
-`MODEL_PATH` at it):
+Download a GGUF model and place it at `models/` (or point `MODEL_PATH` at it):
+
 ```bash
 wget https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf -O models/qwen2.5-3b-instruct-q4_k_m.gguf
 ```
@@ -166,7 +181,7 @@ The unit file uses `EnvironmentFile=/opt/ycplt/.env` and intentionally has no
 
 | Method/path | Description |
 |---|---|
-| `POST /chat` | Send a message. Body: `{query, conversation_id?, use_rag?, max_tokens?, temperature?}`. Without `conversation_id`, creates a new conversation. If the message is classified as an image request, returns a `pending` placeholder immediately instead of chat text; otherwise returns the model's reply with `sent_at`/`responded_at` (ms), `thinking_ms`, and a `files` list. |
+| `POST /chat` | Send a message. Body: `{query, conversation_id?, use_rag?, max_tokens?, temperature?}`. Without `conversation_id`, creates a new conversation. `max_tokens` defaults to `null` — no artificial cap; the model generates until it stops on its own or fills the context window (`N_CTX`). Pass an explicit value only to deliberately shorten a reply. If the message is classified as an image request, returns a `pending` placeholder immediately instead of chat text; otherwise returns the model's reply with `sent_at`/`responded_at` (ms), `thinking_ms`, and a `files` list. |
 | `GET /health` | Model/RAG-index status and the configured `image_service_url`. |
 | `GET /api/conversations` | List conversations (id, title, updated_at), sorted by last activity. |
 | `POST /api/conversations` | Manually create an empty conversation (usually unnecessary — `/chat` creates one lazily). |
@@ -210,6 +225,59 @@ ycplt_img itself is a separate daemon with its own SQLite job queue,
 processing one job at a time on a persistently-loaded image model — see its
 own README at https://github.com/sphynkx/ycplt_img for setup and hardware
 notes.
+
+## Built-in tools (date/time, calculator, extensible)
+
+A local LLM has two well-known blind spots: it has no notion of "now" (its
+training data has a fixed cutoff and it can't tell you today's date), and it
+often gets arithmetic wrong past a few digits. Rather than hardcoding
+special cases for these two questions, `/chat` routes through a small,
+generic tool layer:
+
+1. After the image-intent check, `utils/tool_router.py` asks the model
+   (zero-shot, one line, `temperature=0.0`) whether answering the message
+   needs one of the tools registered in `utils/tools.py`, and if so, which
+   one (plus an argument, for tools that need one — e.g. the expression to
+   evaluate for the calculator). On error or ambiguity it answers "no tool
+   needed", same fail-safe default as the image classifier.
+2. If a tool is picked, `routes/chat.py` runs it directly (no LLM call —
+   `get_current_datetime` reads the system clock, `calculate` evaluates the
+   expression) and does one more short generation: the tool's result is
+   handed to the model with a prompt asking it to phrase a natural answer
+   to the user's original question using that result.
+3. The reply is then saved and returned exactly like a normal chat message
+   (`status: "complete"`) — no schema or frontend changes were needed for
+   this.
+
+Built-in tools:
+
+- **`get_current_datetime`** — current date, time, and day of week.
+- **`calculate`** — arithmetic expressions (`+ - * / // % **`, parentheses).
+  Evaluated via a restricted `ast` walk, not `eval()` — it can only ever
+  do arithmetic on numbers, never call functions, import anything, or
+  access names, so a malformed or adversarial expression just returns an
+  error string instead of executing.
+
+Adding a new tool is meant to be a small, self-contained change:
+
+1. Write a function in `utils/tools.py` with signature `(arg: str) -> str`.
+2. Register it in `TOOL_REGISTRY` with a clear one-line description — the
+   router builds its classifier prompt directly from these descriptions, so
+   a vague description leads to vague routing.
+
+Nothing else needs to change: `utils/tool_router.py` and `routes/chat.py`
+read the registry, they don't name individual tools.
+
+Ideas for further tools (not implemented): a persistent notes/reminders
+store (the app already has SQLite + a DB layer, so this is mostly a new
+table + two tool functions); a "search past conversations" tool once the
+sidebar search mentioned below exists; a unit/currency converter; exposing
+RAG document search as an explicit tool (`use_rag` is currently automatic-
+only via a request flag, not a chat-time decision) so the model can decide
+mid-conversation whether to consult the indexed documents. A web search
+tool is possible in principle but a bigger lift — it needs outbound internet
+access, a search API/key, and more thought about what an offline-first local
+app should reach out to the network for.
 
 ## Why file attachments are stored as BLOBs in SQLite
 
@@ -277,6 +345,11 @@ server keeps working as a normal chat; `use_rag` simply has no effect (see
   reachable at `IMAGE_SERVICE_HOST`/`IMAGE_SERVICE_PORT` (see its own
   firewall notes) and that its job queue isn't stuck; `utils/image_jobs.py`
   logs poll errors to stdout.
+- **Replies still feel short even with no `max_tokens` cap** — the real
+  ceiling is `N_CTX` (the context window, in tokens, shared between the
+  prompt and the reply). Raise it in `.env` if you need longer answers;
+  a bigger `N_CTX` costs more RAM and makes each token slightly slower to
+  generate, so it's a deliberate trade-off, not a free change.
 
 ## Not done yet (but the architecture allows for it)
 
