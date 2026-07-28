@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+llama-cpp-python
+jinja2
+python-dotenv
+
+# Optional, only needed for RAG (search over your own documents, build_index.py + use_rag=true):
+sentence-transformers
+faiss-cpu
+numpy
+pypdf

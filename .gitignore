@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+models/*
+!models/.gitempty
+rag_data/*
+!rag_data/.gitempty

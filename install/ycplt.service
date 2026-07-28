@@ -1,0 +1,17 @@
+[Unit]
+Description=ycplt - local chat application (FastAPI + llama-cpp-python)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ycplt
+
+# No User= — this deployment runs as root.
+EnvironmentFile=/opt/ycplt/.env
+
+ExecStart=/opt/ycplt/.venv/bin/python /opt/ycplt/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
