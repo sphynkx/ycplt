@@ -34,12 +34,13 @@ Every /chat call:
 import asyncio
 import base64
 import time
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from db import repository
+from utils import astro
 from utils import config
 from utils import image_client
 from utils import intent
@@ -84,6 +85,45 @@ def _auto_title(text: str, limit: int = 40) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _prior_user_texts(conversation_id: int, exclude_message_id: int) -> List[str]:
+    """Every prior user message in this conversation, oldest first, as a
+    plain list — the shared source both context variants below are built
+    from."""
+    history = repository.list_messages(conversation_id)
+    return [
+        m["content"] for m in history if m["role"] == "user" and m["id"] != exclude_message_id
+    ]
+
+
+# Deliberately small, for tool_router's own classification prompt
+# specifically — NOT the same thing as "how much history is available for
+# extracting a tool argument" (see _handle_tool_request, which uses the
+# full, untruncated history instead). Tried feeding the entire
+# conversation history into the classifier itself and it made routing
+# measurably *worse* in practice: a small model's attention to the actual
+# current message degrades once the prompt is dominated by a long history
+# dump ("lost in the middle"), so a message that used to route correctly
+# started coming back as "no tool needed" — the model just answered from
+# its own (hallucinated) general knowledge instead. More context helps a
+# deterministic regex extraction step; it does not reliably help an LLM's
+# yes/no classification decision, so the two uses are kept separate on
+# purpose rather than sharing one "give it everything" value.
+_CLASSIFIER_HISTORY_MAX_MESSAGES = 4
+_CLASSIFIER_HISTORY_MAX_CHARS_EACH = 300
+
+
+def _classifier_history_context(prior_texts: List[str]) -> str:
+    recent = prior_texts[-_CLASSIFIER_HISTORY_MAX_MESSAGES:]
+    return "\n".join(t[:_CLASSIFIER_HISTORY_MAX_CHARS_EACH] for t in recent)
+
+
+def _extraction_history_context(prior_texts: List[str]) -> str:
+    """Untruncated — fed only into utils/astro.py's regex-based field
+    extraction (via _handle_tool_request), never into an LLM prompt on its
+    own, so there's no attention-dilution downside to keeping all of it."""
+    return "\n".join(prior_texts)
+
+
 @router.post("/chat")
 async def chat(req: ChatRequest):
     if llm_utils.get_llm() is None:
@@ -122,9 +162,26 @@ async def chat(req: ChatRequest):
     if await intent.is_image_request_async(req.query):
         return await _handle_image_request(conversation_id, req.query)
 
-    tool_decision = await tool_router.classify_async(req.query)
+    prior_user_texts = _prior_user_texts(conversation_id, exclude_message_id=user_msg_id)
+    tool_decision = await tool_router.classify_async(
+        req.query, _classifier_history_context(prior_user_texts)
+    )
+    # Deliberately unconditional (not just when a tool fires): "the router
+    # decided no tool was needed" is exactly as important to see in the
+    # log as which tool/argument it picked, when diagnosing a tool that
+    # silently isn't being used for a message that clearly needed it.
+    print(
+        f"[tool_router] tool={tool_decision.tool_name!r} "
+        f"arg={tool_decision.tool_arg!r}"
+    )
     if tool_decision.tool_name:
-        return await _handle_tool_request(conversation_id, req, sent_at, tool_decision)
+        return await _handle_tool_request(
+            conversation_id,
+            req,
+            sent_at,
+            tool_decision,
+            _extraction_history_context(prior_user_texts),
+        )
 
     return await _handle_chat_request(conversation_id, req, sent_at)
 
@@ -231,31 +288,131 @@ async def _handle_chat_request(conversation_id: int, req: ChatRequest, sent_at: 
     }
 
 
-async def _handle_tool_request(
-    conversation_id: int, req: ChatRequest, sent_at: float, decision: tool_router.ToolDecision
-) -> dict:
-    """Runs the tool utils/tool_router.py picked, then does one more (short)
-    LLM call that turns the raw tool result into a natural-language answer
-    to the user's original question. Two model calls total for this path
-    (the router's classification, plus this one) — acceptable, since both
-    are small compared to a full chat generation."""
-    tool_spec = tools.TOOL_REGISTRY[decision.tool_name]
-    loop = asyncio.get_running_loop()
-    tool_result = await loop.run_in_executor(None, tool_spec["run"], decision.tool_arg)
+# Tools whose raw result is meant to be *interpreted*, not just relayed —
+# these route through the RAG methodology/reasoning-mode machinery (see
+# below) instead of the generic "answer naturally" follow-up. A bare
+# "answer naturally" prompt over the raw chart data alone produced
+# shallow, generic descriptions in practice: it never saw the indexed
+# interpretation-methodology document at all, since the tool-call path and
+# the RAG path used to be entirely separate code paths.
+#
+# These also happen to be the tools whose argument is a free-text quote
+# that utils/astro.py's own regex extraction parses (as opposed to e.g.
+# calculate's argument, a math expression that must stay exactly what it
+# is) — see the tool_arg handling below for why that matters.
+_INTERPRETED_TOOL_NAMES = {"astro_natal_chart", "astro_transit_chart"}
 
-    followup_prompt = (
-        f'The user asked: "{req.query}"\n'
-        f"Tool used: {decision.tool_name}\n"
-        f"Tool result: {tool_result}\n\n"
-        "Using this result, answer the user's question naturally and "
-        "concisely, in the same language the user wrote in. Don't mention "
-        "that a tool was used unless it's relevant to the answer."
-    )
+
+async def _handle_tool_request(
+    conversation_id: int,
+    req: ChatRequest,
+    sent_at: float,
+    decision: tool_router.ToolDecision,
+    history_context: str = "",
+) -> dict:
+    """Runs the tool utils/tool_router.py picked, then does one more LLM
+    call that turns the raw tool result into a natural-language answer to
+    the user's original question. Two model calls total for this path (the
+    router's classification, plus this one) — acceptable, since both are
+    small compared to a full chat generation.
+
+    For _INTERPRETED_TOOL_NAMES, that follow-up call is the same RAG
+    reasoning-mode prompt used by _handle_chat_request (see utils/rag.py),
+    with the tool's computed result folded in as an always-include context
+    chunk alongside whatever real methodology/fact chunks the query itself
+    retrieves — this is what actually lets rag_data/astrology's
+    interpretation-methodology document reach the model for these
+    questions, instead of a generic "summarize this data" instruction with
+    no awareness that document exists. Other tools (datetime, calculator)
+    keep the original simple prompt — there's no interpretive depth to add
+    for those, so retrieving RAG context for them would just be wasted
+    work."""
+    tool_spec = tools.TOOL_REGISTRY[decision.tool_name]
+
+    if decision.tool_name in _INTERPRETED_TOOL_NAMES:
+        # decision.tool_arg is the router's own transcription of the
+        # birth-info text, and testing showed it isn't reliably complete —
+        # identical requests sometimes came back with the date/time
+        # dropped and only the coordinates kept, even at temperature=0.0
+        # (small-model sampling isn't perfectly deterministic in practice).
+        # Rather than continue trying to make the router's transcription
+        # more reliable, sidestep the problem: utils/astro.py's
+        # _extract_fields() finds each field (date/time/coordinates)
+        # wherever it appears and takes the first match, so it's harmless
+        # to just hand it every text source that might contain the birth
+        # info — the current message, the router's (possibly incomplete)
+        # quote, and any earlier-conversation context — concatenated. A
+        # field missing from one source is simply found in another.
+        tool_arg = "\n".join(filter(None, [req.query, decision.tool_arg, history_context]))
+    else:
+        tool_arg = decision.tool_arg
+
+    loop = asyncio.get_running_loop()
+    tool_result = await loop.run_in_executor(None, tool_spec["run"], tool_arg)
+    # Same rationale as the [tool_router] print above: the model's final
+    # answer is a paraphrase of tool_result, one more LLM call removed from
+    # what the tool actually computed — printing the raw result here is
+    # what makes "why did it say X" diagnosable at all.
+    print(f"[tool_request] {decision.tool_name} raw result: {tool_result!r}")
+
+    if (
+        decision.tool_name in _INTERPRETED_TOOL_NAMES
+        and rag_utils.is_available()
+        and not astro.is_error_result(tool_result)
+    ):
+        # is_error_result guards against retrieving and injecting the full
+        # methodology/context for a placeholder like "не хватает данных" —
+        # there's no chart data to interpret yet, so this would just be
+        # wasted (and, on a small context window, potentially
+        # budget-breaking) work for a question that isn't ready to be
+        # answered yet anyway.
+        rag_contexts = rag_utils.retrieve_context(req.query)
+        computed_chunk = {
+            "text": (
+                "ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА (уже вычислены и предоставлены — "
+                "это не пример и не общий случай, а точная натальная/транзитная "
+                "карта конкретного человека из вопроса пользователя; "
+                "не пересчитывать, не менять и не утверждать, что этих "
+                "данных не хватает или что они не были даны):\n"
+                f"{tool_result}"
+            ),
+            "topic": "astrology",
+            # Always included regardless of retrieval ranking, for two
+            # reasons: the model needs the actual computed data no matter
+            # what, and marking it always_include=True guarantees
+            # build_prompt's step-by-step reasoning-mode prompt activates
+            # for every astro answer, even on a run where no real
+            # methodology chunk happened to rank in the top-k on its own.
+            "always_include": True,
+        }
+        # computed_chunk goes FIRST, not appended after the (possibly long,
+        # up to RAG_ALWAYS_INCLUDE_MAX_CHARS) methodology text: a real
+        # failure was observed where the model's "Рассуждение:" correctly
+        # used this data but "Ответ:" then claimed no data was given —
+        # putting the actual person's data immediately after "Context:",
+        # ahead of generic reference material, plus the strengthened
+        # wording above and build_prompt's explicit consistency
+        # instruction, are the mitigations for that.
+        followup_prompt = rag_utils.build_prompt(req.query, [computed_chunk] + rag_contexts)
+        # Interpretation benefits from a bit more creative latitude than
+        # the default chat temperature, and from not being nudged toward
+        # brevity the way the generic tool prompt below is ("...concisely").
+        default_temperature = 0.5
+    else:
+        followup_prompt = (
+            f'The user asked: "{req.query}"\n'
+            f"Tool used: {decision.tool_name}\n"
+            f"Tool result: {tool_result}\n\n"
+            "Using this result, answer the user's question naturally and "
+            "concisely, in the same language the user wrote in. Don't mention "
+            "that a tool was used unless it's relevant to the answer."
+        )
+        default_temperature = 0.7
 
     gen_start = time.time()
     try:
         resp_text = await llm_utils.generate_async(
-            followup_prompt, max_tokens=req.max_tokens, temperature=req.temperature or 0.7
+            followup_prompt, max_tokens=req.max_tokens, temperature=req.temperature or default_temperature
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка генерации: {e}")
@@ -381,4 +538,5 @@ async def health():
         "model_loaded": llm_utils.get_llm() is not None,
         "rag_index": rag_utils.is_available(),
         "image_service_url": config.IMAGE_SERVICE_URL,
+        "astro_engine": astro.status(),
     }

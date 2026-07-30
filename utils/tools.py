@@ -20,6 +20,8 @@ import operator
 from datetime import datetime
 from typing import Callable, Dict, TypedDict
 
+from utils import astro
+
 
 def get_current_datetime(_arg: str = "") -> str:
     """Current date, time, and day of week. Local to wherever the server
@@ -90,5 +92,40 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "Argument: the expression as a plain string."
         ),
         "run": calculate,
+    },
+    "astro_natal_chart": {
+        "description": (
+            "Computes a natal (birth) astrological chart — planet signs/"
+            "houses and aspects between them — from someone's exact birth "
+            "data (see utils/astro.py for the full computation). Only use "
+            "this if a birth date, time, and place or coordinates actually "
+            "appear somewhere in this conversation (the current message or "
+            "an earlier one) — never invent placeholder birth data; if it's "
+            "missing, don't use this tool at all. Argument: simply copy the "
+            "birth date, time, and place/coordinates as they were written — "
+            "do NOT reformat or convert them yourself, the tool parses "
+            "common formats automatically (dates like '5 июля 1976' or "
+            "'1990-03-12'; times like '4:30'; coordinates as decimal or "
+            "degree-minute-second, e.g. '46°28'00\"N;30°44'00\"E' — the "
+            "timezone is resolved automatically from the coordinates, you "
+            "never need to state or know it). If only a well-known city is "
+            "named with no coordinates, you may add that city's "
+            "approximate coordinates from your own knowledge instead of "
+            "skipping the tool."
+        ),
+        "run": astro.run_natal,
+    },
+    "astro_transit_chart": {
+        "description": (
+            "Computes current (or a given moment's) planetary positions and "
+            "how they aspect someone's natal chart — for questions about "
+            "what's currently happening in someone's chart, or on a "
+            "specific date. Requires the same birth data as "
+            "astro_natal_chart, in the same free-text form (never invent "
+            "it — skip this tool if it isn't in the conversation). Only add "
+            "';moment=YYYY-MM-DDTHH:MM' if a specific non-current moment "
+            "was asked about (default: right now)."
+        ),
+        "run": astro.run_transit,
     },
 }

@@ -10,3 +10,16 @@ sentence-transformers
 faiss-cpu
 numpy
 pypdf
+
+# Optional, only needed for the astrology chart tool (utils/astro.py):
+# fully local/offline (Swiss Ephemeris via pyswisseph), no API key needed.
+# AGPL-3.0 licensed — see utils/astro.py's module docstring.
+kerykeion
+# Resolves an IANA timezone name from lat/lon, fully offline (bundled
+# timezone-boundary data) — lets the astro tool work without the user or
+# model needing to know/state a timezone string explicitly.
+timezonefinder
+# Offline city-name -> coordinates/timezone lookup (~34k cities, bundled
+# with the package, no separate download) — fallback for the astro tool
+# when only a city name is given, no explicit coordinates.
+geonamescache

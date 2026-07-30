@@ -20,8 +20,11 @@ Run:
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+import asyncio
+
 from db.connection import init_db
 from routes import chat, conversations, files, pages
+from utils import astro
 from utils import config
 from utils import image_jobs
 from utils import llm as llm_utils
@@ -41,6 +44,13 @@ async def startup_event():
     init_db()               # creates DB tables if they don't exist yet
     rag_utils.load_rag()    # optional: not fatal if no index is present
     llm_utils.load_llm()    # required: startup fails if this raises
+
+    # Optional: not fatal if kerykeion/timezonefinder/geonamescache aren't
+    # installed. Runs in a worker thread (not awaited synchronously here)
+    # so it doesn't delay serving the first request behind its ~18s cost —
+    # it just needs to finish running once before the first astro chart
+    # question comes in, which in practice it comfortably will.
+    asyncio.get_running_loop().run_in_executor(None, astro.warmup)
 
     # Background task: polls ycplt_img for pending image jobs and resolves
     # them into the chat history once ready. Runs independently of any open

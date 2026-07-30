@@ -29,8 +29,9 @@ utils/
   image_client.py               — HTTP client for the ycplt_img job queue
   image_jobs.py                 — background poller resolving pending image jobs
                                    (generation/edit results, and caption text answers)
-  tools.py                      — registry of built-in tools (datetime, calculator, ...)
+  tools.py                      — registry of built-in tools (datetime, calculator, astro chart, ...)
   tool_router.py                 — LLM-based classifier: does this need a tool?
+  astro.py                       — natal/transit chart computation via kerykeion (optional)
 templates/
   index.html                  — sidebar + chat UI markup (fetch to /chat and /api/*)
 static/
@@ -103,14 +104,17 @@ Key variables:
 | `PORT` | `4010` | App port |
 | `MODEL_PATH` | `models/model.gguf` | Path to the GGUF chat model |
 | `N_THREADS` | `4` | Inference threads |
-| `N_CTX` | `2048` | Context window |
+| `N_CTX` | `32768` | Context window (Qwen2.5's native length — lower it if RAM is tight) |
 | `N_GPU_LAYERS` | `0` | Layers offloaded to GPU (0 = CPU only) |
 | `DB_PATH` | `data/chat.sqlite3` | Chat history database |
 | `RAG_DATA_DIR` | `rag_data` | RAG source documents folder |
 | `INDEX_PATH` | `data/faiss_index.bin` | Built FAISS index |
 | `META_PATH` | `data/meta.pkl` | RAG chunk metadata |
-| `EMBED_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers embedding model |
+| `EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers embedding model |
 | `TOP_K` | `3` | Number of RAG chunks retrieved per query |
+| `RAG_ALWAYS_INCLUDE_MAX_CHARS` | `6000` | Cap on methodology-doc auto-inclusion size (see utils/rag.py) |
+| `HF_TOKEN` | (unset) | Optional Hugging Face Hub token (rate limit / warning) |
+| `HF_HUB_OFFLINE` | (unset) | Set to `1` once models are cached, to skip Hub network checks entirely |
 | `IMAGE_SERVICE_HOST` | `192.168.7.7` | ycplt_img host |
 | `IMAGE_SERVICE_PORT` | `4011` | ycplt_img port |
 | `IMAGE_POLL_INTERVAL_SEC` | `10` | How often the background poller checks ycplt_img |
@@ -390,6 +394,59 @@ Built-in tools:
   do arithmetic on numbers, never call functions, import anything, or
   access names, so a malformed or adversarial expression just returns an
   error string instead of executing.
+- **`astro_natal_chart`** / **`astro_transit_chart`** — computes an
+  astrological chart (planet signs/houses, aspects) via
+  [kerykeion](https://github.com/g-battaglia/kerykeion) (`utils/astro.py`),
+  fully offline (Swiss Ephemeris, no API key). `astro_natal_chart` computes
+  a birth chart; `astro_transit_chart` computes current (or a given
+  moment's) planetary positions and their aspects to a natal chart — for
+  "what's happening right now" style questions. Both require birth date,
+  time, and place (as coordinates) to already be present in the
+  conversation — the tool descriptions explicitly tell the router never to
+  invent placeholder birth data, so if it's missing the model just asks the
+  user for it in the follow-up answer instead of guessing. The argument the
+  router extracts is meant to be a verbatim quote of the birth info from
+  the user's own message, not a reformatted one — `utils/astro.py` parses
+  common date formats (including "5 июля 1976"), times, and coordinates
+  (decimal or degree-minute-second with N/S/E/W) itself, and resolves the
+  timezone automatically from the coordinates via `timezonefinder` — this
+  turned out to matter in practice: asking the small router model to
+  itself convert a date/coordinate format and look up an IANA timezone
+  name in one short completion was unreliable, quoting the original
+  wording back is a much easier task for it. A bare city name with no
+  coordinates at all also resolves, via `geonamescache` (~34k world
+  cities, bundled with the package — no download or file to place
+  anywhere): exact name match first (checked against every alternate-
+  language name too, so Cyrillic city names generally work), then a
+  same-first-5-letters "stem" fallback for when the name appears in some
+  Russian grammatical case rather than the gazetteer's nominative form
+  ("в Одессе" vs "Одесса") — not real morphological analysis, just a cheap
+  approximation, but works for most city names. Ambiguous matches (a name
+  that exists in more than one country, or an ordinary word that
+  coincidentally happens to also be some obscure place's alternate name)
+  are resolved by picking the most populous match, which is right far more
+  often than not. `pip install kerykeion timezonefinder geonamescache`
+  (kerykeion is AGPL-3.0 — see `utils/astro.py`'s docstring if you plan to
+  redistribute this project) if you want this tool available; without
+  timezonefinder/geonamescache specifically, their part is simply skipped
+  gracefully — kerykeion alone still gets you the explicit-coordinates
+  path, just not automatic timezone lookup or city-name resolution
+  (best-effort imports inside the tool functions, same graceful-absence
+  pattern as everywhere else optional in this project).
+
+  Birth data mentioned earlier in the conversation (not just the current
+  message) is also picked up, within limits: `routes/chat.py` hands
+  `utils/tool_router.py` a short excerpt of the last few user messages as
+  background context, specifically so "use the birth data I gave you
+  before" can still route correctly instead of silently failing because
+  the classifier only ever saw the current message in isolation.
+
+  This is meant to grow rather than stay fixed at two operations —
+  `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point for
+  future chart types (synastry between two people, composite charts, event-
+  time/electional search, birth-time rectification): write one function,
+  add one registry entry, wire a new `TOOL_REGISTRY` description when
+  there's a concrete need for it.
 
 Adding a new tool is meant to be a small, self-contained change:
 
@@ -433,7 +490,15 @@ is unnecessary complexity for now.
    ```
 
 2. Put your files (`.txt` and/or `.pdf`) in `rag_data/` (created automatically
-   on first run of the script if missing).
+   on first run of the script if missing). Group documents into
+   topic subfolders if you have more than one subject —
+   `rag_data/astrology/planets.txt`, `rag_data/cooking/pasta.txt`, and so
+   on — `build_index.py` walks subfolders recursively. This is one combined
+   index either way (not one per topic — there's no per-request topic
+   selector in the app, so a single index is simpler and still correct),
+   but every chunk is tagged with its topic in the index metadata, which is
+   what the methodology mechanism below relies on. Files placed directly in
+   `rag_data/` (no subfolder) just have no topic.
 
 3. Build the index:
 
@@ -441,10 +506,12 @@ is unnecessary complexity for now.
    python build_index.py
    ```
 
-   This splits documents into chunks, computes embeddings
-   (`all-MiniLM-L6-v2`), and saves the FAISS index and metadata to
-   `data/faiss_index.bin` and `data/meta.pkl` — the same paths `utils/rag.py`
-   reads at app startup.
+   This splits documents into chunks, computes embeddings, and saves the
+   FAISS index and metadata to `data/faiss_index.bin` and `data/meta.pkl`
+   — the same paths `utils/rag.py` reads at app startup. Re-run this any
+   time source documents change, or after changing `EMBED_MODEL` (see
+   below — embeddings from a different model aren't compatible with an
+   existing index even if the vector dimension happens to match).
 
 4. Restart the server so it picks up the index at startup (the log will show
    `RAG index loaded: N chunks`).
@@ -460,6 +527,54 @@ is unnecessary complexity for now.
 If no index has been built, or the RAG dependencies aren't installed, the
 server keeps working as a normal chat; `use_rag` simply has no effect (see
 `utils/rag.py`).
+
+**Embedding model.** `EMBED_MODEL` defaults to
+`paraphrase-multilingual-MiniLM-L12-v2`, not the more commonly-referenced
+`all-MiniLM-L6-v2` — the latter is English-only and gives noticeably worse
+retrieval on non-English documents (Russian included). Both are
+sentence-transformers models of similar size/speed on CPU; the
+multilingual one just also understands ~50 other languages. Override
+`EMBED_MODEL` in `.env` if you'd rather use a different one (e.g. a
+larger multilingual model for better quality at the cost of slower
+indexing/queries) — just remember to rebuild the index afterward.
+
+This is **not** a file you download and place under `models/` yourself,
+unlike `MODEL_PATH` (the GGUF chat model). `SentenceTransformer(EMBED_MODEL)`
+fetches it automatically from the Hugging Face Hub
+(https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2,
+~470MB) the first time it's needed — either the first `python build_index.py`
+run or the first app startup — and caches it locally afterward (default
+cache dir `~/.cache/huggingface/hub`), the same auto-download pattern
+already used for CLIPSeg in ycplt_img. The only implication for a
+privacy-focused local setup: the machine needs internet access once, for
+that first download; every run after that is fully offline.
+
+**Methodology documents — always included, not just similarity-matched.**
+Ordinary chunk-similarity search is good at finding isolated facts ("what
+does Mars in the 7th house mean"), but bad at surfacing a document that
+describes *how to combine* facts into a conclusion — its wording rarely
+resembles a specific question closely enough to rank in the top-k. This
+matters for a genuinely synthesis-oriented topic like astrological
+interpretation, where the individual planet/house/aspect facts retrieve
+fine on their own, but the rules for weighing and combining several of
+them into a new, specific conclusion might not surface at all.
+
+Name such a document with a `_methodology` suffix before the extension —
+e.g. `rag_data/astrology/interpretation_methodology.txt` — and
+`utils/rag.py`'s `retrieve_context` will always include its chunks
+whenever ordinary similarity search already found other chunks from the
+same topic, regardless of the methodology document's own similarity rank.
+When any such chunk is present, `build_prompt` also switches from a plain
+"answer using this context" prompt to one that asks the model to reason
+step by step — list the relevant facts, think through how they interact
+per the methodology, *then* answer — instead of a one-shot lookup-style
+response. This is a prompting change on the existing chat model, not a
+separate reasoning model; a dedicated reasoning-tuned model (loaded
+alongside the main one, the same pattern as the vision model) is a
+plausible next step if this isn't enough on its own, but is meaningfully
+more infrastructure and hasn't been built — try this first and see
+whether the depth of synthesis is actually the bottleneck before adding
+it.
 
 ## Known gotchas
 
