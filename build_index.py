@@ -237,22 +237,45 @@ def _read_doc(path: str) -> str:
     pypdf don't read this at all). Prefers the antiword CLI tool, which
     correctly parses the underlying OLE2/binary structure; falls back to a
     crude best-effort scrape (decode as UTF-16LE, keep only runs that look
-    like real text) if antiword isn't installed, rather than skipping the
-    file outright — rougher output, but still searchable."""
+    like real text) if antiword isn't installed or can't read this
+    particular file, rather than skipping it outright — rougher output,
+    but still searchable.
+
+    Antiword being installed doesn't guarantee it can read every file with
+    a .doc extension: antiword only understands Word 2.0-2003's binary
+    format specifically, so a file that's actually something else wearing
+    a .doc extension (an older Word format, WordPerfect, a plain-text
+    export, a corrupted file, ...) makes antiword exit with a nonzero
+    status and an explanatory message on stderr — which is surfaced below
+    instead of being discarded, since "why did this specific file fail"
+    is only answerable if that message is actually shown."""
+    result = None
     try:
         result = subprocess.run(["antiword", path], capture_output=True, timeout=30)
+    except FileNotFoundError:
+        print(
+            f"Warning: {path} — antiword is not installed (or not on PATH); "
+            "using a crude fallback extraction for this legacy .doc file. "
+            "Install antiword (e.g. `apt install antiword` / `dnf install "
+            "antiword`) for reliable results."
+        )
+    except Exception as e:
+        print(f"Warning: antiword failed to run on {path}: {e}; using a crude fallback extraction instead.")
+
+    if result is not None:
         if result.returncode == 0 and result.stdout:
             return result.stdout.decode("utf-8", errors="replace")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"Warning: antiword failed on {path}: {e} — falling back to a crude text scrape")
+        stderr_text = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        print(
+            f"Warning: antiword ran but produced no usable text for {path} "
+            f"(exit code {result.returncode}"
+            + (f": {stderr_text}" if stderr_text else ", no error message on stderr")
+            + ") — this usually means the file isn't actually a Word "
+            "2.0-2003 binary .doc despite its extension (a different old "
+            "format, a corrupted file, or an empty one). Falling back to a "
+            "crude text scrape."
+        )
 
-    print(
-        f"Warning: {path} — antiword not available (or it failed), using a "
-        "crude fallback extraction for this legacy .doc file; install "
-        "antiword (e.g. `apt install antiword`) for reliable results"
-    )
     raw = open(path, "rb").read()
     text = raw.decode("utf-16-le", errors="ignore")
     # Legacy .doc interleaves real text with binary control structures, so
