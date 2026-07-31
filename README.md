@@ -65,6 +65,13 @@ GeForce 940M (2 GB) — no usable GPU acceleration for LLM inference. Hence:
 ## Installation
 
 ```bash
+dnf install gcc cmake python-devel antiword p7zip p7zip-plugins unrar-free
+cd /tmp
+git clone https://github.com/val-khokhlov/ha
+cd ha
+cmake . -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+make all
+cp ha /usr/local/bin
 cd /opt
 git clone https://github.com/sphynkx/ycplt
 cd ycplt
@@ -516,26 +523,7 @@ is unnecessary complexity for now.
    ```
 
    `.zip` archives are read directly (stdlib, no extra package). `.rar`/`.arj`/`.7z` and
-   legacy binary `.doc` (MS Word 97-2003, NOT `.docx`) need matching **system** tools, and
-   the exact package names differ by distro:
-
-   **Debian/Ubuntu:**
-   ```bash
-   sudo apt install antiword p7zip-full unrar
-   ```
-
-   **Fedora:**
-   ```bash
-   sudo dnf install antiword p7zip p7zip-plugins unrar-free
-   ```
-   `p7zip-plugins` adds rar/arj support to `p7zip`'s `7z` command. As of Fedora 43/44,
-   Fedora also ships a newer official `7zip` package (upstream 7-Zip's own Linux port) as an
-   alternative to `p7zip` — it covers more formats out of the box but not RAR, so keep
-   `p7zip`/`p7zip-plugins` (or `unrar-free`) around if you have `.rar` files. `unrar-free` is
-   a free libarchive-based clone that provides a compatible `unrar` command without needing
-   RPM Fusion; the genuine proprietary RARLAB `unrar` is also available, but only via RPM
-   Fusion's nonfree repo — `unrar-free` (or the `unar` package, another free alternative) is
-   the simpler path for most cases.
+   legacy binary `.doc` (MS Word 97-2003, NOT `.docx`) need matching **system** tools.
 
    Without `antiword`/a working `.rar`/`.arj`/`.7z` tool installed, `build_index.py` doesn't
    fail — `.doc` files fall back to a cruder built-in text scrape, and archives it can't open
