@@ -83,17 +83,30 @@ TOP_K = int(os.environ.get("TOP_K", "3"))
 # expansion can add on top of the ordinary top-k hits (see utils/rag.py).
 # Without this, a long methodology document gets pulled in *entirely* the
 # moment any chunk from its topic is retrieved, regardless of length. This
-# is still a real bound, not a value chosen to be stingy: even with
-# N_CTX raised well past what a small local model needs for one plain
-# chat turn, an unbounded expansion could still keep growing as
-# methodology documents grow, and a bound that scales with "however big
-# the document happens to be" isn't really a bound. 6000 chars (~1500
-# tokens) comfortably fits a substantial methodology document alongside
-# retrieved facts, the astro tool's chart data, and the model's own answer
-# within the current N_CTX default (32768) with a lot of headroom to
-# spare — raise it further if you have a genuinely large methodology
-# corpus and the context budget for it.
-RAG_ALWAYS_INCLUDE_MAX_CHARS = int(os.environ.get("RAG_ALWAYS_INCLUDE_MAX_CHARS", "6000"))
+# is NOT a cost/quota setting — there's no billing here, everything runs
+# locally — it's a safety margin under N_CTX (above), which is itself a
+# hard technical ceiling, not a dial to economize on: llama.cpp simply
+# cannot process more tokens than N_CTX in one call, and going past what
+# the model was actually trained to attend over (32768 for Qwen2.5)
+# degrades output quality even on hardware that could technically hold
+# more in RAM. So the real limits here are the model's own architecture
+# and however much RAM you can give the KV cache — not a preference for
+# keeping this number small. The previous default (6000) was confirmed in
+# practice to be too tight: after interpretation_methodology.txt grew past
+# ~6000 chars (adding the fabrication-guardrail and unicode-symbol
+# sections), a simulation of build_index.py's own chunking showed the cap
+# silently dropping the symbol-legend table, the whole "how to format the
+# answer" section, and the worked example — the model was never even
+# seeing that content, no matter how the wording was tuned. 16000 chars
+# (~4000-6000 tokens depending on tokenizer efficiency on Cyrillic)
+# comfortably covers the current methodology doc (~10000 chars) plus real
+# headroom for it to grow, alongside retrieved facts, the astro tool's
+# chart data, and the model's own answer, within the current N_CTX default
+# (32768). Raise it further (and N_CTX and available RAM alongside it) if
+# your methodology corpus grows past that — or check for silent truncation
+# yourself with a quick chunking simulation, which is also exactly what
+# build_index.py now warns about automatically at build time.
+RAG_ALWAYS_INCLUDE_MAX_CHARS = int(os.environ.get("RAG_ALWAYS_INCLUDE_MAX_CHARS", "16000"))
 
 # ---------- Image generation service (ycplt_img, on a separate machine) ----------
 # Passive queue — see utils/image_client.py and https://github.com/sphynkx/ycplt_img

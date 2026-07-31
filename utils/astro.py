@@ -107,6 +107,19 @@ _SIGN_NAMES_RU = {
     "Sag": "Стрелец", "Cap": "Козерог", "Aqu": "Водолей", "Pis": "Рыбы",
 }
 
+# Prepositional case ("в Раке", not "в Рак") — needed anywhere a sign name
+# follows "в" as a real grammatical phrase (get_significant_facts' RAG
+# queries and fact descriptions) rather than standing alone as a label
+# (_format_point_line's "Рак 13.2°" doesn't need this). Getting this wrong
+# isn't just clumsy Russian — reference material is normally titled/phrased
+# in this case ("Солнце в Раке"), so using the nominative form here would
+# also weaken the targeted RAG queries' match against it.
+_SIGN_NAMES_RU_PREPOSITIONAL = {
+    "Овен": "Овне", "Телец": "Тельце", "Близнецы": "Близнецах", "Рак": "Раке",
+    "Лев": "Льве", "Дева": "Деве", "Весы": "Весах", "Скорпион": "Скорпионе",
+    "Стрелец": "Стрельце", "Козерог": "Козероге", "Водолей": "Водолее", "Рыбы": "Рыбах",
+}
+
 _POINT_NAMES_RU = {
     "Sun": "Солнце", "Moon": "Луна", "Mercury": "Меркурий", "Venus": "Венера",
     "Mars": "Марс", "Jupiter": "Юпитер", "Saturn": "Сатурн", "Uranus": "Уран",
@@ -615,6 +628,129 @@ def _format_transit_text(natal, transit) -> str:
     if not shown:
         lines.append("  (нет аспектов в пределах орбиса)")
     return "\n".join(lines)
+
+
+_ANGULAR_HOUSES = {1, 4, 7, 10}
+_SUCCEDENT_HOUSES = {2, 5, 8, 11}
+
+
+def get_significant_facts(spec: str, top_n: int = 8) -> List[Dict]:
+    """Extracts the most significant individual placements/aspects from a
+    natal chart, ranked by the same qualitative priority rules
+    rag_data/astrology/interpretation_methodology.txt already states in
+    prose (angularity, orb precision, retrogradation) — reimplemented here
+    in plain Python rather than left for an LLM to apply on the fly. Each
+    returned fact carries one or two natural-language RAG query strings
+    ("Юпитер в Тельце", "Юпитер в 12 доме", "квадрат Сатурн и Уран") meant
+    for utils/rag.py's retrieve_similarity_only(): reference material about
+    what a specific placement or aspect *means* is usually organized and
+    titled that way, and a single top-k search against the user's free-text
+    birth-data question has no lexical overlap with it at all — this is
+    what makes targeted, per-fact retrieval possible instead of hoping one
+    generic search surfaces the right handful of paragraphs out of a large
+    indexed corpus.
+
+    Returns [] (not an error) if the chart can't be built at all — callers
+    should already be checking is_error_result() on the main tool result
+    before bothering with this, since there's nothing to rank without a
+    chart.
+
+    Natal charts only for now — transit significance would need different
+    scoring (which *transiting* aspect matters depends on separation from
+    exact and which natal point it touches, not angularity of the transit
+    moment itself), left as a follow-up rather than bolted on here."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return []
+    try:
+        subject = _build_subject(fields, name=fields.get("name") or "Subject")
+    except Exception:
+        return []
+
+    from kerykeion import AspectsFactory
+
+    m = subject.model()
+    facts: List[Dict] = []
+    aspect_counts: Dict[str, int] = {}
+
+    aspects = AspectsFactory.natal_aspects(
+        m, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_MAJOR_ASPECTS,
+    ).aspects
+    for a in aspects:
+        aspect_counts[a.p1_name] = aspect_counts.get(a.p1_name, 0) + 1
+        aspect_counts[a.p2_name] = aspect_counts.get(a.p2_name, 0) + 1
+
+    for label, attr in _PLANET_ATTRS:
+        point = getattr(subject, attr)
+        house_num = _house_number(getattr(point, "house", None)) or 0
+        sign_ru = _SIGN_NAMES_RU.get(point.sign, point.sign)
+        retrograde = bool(getattr(point, "retrograde", False))
+
+        score = 0.0
+        if house_num in _ANGULAR_HOUSES:
+            score += 3.0
+        elif house_num in _SUCCEDENT_HOUSES:
+            score += 1.5
+        if retrograde:
+            score += 0.5
+        score += 0.5 * aspect_counts.get(attr_to_kerykeion_name(attr), 0)
+
+        sign_prep = _SIGN_NAMES_RU_PREPOSITIONAL.get(sign_ru, sign_ru)
+        retro_text = " (ретроградный)" if retrograde else ""
+        facts.append(
+            {
+                "kind": "planet",
+                "text": f"{label} в {sign_prep}, {house_num} дом{retro_text}"
+                if house_num else f"{label} в {sign_prep}{retro_text}",
+                "queries": [f"{label} в {sign_prep}"]
+                + ([f"{label} в {house_num} доме"] if house_num else []),
+                "score": score,
+            }
+        )
+
+    for a in aspects:
+        # Orb precision matters more than aspect type per the methodology
+        # ("точность важнее типа") — score purely on how exact the aspect
+        # is, plus a small bonus for touching an angle (Ascendant/MC),
+        # which the priority rules also call out as amplifying relevance.
+        score = max(0.0, 8.0 - a.orbit)
+        if a.p1_name in ("Ascendant", "Medium_Coeli") or a.p2_name in ("Ascendant", "Medium_Coeli"):
+            score += 1.0
+        p1_ru, p2_ru, aspect_ru = _point_ru(a.p1_name), _point_ru(a.p2_name), _aspect_ru(a.aspect)
+        facts.append(
+            {
+                "kind": "aspect",
+                "text": f"{p1_ru} — {aspect_ru} — {p2_ru} (орбис {a.orbit:.1f}°)",
+                "queries": [f"{aspect_ru} {p1_ru} и {p2_ru}"],
+                "score": score,
+            }
+        )
+
+    # Planet and aspect scores aren't on comparable scales (aspect scores
+    # run up to ~8 from orb precision alone, planet scores top out around
+    # ~5), so a single global sort/cutoff was found in testing to silently
+    # exclude every planet-in-sign/house fact in favor of aspects — exactly
+    # the fact type responsible for the real errors this whole mechanism
+    # exists to fix (e.g. a Cancer Sun described as "leadership"). Ranking
+    # each kind separately and taking half the budget from each guarantees
+    # both are represented regardless of the scale mismatch.
+    planets = sorted((f for f in facts if f["kind"] == "planet"), key=lambda f: f["score"], reverse=True)
+    aspects = sorted((f for f in facts if f["kind"] == "aspect"), key=lambda f: f["score"], reverse=True)
+    half = max(1, top_n // 2)
+    return planets[:half] + aspects[:top_n - half]
+
+
+def attr_to_kerykeion_name(attr: str) -> str:
+    """Maps a subject attribute name (e.g. "true_north_lunar_node") back to
+    kerykeion's own point-name literal (e.g. "True_North_Lunar_Node") as
+    used in aspect.p1_name/p2_name — small helper so get_significant_facts
+    can look up per-planet aspect counts without a second parallel table."""
+    return {
+        "sun": "Sun", "moon": "Moon", "mercury": "Mercury", "venus": "Venus",
+        "mars": "Mars", "jupiter": "Jupiter", "saturn": "Saturn",
+        "uranus": "Uranus", "neptune": "Neptune", "pluto": "Pluto",
+        "true_north_lunar_node": "True_North_Lunar_Node",
+    }.get(attr, attr)
 
 
 # Every non-chart string run_natal/run_transit can return starts with one

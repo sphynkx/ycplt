@@ -10,6 +10,30 @@ sentence-transformers
 faiss-cpu
 numpy
 pypdf
+# Auto-detects the encoding of .txt/.html source files in rag_data/
+# (cp1251, koi8-r, UTF-16, etc.) so build_index.py doesn't require every
+# file to be UTF-8 — without it, build_index.py falls back to a fixed
+# encoding list, which is less reliable but still works.
+charset-normalizer
+# Strips tags/scripts/styles to read .html/.htm source files.
+beautifulsoup4
+# Converts .rtf source files to plain text — pure Python, no system tool needed.
+striprtf
+# Extracts .rar/.arj/.7z source archives (build_index.py reads .zip
+# directly via the stdlib, no extra package needed for that one). Also
+# needs a matching system tool installed — see README.md's "RAG source
+# formats" section for exact package names on Debian/Ubuntu and Fedora
+# (they differ, and Fedora's own packaging for this has been in flux).
+patool
+# Legacy binary .doc (MS Word 97-2003) source files are read via the
+# antiword system tool if present — no Python package needed for this
+# one; without antiword installed, build_index.py falls back to a cruder
+# built-in text scrape instead of skipping such files entirely.
+#
+# .ha archives (the old "HA" DOS-era format) have no current package on
+# any distro and aren't recognized by patool at all — see build_index.py's
+# module docstring. Not something pip/dnf/apt can fix; mentioned here so
+# it isn't mistaken for an oversight in this file.
 
 # Optional, only needed for the astrology chart tool (utils/astro.py):
 # fully local/offline (Swiss Ephemeris via pyswisseph), no API key needed.

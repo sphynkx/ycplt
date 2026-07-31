@@ -34,7 +34,7 @@ Every /chat call:
 import asyncio
 import base64
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -44,6 +44,7 @@ from utils import astro
 from utils import config
 from utils import image_client
 from utils import intent
+from utils import interpret
 from utils import llm as llm_utils
 from utils import rag as rag_utils
 from utils import tool_router
@@ -385,15 +386,51 @@ async def _handle_tool_request(
             # methodology chunk happened to rank in the top-k on its own.
             "always_include": True,
         }
-        # computed_chunk goes FIRST, not appended after the (possibly long,
-        # up to RAG_ALWAYS_INCLUDE_MAX_CHARS) methodology text: a real
-        # failure was observed where the model's "Рассуждение:" correctly
-        # used this data but "Ответ:" then claimed no data was given —
-        # putting the actual person's data immediately after "Context:",
-        # ahead of generic reference material, plus the strengthened
-        # wording above and build_prompt's explicit consistency
-        # instruction, are the mitigations for that.
-        followup_prompt = rag_utils.build_prompt(req.query, [computed_chunk] + rag_contexts)
+
+        # Multi-stage RAG: rank the chart's own significant facts, run a
+        # targeted retrieval query per fact, and have the model "digest"
+        # those raw fragments into already-reasoned notes in one extra
+        # call, before the final answer call below even starts — see
+        # utils/interpret.py's module docstring for the full rationale
+        # (a plain top-k search against the user's free-text question
+        # essentially never surfaces reference material organized by
+        # specific placement/aspect, however large that reference corpus
+        # is). Natal charts only for now (get_significant_facts' own
+        # scoring is natal-specific); transit significance would need
+        # different ranking, left as a follow-up.
+        digest_chunks: List[Dict] = []
+        if decision.tool_name == "astro_natal_chart":
+            facts = astro.get_significant_facts(tool_arg)
+            digested = await interpret.digest_facts_async(facts)
+            if digested:
+                digest_chunks = [
+                    {
+                        "text": (
+                            "ОСМЫСЛЕННЫЕ ЗАМЕТКИ ПО ЗНАЧИМЫМ ФАКТАМ КАРТЫ (уже "
+                            "получены отдельным рассуждением с учётом правил силы/"
+                            "приоритета из методологии и найденных по каждому факту "
+                            "справочных материалов — используй как готовый строительный "
+                            "материал для ответа, не противоречь им и не переспрашивай "
+                            "то, что в них уже объяснено):\n" + digested
+                        ),
+                        "topic": "astrology",
+                        "always_include": True,
+                    }
+                ]
+
+        # Order matters: raw computed data first, then the digested
+        # per-fact notes, then general retrieved/methodology context — a
+        # real failure was observed where the model's "Рассуждение:"
+        # correctly used the raw data but "Ответ:" then claimed no data
+        # was given; putting the actual person's data immediately after
+        # "Context:", ahead of generic reference material, plus the
+        # strengthened wording above and build_prompt's explicit
+        # consistency instruction, are the mitigations for that. The
+        # digested notes sit between the two for the same reason — they're
+        # specific to this chart, not generic reference material.
+        followup_prompt = rag_utils.build_prompt(
+            req.query, [computed_chunk] + digest_chunks + rag_contexts
+        )
         # Interpretation benefits from a bit more creative latitude than
         # the default chat temperature, and from not being nudged toward
         # brevity the way the generic tool prompt below is ("...concisely").

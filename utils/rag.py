@@ -68,6 +68,37 @@ def is_available() -> bool:
     return _faiss_index is not None and _embed_model is not None
 
 
+def _similarity_search(query: str, top_k: int) -> List[Dict[str, Any]]:
+    """The plain top-k similarity lookup shared by retrieve_context (below)
+    and retrieve_similarity_only — no always-include expansion here, just
+    embed the query and return the nearest chunks."""
+    import faiss
+
+    q_emb = _embed_model.encode([query], convert_to_numpy=True)
+    faiss.normalize_L2(q_emb)
+    D, I = _faiss_index.search(q_emb, top_k)
+
+    results: List[Dict[str, Any]] = []
+    for idx in I[0]:
+        if 0 <= idx < len(_meta):
+            results.append(_meta[idx])
+    return results
+
+
+def retrieve_similarity_only(query: str, top_k: int = 2) -> List[Dict[str, Any]]:
+    """Plain top-k similarity search, no always-include expansion — used
+    for targeted, per-fact retrieval (utils/interpret.py) where the "query"
+    is something like "Юпитер в 12 доме" rather than the user's actual
+    question. Pulling in a topic's entire methodology document again for
+    every one of a dozen per-fact queries would be pure waste (it's already
+    included once via retrieve_context/build_prompt) — this function exists
+    specifically to avoid that, returning just the handful of chunks that
+    are actually about this one specific fact."""
+    if not is_available():
+        return []
+    return _similarity_search(query, top_k)
+
+
 def retrieve_context(query: str, top_k: int = config.TOP_K) -> List[Dict[str, Any]]:
     """Returns a list of chunk dicts (text/topic/always_include), not just
     plain strings — build_prompt needs always_include to decide whether to
@@ -92,23 +123,10 @@ def retrieve_context(query: str, top_k: int = config.TOP_K) -> List[Dict[str, An
     """
     if not is_available():
         return []
-    import faiss
 
-    q_emb = _embed_model.encode([query], convert_to_numpy=True)
-    faiss.normalize_L2(q_emb)
-    D, I = _faiss_index.search(q_emb, top_k)
-
-    results: List[Dict[str, Any]] = []
-    seen_ids = set()
-    topics_hit = set()
-
-    for idx in I[0]:
-        if 0 <= idx < len(_meta):
-            chunk = _meta[idx]
-            results.append(chunk)
-            seen_ids.add(chunk.get("id"))
-            if chunk.get("topic"):
-                topics_hit.add(chunk["topic"])
+    results = _similarity_search(query, top_k)
+    seen_ids = {chunk.get("id") for chunk in results}
+    topics_hit = {chunk["topic"] for chunk in results if chunk.get("topic")}
 
     if topics_hit:
         always_include_chars = 0

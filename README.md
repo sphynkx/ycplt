@@ -42,7 +42,7 @@ install/
   .env.example                 — template for .env (copy and adjust)
   ycplt.service                — systemd unit file
 models/model.gguf          — the model file (you provide it, see below)
-rag_data/                  — RAG source documents (*.txt, *.pdf) — you provide them
+rag_data/                  — RAG source documents (.txt/.html/.rtf/.pdf/.doc/.zip/.rar/.arj/.7z/.ha) — you provide them
 data/                      — generated data:
   faiss_index.bin, meta.pkl  — RAG index (build_index.py)
   chat.sqlite3                — conversations/messages/files (created at startup)
@@ -441,6 +441,27 @@ Built-in tools:
   before" can still route correctly instead of silently failing because
   the classifier only ever saw the current message in isolation.
 
+  Multi-stage RAG for natal-chart answers (`utils/interpret.py`): plain RAG
+  (retrieve chunks similar to the user's whole question, paste them into
+  the prompt) turned out to be a poor fit for "what does this specific
+  placement mean" reference material, which is normally written and titled
+  by placement ("Солнце в Раке", "Юпитер в 12 доме") — very different
+  wording from a birth-data question, so a single top-k search rarely
+  surfaces it however large the indexed corpus is. Instead, for
+  `astro_natal_chart` answers: `utils/astro.py`'s `get_significant_facts()`
+  ranks the chart's own placements/aspects by the same qualitative priority
+  rules the methodology document states in prose (angularity, orb
+  precision, retrogradation — reimplemented in plain Python, not left for
+  the model to apply under time pressure); each significant fact gets one
+  or two targeted retrieval queries via `rag.retrieve_similarity_only()`;
+  and one additional LLM call "digests" the raw fragments found per fact
+  into short, already-reasoned notes (not just quoting the source) before
+  the final answer-synthesis call gets to see any of it. This is a real
+  latency trade — one more model call per natal-chart answer — made
+  deliberately for interpretive accuracy over speed; transit-chart answers
+  don't go through this yet (significance scoring there needs different
+  rules than a static natal chart's angularity/orb).
+
   This is meant to grow rather than stay fixed at two operations —
   `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point for
   future chart types (synastry between two people, composite charts, event-
@@ -482,16 +503,56 @@ is unnecessary complexity for now.
 
 ## RAG — search over your own documents (optional)
 
-1. Install indexing dependencies:
+1. Install indexing dependencies (`pip install -r install/requirements.txt` covers all of
+   the Python packages below in one go):
 
    ```bash
    pip install sentence-transformers faiss-cpu numpy
-   pip install pypdf   # only needed if some documents are *.pdf
+   pip install pypdf                 # only needed for *.pdf sources
+   pip install charset-normalizer    # auto-detects .txt/.html encoding (cp1251, koi8-r, ...)
+   pip install beautifulsoup4        # only needed for *.html/*.htm sources
+   pip install striprtf              # only needed for *.rtf sources (pure Python, no system tool)
+   pip install patool                # only needed for *.rar/*.arj/*.7z source archives
    ```
 
-2. Put your files (`.txt` and/or `.pdf`) in `rag_data/` (created automatically
-   on first run of the script if missing). Group documents into
-   topic subfolders if you have more than one subject —
+   `.zip` archives are read directly (stdlib, no extra package). `.rar`/`.arj`/`.7z` and
+   legacy binary `.doc` (MS Word 97-2003, NOT `.docx`) need matching **system** tools, and
+   the exact package names differ by distro:
+
+   **Debian/Ubuntu:**
+   ```bash
+   sudo apt install antiword p7zip-full unrar
+   ```
+
+   **Fedora:**
+   ```bash
+   sudo dnf install antiword p7zip p7zip-plugins unrar-free
+   ```
+   `p7zip-plugins` adds rar/arj support to `p7zip`'s `7z` command. As of Fedora 43/44,
+   Fedora also ships a newer official `7zip` package (upstream 7-Zip's own Linux port) as an
+   alternative to `p7zip` — it covers more formats out of the box but not RAR, so keep
+   `p7zip`/`p7zip-plugins` (or `unrar-free`) around if you have `.rar` files. `unrar-free` is
+   a free libarchive-based clone that provides a compatible `unrar` command without needing
+   RPM Fusion; the genuine proprietary RARLAB `unrar` is also available, but only via RPM
+   Fusion's nonfree repo — `unrar-free` (or the `unar` package, another free alternative) is
+   the simpler path for most cases.
+
+   Without `antiword`/a working `.rar`/`.arj`/`.7z` tool installed, `build_index.py` doesn't
+   fail — `.doc` files fall back to a cruder built-in text scrape, and archives it can't open
+   are skipped with a printed warning naming the file, so one missing tool never aborts the
+   whole indexing run.
+
+   `.ha` archives (an old, early-1990s DOS archiver) are a special case: this format is
+   genuinely dead and isn't packaged by any current Linux distro, nor recognized by `patool`
+   at all — `build_index.py` will only read one if you happen to have built/obtained a `ha`
+   binary yourself and put it on `PATH`; otherwise it's skipped with an explanation rather
+   than pretending there's a normal install path for it.
+
+2. Put your files (`.txt`, `.html`/`.htm`, `.rtf`, `.pdf`, `.doc`, or `.zip`/`.rar`/`.arj`/
+   `.7z`/`.ha` archives of any of those) in `rag_data/` (created automatically on first run of
+   the script if missing). Archives are extracted and their contents indexed the same way as
+   loose files, recursively (including archives nested inside archives, up to a small depth
+   limit). Group documents into topic subfolders if you have more than one subject —
    `rag_data/astrology/planets.txt`, `rag_data/cooking/pasta.txt`, and so
    on — `build_index.py` walks subfolders recursively. This is one combined
    index either way (not one per topic — there's no per-request topic
