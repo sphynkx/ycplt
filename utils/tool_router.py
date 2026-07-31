@@ -36,6 +36,16 @@ from utils.tools import TOOL_REGISTRY
 class ToolDecision:
     tool_name: Optional[str] = None
     tool_arg: str = ""
+    # The model's raw, unparsed answer — not used for any decision, kept
+    # purely so callers can log it. A parsed-to-None decision is ambiguous
+    # on its own: it means either "the model genuinely judged no tool is
+    # needed" or "the model's answer didn't match the expected TOOL:/NONE
+    # format and _parse gave up" — those are very different problems (one
+    # is a classifier accuracy issue, the other is a prompt/parsing
+    # brittleness issue against whatever model is currently loaded), and
+    # without the raw text there was previously no way to tell them apart
+    # from the server console after the fact.
+    raw_answer: str = ""
 
 
 def _build_prompt(query: str, history_context: str = "") -> str:
@@ -66,30 +76,53 @@ Answer:"""
 
 
 def _parse(answer: str) -> ToolDecision:
-    line = answer.strip().splitlines()[0].strip() if answer.strip() else ""
-    if not line.upper().startswith("TOOL:"):
-        return ToolDecision()
-    body = line[len("TOOL:"):].strip()
-    name, _, arg = body.partition("|")
-    name = name.strip()
-    if name not in TOOL_REGISTRY:
-        return ToolDecision()
-    return ToolDecision(tool_name=name, tool_arg=arg.strip())
+    """Only the first line was checked here originally, on the assumption
+    that a model told "reply with exactly one line, no other text" would
+    actually do that. In practice this is model-dependent: a larger or
+    more "chatty" model can preface the answer with a line or two of its
+    own reasoning even when explicitly told not to, which pushed the real
+    TOOL:/NONE line down and made this silently fall through to "no tool"
+    every time — not a classifier accuracy problem, a parsing brittleness
+    one. Scanning every line for the first one that actually looks like an
+    answer survives that kind of preamble; it costs nothing when the model
+    *does* follow the one-line instruction, since that's still just the
+    first line checked."""
+    raw = answer.strip()
+    if not raw:
+        return ToolDecision(raw_answer=answer)
+    for line in raw.splitlines():
+        line = line.strip().strip("*").strip()  # tolerate "**TOOL:...**"-style emphasis too
+        upper = line.upper()
+        if upper.startswith("TOOL:"):
+            body = line[len("TOOL:"):].strip()
+            name, _, arg = body.partition("|")
+            name = name.strip()
+            if name not in TOOL_REGISTRY:
+                continue
+            return ToolDecision(tool_name=name, tool_arg=arg.strip(), raw_answer=answer)
+        if upper.startswith("NONE"):
+            return ToolDecision(raw_answer=answer)
+    return ToolDecision(raw_answer=answer)
 
 
 def classify(query: str, history_context: str = "") -> ToolDecision:
     if llm_utils.get_llm() is None:
-        return ToolDecision()
+        return ToolDecision(raw_answer="<model not loaded>")
     try:
-        # max_tokens is generous relative to the old value (20): a tool
-        # argument that's a verbatim quote of birth data (astro_*) or a
-        # longer expression can run past 20 tokens and get truncated,
-        # which silently corrupted the argument in practice.
+        # max_tokens raised from 60: some models add a short line or two of
+        # their own reasoning before the actual TOOL:/NONE line despite
+        # being told not to (see _parse's docstring) — if that preamble ate
+        # most of the old budget, a long argument (a verbatim birth-data
+        # quote) could get truncated before it was ever produced. This is a
+        # generation-length allowance, not a cost control — there's no
+        # per-token cost on a local model, only the fixed latency of
+        # generating more tokens, which is worth it here to not silently
+        # corrupt or drop the tool argument.
         answer = llm_utils.generate_sync(
-            _build_prompt(query, history_context), max_tokens=60, temperature=0.0,
+            _build_prompt(query, history_context), max_tokens=120, temperature=0.0,
         )
-    except Exception:
-        return ToolDecision()
+    except Exception as e:
+        return ToolDecision(raw_answer=f"<classifier call raised: {e}>")
     return _parse(answer)
 
 

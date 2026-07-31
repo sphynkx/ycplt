@@ -7,3 +7,6 @@ models/*
 !models/.gitempty
 rag_data/*
 !rag_data/.gitempty
+
+# Local backups (RAG index/data snapshots, etc.) — not source, not tracked.
+_Xlam/

@@ -73,10 +73,12 @@ Supported source formats and their dependencies:
            been in flux (e.g. Fedora is transitioning away from p7zip
            toward a new official "7zip" package as of Fedora 43/44).
   .ha    — the old "HA" DOS-era archiver (Harri Hirvola, ~1995): genuinely
-           dead, not packaged by any current Linux distro, and not even
-           recognized by patool. Only works if you build/obtain a "ha"
-           binary yourself and put it on PATH; otherwise skipped with an
-           explanation rather than pretending there's a real install path.
+           dead and not packaged by any current Linux distro, and not even
+           recognized by patool — but a modern buildable reimplementation
+           exists (github.com/val-khokhlov/ha) with real build steps in
+           README.md's "Installation" section. Works once a "ha" binary
+           built from that (or any other) source is on PATH; otherwise
+           skipped with an explanatory warning.
   Archives are extracted to a temporary directory, walked recursively
   (nested archives are extracted too, up to a small depth limit to guard
   against runaway/zip-bomb-style nesting), and every recognized file found
@@ -123,10 +125,10 @@ _TEXT_LIKE_EXTENSIONS = (".txt", ".html", ".htm", ".pdf", ".doc", ".rtf")
 # dead, not packaged by any current Linux distro and not recognized by
 # patool at all (unlike .rar/.arj/.7z, where patool at least knows the
 # format and just needs a system tool). It's handled as a special case in
-# _extract_archive() below: if a "ha" binary happens to be on PATH
-# (e.g. manually built from the last surviving source archive), it's used;
-# otherwise the file is skipped with an explanatory warning rather than
-# pretending this format has a real install path.
+# _extract_archive() below: if a "ha" binary happens to be on PATH — e.g.
+# built from github.com/val-khokhlov/ha per README.md's "Installation"
+# section — it's used; otherwise the file is skipped with an explanatory
+# warning.
 _ARCHIVE_EXTENSIONS = (".zip", ".rar", ".arj", ".7z", ".ha")
 _ALL_EXTENSIONS = _TEXT_LIKE_EXTENSIONS + _ARCHIVE_EXTENSIONS
 
@@ -332,21 +334,22 @@ def _extract_archive(path: str, dest_dir: str) -> bool:
         # patool doesn't recognize this format at all (confirmed: it
         # raises "unknown archive format" before even looking for a
         # program), and no current Linux distro packages a "ha" binary —
-        # the format has been dead since the mid-1990s. This only works
-        # if the user has somehow obtained/built a "ha" binary themselves
-        # and put it on PATH; otherwise it's skipped with an explanation
-        # rather than silently failing or crashing the whole build.
+        # the format has been dead since the mid-1990s. github.com/
+        # val-khokhlov/ha is a modern buildable reimplementation (build
+        # steps in README.md's "Installation" section); this only works
+        # once that (or any other) "ha" binary is on PATH, otherwise it's
+        # skipped with an explanation rather than silently failing or
+        # crashing the whole build.
         try:
             subprocess.run(["ha", "x", os.path.abspath(path)], cwd=dest_dir, capture_output=True, timeout=60, check=True)
             return True
         except FileNotFoundError:
             print(
-                f"Warning: skipping {path} — .ha (the old HA/Hirvola archiver) has no "
-                "packaged tool on any current Linux distro; it's effectively an "
-                "abandoned format. This will only work if you build the last known "
-                "Linux port yourself and put a `ha` binary on PATH — otherwise, "
-                "extract this file manually with whatever old tool you have and "
-                "add the extracted contents to rag_data/ directly instead."
+                f"Warning: skipping {path} — .ha (the old HA/Hirvola archiver) needs a "
+                "`ha` binary on PATH; none was found. See README.md's \"Installation\" "
+                "section for build steps (github.com/val-khokhlov/ha) — or extract this "
+                "file manually with whatever old tool you have and add the extracted "
+                "contents to rag_data/ directly instead."
             )
             return False
         except Exception as e:

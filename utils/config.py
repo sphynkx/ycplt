@@ -61,6 +61,19 @@ N_THREADS = int(os.environ.get("N_THREADS", "4"))
 # down if your hardware genuinely can't spare the RAM.
 N_CTX = int(os.environ.get("N_CTX", "32768"))
 N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "0"))  # no usable GPU acceleration on this hardware
+# llama-cpp-python's own default is already 1.1, not 1.0 — this is a
+# slightly higher explicit floor, set after a real, reproducible glitch: a
+# long generation (the astro sectioned answer, which repeats concepts like
+# "practical/practicality" across several paragraphs) started emitting
+# stray Chinese characters mid-sentence (Qwen models' vocabulary includes
+# CJK tokens, and a small quantized model under-penalized for repetition
+# can apparently fall back to one instead of rephrasing in Russian). This
+# is a real trade-off, not a free fix: too high a value can make the model
+# avoid necessary repeated words (planet/sign names have to repeat
+# legitimately in this app's output) or produce less coherent text — raise
+# further only if the glitch recurs, and lower it back toward 1.1 if
+# answers start reading as unnaturally avoidant of repeating chart terms.
+REPEAT_PENALTY = float(os.environ.get("REPEAT_PENALTY", "1.15"))
 
 # ---------- Chat history (conversations, messages, file attachments — see db/) ----------
 DB_PATH = _resolve_path("DB_PATH", "data/chat.sqlite3")

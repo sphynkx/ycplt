@@ -86,6 +86,90 @@
   }
 
   // ---------- Рендер сообщений ----------
+  //
+  // renderProseText below is a deliberately tiny "markdown-lite" renderer,
+  // not a full markdown parser and not raw HTML from the model. It exists
+  // because the astro answer prompt (utils/interpret.py) asks the model
+  // for "## Заголовок" section headers and "**жирный**" emphasis, and this
+  // UI used to just dump that text via textContent — so those markers
+  // showed up as literal "##"/"**" characters instead of being rendered.
+  // Two ways to fix that were considered: (a) have the model emit raw
+  // HTML tags directly and drop them into innerHTML as-is, or (b) keep the
+  // model's existing markdown-style output and parse just the handful of
+  // patterns actually used into DOM elements built via textContent/
+  // createElement. (b) is what's implemented here — it never calls
+  // innerHTML with model-generated text at all, so any stray "<", ">", or
+  // "&" the model happens to write (degree comparisons, HTML-like
+  // abbreviations, whatever) always renders as plain literal text instead
+  // of being interpreted as markup — safe by construction rather than by
+  // sanitizing, and it needed no prompt change since the model was already
+  // emitting correct markdown syntax.
+  function renderInlineFormatted(el, text) {
+    // Splits on **bold** spans; everything else (including any literal
+    // "<"/">"/"&") goes through as plain text nodes, never interpreted as
+    // markup. Single newlines within a paragraph become <br> so multi-line
+    // list-like content (e.g. "1. ...\n2. ...") still breaks visually.
+    const parts = text.split(/(\*\*[^*\n]+\*\*)/g);
+    for (const part of parts) {
+      if (part.length > 4 && part.startsWith('**') && part.endsWith('**')) {
+        const strong = document.createElement('strong');
+        strong.textContent = part.slice(2, -2);
+        el.appendChild(strong);
+        continue;
+      }
+      const lines = part.split('\n');
+      lines.forEach((line, i) => {
+        if (i > 0) el.appendChild(document.createElement('br'));
+        if (line) el.appendChild(document.createTextNode(line));
+      });
+    }
+  }
+
+  function renderProseText(container, text) {
+    // Line-by-line, not paragraph-first: a real answer often puts a
+    // "## Heading" directly above the very next line of prose with no
+    // blank line in between (the model follows the prompt's "## Section"
+    // instruction literally but doesn't always add a blank line after
+    // it) — splitting on blank lines first would leave a heading line
+    // glued to the following paragraph as one blob, so the "#" marker
+    // never gets recognized as its own heading at all. Scanning line by
+    // line and flushing the accumulated paragraph buffer whenever a
+    // heading line or a blank line is hit fixes that (confirmed against
+    // a real generated answer with this exact heading-then-prose shape).
+    const lines = text.split('\n');
+    let buffer = [];
+    const flush = () => {
+      if (!buffer.length) return;
+      const para = buffer.join('\n').trim();
+      buffer = [];
+      if (!para) return;
+      const p = document.createElement('div');
+      p.className = 'msg-text';
+      renderInlineFormatted(p, para);
+      container.appendChild(p);
+    };
+    for (const line of lines) {
+      if (line.trim() === '') {
+        flush();
+        continue;
+      }
+      // ## -> h3, since the message bubble itself is already the "page" —
+      // starting one level below a top-level h2 reads better than h1.
+      const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+      if (headingMatch) {
+        flush();
+        const level = Math.min(6, headingMatch[1].length + 2);
+        const h = document.createElement('h' + level);
+        h.className = 'msg-heading';
+        renderInlineFormatted(h, headingMatch[2].trim());
+        container.appendChild(h);
+        continue;
+      }
+      buffer.push(line);
+    }
+    flush();
+  }
+
   function renderMessageBody(container, text) {
     const fenceRe = /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g;
     let lastIndex = 0;
@@ -96,10 +180,7 @@
       any = true;
       const before = text.slice(lastIndex, match.index).trim();
       if (before) {
-        const p = document.createElement('div');
-        p.className = 'msg-text';
-        p.textContent = before;
-        container.appendChild(p);
+        renderProseText(container, before);
       }
       const pre = document.createElement('pre');
       pre.className = 'code-block';
@@ -113,15 +194,9 @@
 
     const rest = text.slice(lastIndex);
     if (!any) {
-      const p = document.createElement('div');
-      p.className = 'msg-text';
-      p.textContent = text;
-      container.appendChild(p);
+      renderProseText(container, text);
     } else if (rest.trim()) {
-      const p = document.createElement('div');
-      p.className = 'msg-text';
-      p.textContent = rest.trim();
-      container.appendChild(p);
+      renderProseText(container, rest.trim());
     }
   }
 

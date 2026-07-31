@@ -4,12 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/ycplt
+WorkingDirectory=/var/www/ycplt
 
 # No User= — this deployment runs as root.
-EnvironmentFile=/opt/ycplt/.env
+EnvironmentFile=/var/www/ycplt/.env
 
-ExecStart=/opt/ycplt/.venv/bin/python /opt/ycplt/app.py
+ExecStart=/var/www/ycplt/.venv/bin/python /var/www/ycplt/app.py
 Restart=on-failure
 RestartSec=5
 

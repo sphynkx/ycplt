@@ -108,7 +108,7 @@ _SIGN_NAMES_RU = {
 }
 
 # Prepositional case ("в Раке", not "в Рак") — needed anywhere a sign name
-# follows "в" as a real grammatical phrase (get_significant_facts' RAG
+# follows "в" as a real grammatical phrase (get_planet_profiles' RAG
 # queries and fact descriptions) rather than standing alone as a label
 # (_format_point_line's "Рак 13.2°" doesn't need this). Getting this wrong
 # isn't just clumsy Russian — reference material is normally titled/phrased
@@ -119,18 +119,33 @@ _SIGN_NAMES_RU_PREPOSITIONAL = {
     "Лев": "Льве", "Дева": "Деве", "Весы": "Весах", "Скорпион": "Скорпионе",
     "Стрелец": "Стрельце", "Козерог": "Козероге", "Водолей": "Водолее", "Рыбы": "Рыбах",
 }
+# Which preposition ("в" or "во") precedes each sign's prepositional form.
+# Plain "в" works before almost every consonant, but Russian swaps to "во"
+# before certain consonant clusters that are awkward to pronounce after "в"
+# — "Льве" (Leo) is the one case among the 12 signs this actually affects
+# ("во Льве", never "в Льве"; confirmed a real bug — a real answer used "в
+# Леве", not even the right consonant cluster). Defaults to "в" for every
+# sign not listed here.
+_SIGN_PREPOSITION = {"Лев": "во"}
 
 _POINT_NAMES_RU = {
     "Sun": "Солнце", "Moon": "Луна", "Mercury": "Меркурий", "Venus": "Венера",
     "Mars": "Марс", "Jupiter": "Юпитер", "Saturn": "Сатурн", "Uranus": "Уран",
     "Neptune": "Нептун", "Pluto": "Плутон",
-    "True_North_Lunar_Node": "Северный узел",
+    "True_North_Lunar_Node": "Северный узел", "True_South_Lunar_Node": "Южный узел",
+    "Chiron": "Хирон", "True_Lilith": "Лилит", "Pars_Fortunae": "Парс Фортуны",
+    "Vertex": "Вертекс",
     "Ascendant": "Асцендент", "Medium_Coeli": "Середина неба (MC)",
 }
 
 _ASPECT_NAMES_RU = {
     "conjunction": "соединение", "opposition": "оппозиция", "trine": "трин",
     "square": "квадрат", "sextile": "секстиль",
+    # Minor aspects — see _MINOR_ASPECTS below for why these are included
+    # with much tighter orbs than the majors above.
+    "semi-sextile": "полусекстиль", "semi-square": "полуквадрат",
+    "quintile": "квинтиль", "sesquiquadrate": "полутораквадрат",
+    "biquintile": "биквинтиль", "quincunx": "квинконс",
 }
 
 _ASPECT_MOVEMENT_RU = {
@@ -139,17 +154,74 @@ _ASPECT_MOVEMENT_RU = {
     "Static": "статичный",
 }
 
+# Unicode symbols, embedded directly in the chart text / fact descriptions
+# this module produces — NOT left as a "please use these symbols"
+# instruction for the interpreting model to follow. That was tried first
+# (a table in interpretation_methodology.txt) and the model simply ignored
+# it even when the table was confirmed to be in context — a small model
+# reliably PRESERVING a symbol that's already right there in the data it's
+# copying from is a much easier task than reliably RECALLING and
+# generating the correct one from scratch. Points/signs/aspects without a
+# genuinely standard, widely-recognized glyph (Parts, Vertex, most
+# non-classical points) deliberately have no entry here rather than an
+# invented one — same principle the methodology document states for the
+# model's own output.
+_SIGN_SYMBOLS = {
+    "Овен": "♈", "Телец": "♉", "Близнецы": "♊", "Рак": "♋", "Лев": "♌", "Дева": "♍",
+    "Весы": "♎", "Скорпион": "♏", "Стрелец": "♐", "Козерог": "♑", "Водолей": "♒", "Рыбы": "♓",
+}
+_POINT_SYMBOLS = {
+    "Солнце": "☉", "Луна": "☽", "Меркурий": "☿", "Венера": "♀", "Марс": "♂",
+    "Юпитер": "♃", "Сатурн": "♄", "Уран": "♅", "Нептун": "♆", "Плутон": "♇",
+    "Северный узел": "☊", "Южный узел": "☋", "Хирон": "⚷", "Лилит": "⚸",
+}
+_ASPECT_SYMBOLS = {
+    "соединение": "☌", "оппозиция": "☍", "трин": "△", "квадрат": "□", "секстиль": "⚹",
+    # Semisextile/quincunx/sesquiquadrate have standard, widely-recognized
+    # Unicode glyphs (U+26BA/26BB/26BC, the same "Miscellaneous Symbols"
+    # block sextile's ⚹ comes from). Semi-square, quintile, and biquintile
+    # have no comparably standard single-glyph symbol — left out rather
+    # than invented, same principle as elsewhere in this table.
+    "полусекстиль": "⚺", "полутораквадрат": "⚼", "квинконс": "⚻",
+}
+
+
+def _with_symbol(name_ru: str, symbols: Dict[str, str]) -> str:
+    """Appends " <symbol>" after a Russian name if one exists for it,
+    otherwise returns the name unchanged — never invents a symbol for
+    something not in the table above."""
+    symbol = symbols.get(name_ru)
+    return f"{name_ru} {symbol}" if symbol else name_ru
+
 
 def _point_ru(name: str) -> str:
-    return _POINT_NAMES_RU.get(name, name)
+    return _with_symbol(_POINT_NAMES_RU.get(name, name), _POINT_SYMBOLS)
 
 
 def _aspect_ru(name: str) -> str:
-    return _ASPECT_NAMES_RU.get(name, name)
+    return _with_symbol(_ASPECT_NAMES_RU.get(name, name), _ASPECT_SYMBOLS)
 
 
 def _movement_ru(name: str) -> str:
     return _ASPECT_MOVEMENT_RU.get(name, name)
+
+
+def _sign_ru(sign_code: str) -> str:
+    """Nominative Russian sign name with its symbol, e.g. "Рак ♋"."""
+    name = _SIGN_NAMES_RU.get(sign_code, sign_code)
+    return _with_symbol(name, _SIGN_SYMBOLS)
+
+
+def _sign_ru_prepositional(sign_code: str) -> str:
+    """Full prepositional phrase with symbol, e.g. "в Раке ♋" or "во Льве
+    ♌" — includes the preposition itself (see _SIGN_PREPOSITION), so
+    callers should use this as a complete phrase, not prepend their own
+    literal "в " in front of it (that was the bug: a hardcoded "в" at each
+    call site could never produce "во Льве")."""
+    name = _SIGN_NAMES_RU.get(sign_code, sign_code)
+    prep_word = _SIGN_NAMES_RU_PREPOSITIONAL.get(name, name)
+    preposition = _SIGN_PREPOSITION.get(name, "в")
+    return f"{preposition} {_with_symbol(prep_word, _SIGN_SYMBOLS)}"
 
 
 _HOUSE_ORDER = [
@@ -158,21 +230,69 @@ _HOUSE_ORDER = [
     "Ninth_House", "Tenth_House", "Eleventh_House", "Twelfth_House",
 ]
 
-# (Russian display label, AstrologicalSubject attribute name)
+# (Russian display label, AstrologicalSubjectModel attribute name). Chiron,
+# Lilith, Part of Fortune and the Vertex were added after real testing
+# showed the reference corpus (fixed stars, "fictitious"/hypothetical
+# points, Arabic Parts) existed but nothing in this module ever surfaced
+# facts about them — these four are the commonly-used-in-mainstream-
+# practice subset (out of kerykeion's much larger catalogue of dwarf
+# planets/parts/stars) added as regular "planet-like" points with their
+# own sign/house. Fixed stars are handled separately below
+# (_find_star_conjunctions) since they're conventionally read only via
+# tight conjunctions to a personal point, not as their own sign/house
+# placement the way a planet is.
 _PLANET_ATTRS = [
     ("Солнце", "sun"), ("Луна", "moon"), ("Меркурий", "mercury"), ("Венера", "venus"),
     ("Марс", "mars"), ("Юпитер", "jupiter"), ("Сатурн", "saturn"),
     ("Уран", "uranus"), ("Нептун", "neptune"), ("Плутон", "pluto"),
-    ("Северный узел", "true_north_lunar_node"),
+    ("Северный узел", "true_north_lunar_node"), ("Южный узел", "true_south_lunar_node"),
+    ("Хирон", "chiron"), ("Лилит", "true_lilith"), ("Парс Фортуны", "pars_fortunae"),
+    ("Вертекс", "vertex"),
 ]
 _ANGLE_ATTRS = [("Асцендент", "ascendant"), ("Середина неба (MC)", "medium_coeli")]
 
+# The extended set of points AstrologicalSubjectFactory.from_birth_data
+# should actually compute (see _build_subject) — kerykeion's own
+# AstrologicalSubject wrapper class is deprecated and hardcodes a fixed 18-
+# point DEFAULT_ACTIVE_POINTS list with no way to extend it (confirmed by
+# reading kerykeion's own source: backword.py's compat class doesn't
+# accept an active_points argument at all), which is why True_Lilith,
+# Pars_Fortunae, Vertex, and every fixed star used to silently come back
+# as None regardless of what this module asked for — not a missing
+# dependency, a genuinely different, non-deprecated entry point
+# (AstrologicalSubjectFactory.from_birth_data) was required.
+_FIXED_STARS = ["Regulus", "Aldebaran", "Antares", "Fomalhaut", "Spica", "Algol"]
+_FIXED_STAR_NAMES_RU = {
+    "Regulus": "Регул", "Aldebaran": "Альдебаран", "Antares": "Антарес",
+    "Fomalhaut": "Фомальгаут", "Spica": "Спика", "Algol": "Алголь",
+}
+_ACTIVE_POINTS_NATAL = [
+    "Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus",
+    "Neptune", "Pluto", "True_North_Lunar_Node", "True_South_Lunar_Node",
+    "Chiron", "True_Lilith", "Pars_Fortunae", "Vertex",
+    "Ascendant", "Medium_Coeli", "Descendant", "Imum_Coeli",
+] + _FIXED_STARS
+
+# For the *transiting* moment's own subject in run_transit — deliberately
+# narrower than _ACTIVE_POINTS_NATAL: fixed stars don't move, so nothing
+# meaningful "transits" them, and the Vertex is itself derived from the
+# moment/location rather than being a body in motion, so a "transiting
+# Vertex" isn't a standard reading either. Chiron/Lilith/Part of Fortune
+# ARE conventionally read as transiting bodies, so those stay.
+_ACTIVE_POINTS_TRANSIT = [
+    p for p in _ACTIVE_POINTS_NATAL if p not in _FIXED_STARS and p != "Vertex"
+]
+
 # kerykeion's own point-name literals, used for AspectsFactory filtering —
-# restricting to the classical set keeps the aspect list short and relevant
-# (unfiltered, kerykeion also considers dozens of asteroids/fixed stars).
+# restricting to this set keeps the aspect list relevant. Fixed stars are
+# deliberately excluded here (see _find_star_conjunctions): the standard
+# aspect/orb table below is right for planets and points but far too
+# generous for a star, which is conventionally only significant on a tight
+# conjunction (~1°), not a wide trine or square.
 _ASPECT_ACTIVE_POINTS = [
     "Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn",
-    "Uranus", "Neptune", "Pluto", "True_North_Lunar_Node",
+    "Uranus", "Neptune", "Pluto", "True_North_Lunar_Node", "Chiron",
+    "True_Lilith", "Pars_Fortunae",
     "Ascendant", "Medium_Coeli",
 ]
 _MAJOR_ASPECTS = [
@@ -182,6 +302,38 @@ _MAJOR_ASPECTS = [
     {"name": "square", "orb": 7},
     {"name": "sextile", "orb": 5},
 ]
+# Minor aspects: present in the indexed reference corpus (per the user's
+# real testing) but never computed at all before, so that material was
+# unreachable no matter how good the corpus was — the same class of gap
+# houses/stars/Parts had before tasks #101-103. Orbs are kept much tighter
+# than the majors' above (2-3° vs 5-8°) per standard astrological
+# convention: minor aspects are considered meaningful only close to exact,
+# unlike majors which stay significant across a wider separation. Quincunx
+# gets a slightly wider orb than the other minors — conventionally treated
+# as the most significant of this group. kerykeion itself only enables one
+# minor aspect (quintile, 1° orb) by default; the rest were never
+# reachable via this app at all before this list existed.
+_MINOR_ASPECTS = [
+    {"name": "semi-sextile", "orb": 2},
+    {"name": "semi-square", "orb": 2},
+    {"name": "quintile", "orb": 2},
+    {"name": "sesquiquadrate", "orb": 2},
+    {"name": "biquintile", "orb": 2},
+    {"name": "quincunx", "orb": 3},
+]
+# Combined list passed to AspectsFactory everywhere aspects are computed
+# (natal, transit, significant-fact scoring) — kerykeion takes one
+# active_aspects list, not separate major/minor calls. Kept as two named
+# lists above (rather than one flat one) purely so the rationale for each
+# tier's orbs stays attached to it in the source, not because anything
+# downstream treats major/minor differently — scoring in
+# get_planet_profiles is purely by orb tightness regardless of aspect
+# type, per the methodology's "точность важнее типа" rule, so a very tight
+# minor aspect can legitimately outrank a loose major one.
+_ALL_ASPECTS = _MAJOR_ASPECTS + _MINOR_ASPECTS
+# Fixed stars barely move, so what matters is a personal point sitting
+# right on top of one — kept tight and separate from _ALL_ASPECTS' orbs.
+_STAR_CONJUNCTION_ORB = 1.5
 
 _REQUIRED_FIELDS = ("date", "time", "lat", "lon", "tz")
 
@@ -235,11 +387,17 @@ def warmup() -> None:
     except Exception:
         pass
     try:
-        from kerykeion import AstrologicalSubject
+        from kerykeion.astrological_subject_factory import AstrologicalSubjectFactory
 
-        AstrologicalSubject(
+        # Warms the richer natal active_points set (fixed stars, Lilith,
+        # Part of Fortune, Vertex, ...), not just the classical 10 planets
+        # — this is the actual code path run_natal/get_planet_profiles
+        # exercise per request, and the whole point of warmup() is to move
+        # first-use cost here instead of onto a user's request.
+        AstrologicalSubjectFactory.from_birth_data(
             name="warmup", year=2000, month=1, day=1, hour=12, minute=0,
             lat=0.0, lng=0.0, tz_str="UTC", online=False,
+            active_points=_ACTIVE_POINTS_NATAL,
         )
     except Exception:
         pass
@@ -525,41 +683,135 @@ def _house_number(house_name: Optional[str]) -> Optional[int]:
 
 
 def _format_point_line(label: str, point) -> str:
-    sign = _SIGN_NAMES_RU.get(point.sign, point.sign)
+    sign = _sign_ru(point.sign)
     house_num = _house_number(getattr(point, "house", None))
     house_part = f", дом {house_num}" if house_num else ""
     retro = " (ретроградный)" if getattr(point, "retrograde", False) else ""
     return f"{label}: {sign} {point.position:.1f}°{house_part}{retro}"
 
 
-def _build_subject(fields: Dict[str, str], name: str):
-    from kerykeion import AstrologicalSubject
+def _build_subject(fields: Dict[str, str], name: str, active_points: Optional[List[str]] = None):
+    """Builds a chart via AstrologicalSubjectFactory.from_birth_data —
+    NOT kerykeion's own `AstrologicalSubject` class, which is a deprecated
+    backward-compat wrapper (confirmed by reading kerykeion's source,
+    backword.py) that hardcodes an 18-point DEFAULT_ACTIVE_POINTS list
+    with no way to ask for anything beyond it. That's why Lilith (the
+    "true" variant), the Part of Fortune, the Vertex, and every fixed star
+    used to silently come back as None regardless of what this module
+    tried to do with them — not a missing dependency or a bug in this
+    file's own translation tables, a fundamentally different constructor
+    was required to get them computed at all.
+
+    active_points defaults to _ACTIVE_POINTS_NATAL (the rich set used for
+    a person's own birth chart); run_transit passes _ACTIVE_POINTS_TRANSIT
+    for the moving/transiting side instead."""
+    from kerykeion.astrological_subject_factory import AstrologicalSubjectFactory
 
     date_str = fields["date"]
     time_str = fields.get("time", "12:00")
     year, month, day = (int(x) for x in date_str.split("-"))
     hour, minute = (int(x) for x in time_str.split(":"))
-    return AstrologicalSubject(
+    return AstrologicalSubjectFactory.from_birth_data(
         name=name,
         year=year, month=month, day=day, hour=hour, minute=minute,
         lat=float(fields["lat"]), lng=float(fields["lon"]), tz_str=fields["tz"],
         city=fields.get("city") or None, nation=fields.get("nation") or None,
         online=False,
+        active_points=active_points if active_points is not None else _ACTIVE_POINTS_NATAL,
     )
+
+
+def _find_star_conjunctions(subject) -> List[Dict]:
+    """Fixed stars are conventionally read only via a tight conjunction to
+    a personal point (typically ~1° orb), not as their own sign/house
+    placement the way a planet is read, and not via the standard 5-aspect
+    table (a fixed star "trine" is essentially meaningless — the star
+    hasn't moved, only the natal point's own degree happens to be some
+    angle away). This checks each of _FIXED_STARS against each classical
+    point/angle for a conjunction within _STAR_CONJUNCTION_ORB, entirely
+    separately from AspectsFactory.natal_aspects."""
+    classical = [attr for _, attr in _PLANET_ATTRS if attr not in ("chiron", "true_lilith", "pars_fortunae", "vertex")]
+    classical += [attr for _, attr in _ANGLE_ATTRS]
+
+    facts: List[Dict] = []
+    for star_en in _FIXED_STARS:
+        star_point = getattr(subject, star_en.lower(), None)
+        if star_point is None:
+            continue
+        star_ru = _FIXED_STAR_NAMES_RU.get(star_en, star_en)
+        for attr in classical:
+            point = getattr(subject, attr, None)
+            if point is None:
+                continue
+            separation = abs(point.position - star_point.position)
+            separation = min(separation, 360.0 - separation)
+            if separation <= _STAR_CONJUNCTION_ORB:
+                label = next(l for l, a in (_PLANET_ATTRS + _ANGLE_ATTRS) if a == attr)
+                point_ru = _point_ru_from_label(label)
+                facts.append(
+                    {
+                        "kind": "star",
+                        "text": f"{point_ru} — соединение со звездой {star_ru} (орбис {separation:.1f}°)",
+                        "queries": [f"{point_ru} соединение звезда {star_ru}", f"звезда {star_ru}"],
+                        "score": max(0.0, 3.0 - separation),
+                    }
+                )
+    return facts
+
+
+def _point_ru_from_label(label: str) -> str:
+    """_PLANET_ATTRS/_ANGLE_ATTRS labels are already Russian names without
+    a symbol (e.g. "Солнце", not "Sun") — this adds the symbol the same
+    way _point_ru does for kerykeion's own English literals, without
+    needing a reverse lookup back to English first."""
+    return _with_symbol(label, _POINT_SYMBOLS)
+
+
+# Genitive case ("трин Солнца и Луны", not "трин Солнце и Луна") — needed
+# for get_planet_profiles' pre-formatted aspect phrases (see "phrase" below).
+# This exists because of a real, reproducible grammar failure: the digest/
+# final-answer prompts used to just say "<аспект> к <planet>", where
+# "к" grammatically demands the DATIVE case ("к Венере"), but the point
+# labels everywhere else in this module are nominative ("Венера") — asking
+# the model to paraphrase around that mismatch on the fly produced garbled
+# results in a real answer ("Лунный аспект с Венерой", "Марский аспект",
+# "Юпитерианский аспект" — invented, sometimes ungrammatical adjectives
+# standing in for a case the model couldn't confidently produce). Spelling
+# out the full genitive phrase here in code, the same way sign names got a
+# prepositional-case table, removes the ambiguity instead of hoping the
+# model resolves it correctly under time pressure.
+_POINT_NAMES_RU_GENITIVE = {
+    "Солнце": "Солнца", "Луна": "Луны", "Меркурий": "Меркурия", "Венера": "Венеры",
+    "Марс": "Марса", "Юпитер": "Юпитера", "Сатурн": "Сатурна", "Уран": "Урана",
+    "Нептун": "Нептуна", "Плутон": "Плутона",
+    "Северный узел": "Северного узла", "Южный узел": "Южного узла",
+    "Хирон": "Хирона", "Лилит": "Лилит",  # "Лилит" is indeclinable as a name
+    "Парс Фортуны": "Парса Фортуны", "Вертекс": "Вертекса",
+    "Асцендент": "Асцендента", "Середина неба (MC)": "Середины неба (MC)",
+}
+
+
+def _point_ru_genitive_from_label(label: str) -> str:
+    """Genitive counterpart to _point_ru_from_label — same plain-Russian-
+    label input (e.g. "Венера"), symbol appended the same way, but the
+    word itself declined ("Венеры ♀")."""
+    genitive = _POINT_NAMES_RU_GENITIVE.get(label, label)
+    return _with_symbol(genitive, _POINT_SYMBOLS)
 
 
 def _format_natal_text(subject) -> str:
     from kerykeion import AspectsFactory
 
-    m = subject.model()
     lines = [
         f"Натальная карта для {subject.name} "
-        f"({m.year:04d}-{m.month:02d}-{m.day:02d} {m.hour:02d}:{m.minute:02d}, "
-        f"{m.tz_str}).",
-        "Планеты:",
+        f"({subject.year:04d}-{subject.month:02d}-{subject.day:02d} {subject.hour:02d}:{subject.minute:02d}, "
+        f"{subject.tz_str}).",
+        "Планеты и точки:",
     ]
     for label, attr in _PLANET_ATTRS:
-        lines.append("  " + _format_point_line(label, getattr(subject, attr)))
+        point = getattr(subject, attr, None)
+        if point is not None:
+            lines.append("  " + _format_point_line(label, point))
     lines.append("Углы:")
     for label, attr in _ANGLE_ATTRS:
         lines.append("  " + _format_point_line(label, getattr(subject, attr)))
@@ -571,11 +823,10 @@ def _format_natal_text(subject) -> str:
         start=1,
     ):
         cusp = getattr(subject, attr)
-        sign = _SIGN_NAMES_RU.get(cusp.sign, cusp.sign)
-        lines.append(f"  Дом {i}: {sign} {cusp.position:.1f}°")
+        lines.append(f"  Дом {i}: {_sign_ru(cusp.sign)} {cusp.position:.1f}°")
 
     aspects = AspectsFactory.natal_aspects(
-        m, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_MAJOR_ASPECTS,
+        subject, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
     ).aspects
     lines.append("Аспекты:")
     if aspects:
@@ -586,24 +837,32 @@ def _format_natal_text(subject) -> str:
             )
     else:
         lines.append("  (нет аспектов в пределах орбиса)")
+
+    star_facts = _find_star_conjunctions(subject)
+    if star_facts:
+        lines.append("Соединения с неподвижными звёздами:")
+        for f in star_facts:
+            lines.append("  " + f["text"])
+
     return "\n".join(lines)
 
 
 def _format_transit_text(natal, transit) -> str:
     from kerykeion import AspectsFactory
 
-    tm = transit.model()
     lines = [
-        f"Положения планет на {tm.year:04d}-{tm.month:02d}-{tm.day:02d} "
-        f"{tm.hour:02d}:{tm.minute:02d} ({tm.tz_str}), в сравнении с натальной "
+        f"Положения планет на {transit.year:04d}-{transit.month:02d}-{transit.day:02d} "
+        f"{transit.hour:02d}:{transit.minute:02d} ({transit.tz_str}), в сравнении с натальной "
         f"картой {natal.name}.",
         "Текущие положения планет:",
     ]
     for label, attr in _PLANET_ATTRS:
-        lines.append("  " + _format_point_line(label, getattr(transit, attr)))
+        point = getattr(transit, attr, None)
+        if point is not None:
+            lines.append("  " + _format_point_line(label, point))
 
     aspects = AspectsFactory.dual_chart_aspects(
-        natal.model(), tm, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_MAJOR_ASPECTS,
+        natal, transit, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
     ).aspects
     lines.append("Транзитные аспекты к натальной карте:")
     shown = 0
@@ -633,32 +892,71 @@ def _format_transit_text(natal, transit) -> str:
 _ANGULAR_HOUSES = {1, 4, 7, 10}
 _SUCCEDENT_HOUSES = {2, 5, 8, 11}
 
+# Cap on how many of a profile's own aspects get their own targeted RAG
+# query + get spelled out in the digest prompt — without this, a
+# heavily-aspected planet (Sun/Moon/angles routinely have 5-8 aspects in
+# _ALL_ASPECTS' now-wider net including minors) would balloon both the
+# number of retrieval calls per answer and the digest prompt's length.
+# Kept to the tightest-orb ones, per the methodology's own "точность важнее
+# типа" priority rule — a wide, barely-in-orb aspect is the first thing to
+# drop when something has to give.
+_MAX_ASPECTS_PER_PROFILE = 3
 
-def get_significant_facts(spec: str, top_n: int = 8) -> List[Dict]:
-    """Extracts the most significant individual placements/aspects from a
-    natal chart, ranked by the same qualitative priority rules
-    rag_data/astrology/interpretation_methodology.txt already states in
-    prose (angularity, orb precision, retrogradation) — reimplemented here
-    in plain Python rather than left for an LLM to apply on the fly. Each
-    returned fact carries one or two natural-language RAG query strings
-    ("Юпитер в Тельце", "Юпитер в 12 доме", "квадрат Сатурн и Уран") meant
-    for utils/rag.py's retrieve_similarity_only(): reference material about
-    what a specific placement or aspect *means* is usually organized and
-    titled that way, and a single top-k search against the user's free-text
-    birth-data question has no lexical overlap with it at all — this is
-    what makes targeted, per-fact retrieval possible instead of hoping one
-    generic search surfaces the right handful of paragraphs out of a large
-    indexed corpus.
 
-    Returns [] (not an error) if the chart can't be built at all — callers
-    should already be checking is_error_result() on the main tool result
-    before bothering with this, since there's nothing to rank without a
+def get_planet_profiles(spec: str, top_n: int = 9) -> List[Dict]:
+    """Replaces the older get_significant_facts(): instead of ranking
+    planet-placement, aspect, and house-cusp facts as independent,
+    unrelated items, this builds one PROFILE per significant point —
+    its sign, house, retrograde state, and (this is the actual fix) its
+    own strongest aspects to other points, each with enough context about
+    the *other* point (its sign/house) to judge how that aspect colors
+    this one.
+
+    Why this replaced the flat fact list: real end-to-end testing (a full
+    answer reviewed by the user) showed the old design's real failure
+    mode — a planet's sign+house meaning and its aspects were digested as
+    entirely separate, unconnected facts, so the final answer described
+    "Юпитер в Овне, 12 дом" as straightforwardly expansive/fortunate
+    without ever registering that a 12th-house placement conventionally
+    mutes or hides a planet's outward expression, and never once wove an
+    aspect into any planet's characterization at all — despite aspects
+    being exactly what turns a generic sign/house description into
+    something specific to this one chart. Bundling sign+house+aspects into
+    one profile, and prompting the digest step (utils/interpret.py) to
+    synthesize them together rather than list them, is meant to fix that.
+
+    A second real complaint this addresses: standalone "what does the Nth
+    house mean" facts (the old "house" kind) produced their own free-
+    floating paragraphs in the final answer that weren't wanted at all —
+    house meaning only matters colored by what's actually placed there, so
+    there is no more standalone house-kind fact; a house's cusp sign is
+    already visible in the raw computed chart text every answer already
+    gets, which is enough context on its own without a dedicated fact/RAG
+    query for it.
+
+    Selection: scored by the same angularity/retrogradation/aspect-count
+    priority rules as before, but two categories are force-included
+    regardless of score — Pars Fortunae (an Arabic Part is inherently a
+    minor point that will rarely out-score a heavily-aspected classical
+    planet on this scale, so it was silently getting dropped every time)
+    and any point sitting in a fixed-star conjunction (same reasoning,
+    plus these are genuinely rare/notable when they do occur). Both were
+    confirmed missing from a real answer despite being present in the
     chart.
 
-    Natal charts only for now — transit significance would need different
-    scoring (which *transiting* aspect matters depends on separation from
-    exact and which natal point it touches, not angularity of the transit
-    moment itself), left as a follow-up rather than bolted on here."""
+    One combined digest LLM call still processes every returned profile
+    together (see utils/interpret.py) rather than one call per profile —
+    a per-profile call was considered (and is worth revisiting once
+    hardware/latency allow), but multiplying an already multi-minute
+    CPU-only generation by one call per profile was judged too costly for
+    now; bundling richer per-profile context into the existing single
+    digest call is the cheaper way to get the same "aspects considered
+    together with placement" result.
+
+    Returns [] (not an error) if the chart can't be built at all.
+
+    Natal charts only for now — transit significance needs different
+    scoring, left as a follow-up rather than bolted on here."""
     fields, missing = _extract_fields(spec)
     if missing:
         return []
@@ -669,22 +967,43 @@ def get_significant_facts(spec: str, top_n: int = 8) -> List[Dict]:
 
     from kerykeion import AspectsFactory
 
-    m = subject.model()
-    facts: List[Dict] = []
-    aspect_counts: Dict[str, int] = {}
-
     aspects = AspectsFactory.natal_aspects(
-        m, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_MAJOR_ASPECTS,
+        subject, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
     ).aspects
+
+    aspect_counts: Dict[str, int] = {}
     for a in aspects:
         aspect_counts[a.p1_name] = aspect_counts.get(a.p1_name, 0) + 1
         aspect_counts[a.p2_name] = aspect_counts.get(a.p2_name, 0) + 1
 
-    for label, attr in _PLANET_ATTRS:
-        point = getattr(subject, attr)
+    # Fixed-star facts, indexed by which classical point/angle they touch
+    # (their own "text" already names it first, e.g. "Сатурн ♄ —
+    # соединение..."), so each attaches to that point's profile instead of
+    # floating as its own unrelated fact kind.
+    stars_by_label: Dict[str, List[Dict]] = {}
+    for sf in _find_star_conjunctions(subject):
+        point_label = sf["text"].split(" — ", 1)[0]
+        stars_by_label.setdefault(point_label, []).append(sf)
+
+    # Kerykeion point-name -> (Russian label, subject attribute) for
+    # looking up the *other* side of an aspect's own sign/house — built
+    # once here rather than as a module-level constant since it depends on
+    # attr_to_kerykeion_name, defined further down this file.
+    all_points = _PLANET_ATTRS + _ANGLE_ATTRS
+    kery_name_to_point = {
+        attr_to_kerykeion_name(attr): (label, attr) for label, attr in all_points
+    }
+
+    profiles: List[Dict] = []
+    for label, attr in all_points:
+        point = getattr(subject, attr, None)
+        if point is None:
+            continue
         house_num = _house_number(getattr(point, "house", None)) or 0
-        sign_ru = _SIGN_NAMES_RU.get(point.sign, point.sign)
         retrograde = bool(getattr(point, "retrograde", False))
+        kery_name = attr_to_kerykeion_name(attr)
+        label_ru = _point_ru_from_label(label)
+        own_stars = stars_by_label.get(label_ru, [])
 
         score = 0.0
         if house_num in _ANGULAR_HOUSES:
@@ -693,63 +1012,120 @@ def get_significant_facts(spec: str, top_n: int = 8) -> List[Dict]:
             score += 1.5
         if retrograde:
             score += 0.5
-        score += 0.5 * aspect_counts.get(attr_to_kerykeion_name(attr), 0)
+        score += 0.5 * aspect_counts.get(kery_name, 0)
+        if own_stars:
+            score += 2.0  # a star conjunction is itself notable, not just a tiebreaker
 
-        sign_prep = _SIGN_NAMES_RU_PREPOSITIONAL.get(sign_ru, sign_ru)
+        # This profile's own aspects, each carrying the OTHER point's
+        # sign/house too — that's the piece the old flat aspect facts
+        # never carried, and is exactly what lets the digest step reason
+        # about how strong/relevant the aspecting influence itself is
+        # (e.g. a square from a planet that's itself angular and tightly
+        # aspected matters more than one from a weak, cadent placement).
+        own_aspects = []
+        for a in aspects:
+            if a.p1_name == kery_name:
+                other_kery = a.p2_name
+            elif a.p2_name == kery_name:
+                other_kery = a.p1_name
+            else:
+                continue
+            other_label, other_attr = kery_name_to_point.get(other_kery, (other_kery, None))
+            other_point = getattr(subject, other_attr, None) if other_attr else None
+            other_sign = _sign_ru(other_point.sign) if other_point is not None else ""
+            other_house = _house_number(getattr(other_point, "house", None)) if other_point is not None else None
+            # Pre-formatted, grammatically correct phrase ("трин Солнца и
+            # Луны") for the digest/final-answer prompts to quote directly
+            # instead of paraphrasing around a case mismatch themselves —
+            # see _POINT_NAMES_RU_GENITIVE's comment for the real failure
+            # this fixes.
+            phrase = (
+                f"{_aspect_ru(a.aspect)} {_point_ru_genitive_from_label(label)} "
+                f"и {_point_ru_genitive_from_label(other_label)}"
+            )
+            own_aspects.append(
+                {
+                    "orb": a.orbit,
+                    "aspect_ru": _aspect_ru(a.aspect),
+                    "movement_ru": _movement_ru(a.aspect_movement),
+                    "other_label": _point_ru_from_label(other_label),
+                    "other_sign": other_sign,
+                    "other_house": other_house,
+                    "phrase": phrase,
+                }
+            )
+        own_aspects.sort(key=lambda x: x["orb"])
+        own_aspects = own_aspects[:_MAX_ASPECTS_PER_PROFILE]
+
+        sign_prep = _sign_ru_prepositional(point.sign)
         retro_text = " (ретроградный)" if retrograde else ""
-        facts.append(
+        house_text = f", {house_num} дом" if house_num else ""
+
+        queries = [f"{label} {sign_prep}"] + ([f"{label} в {house_num} доме"] if house_num else [])
+        for asp in own_aspects:
+            queries.append(f"{asp['aspect_ru']} {label_ru} и {asp['other_label']}")
+        for sf in own_stars:
+            queries.extend(sf["queries"])
+
+        profiles.append(
             {
                 "kind": "planet",
-                "text": f"{label} в {sign_prep}, {house_num} дом{retro_text}"
-                if house_num else f"{label} в {sign_prep}{retro_text}",
-                "queries": [f"{label} в {sign_prep}"]
-                + ([f"{label} в {house_num} доме"] if house_num else []),
+                "label": label_ru,
+                "text": f"{label_ru} {sign_prep}{house_text}{retro_text}",
+                "aspects": own_aspects,
+                "stars": own_stars,
+                "queries": queries,
                 "score": score,
+                # The Sun and Moon are force-included on their own merit
+                # regardless of score — they're the two placements every
+                # mainstream reading treats as fundamental, and this
+                # scoring model (angularity/aspect-count/retrogradation)
+                # has no notion of "luminary" that would otherwise protect
+                # them from being crowded out by a chart with several
+                # fixed-star conjunctions elsewhere (a real tested case:
+                # ten other points force-included by stars alone, which
+                # left zero budget for anything score-ranked at all — the
+                # Sun and Moon included).
+                "force_include": label in ("Солнце", "Луна", "Парс Фортуны") or bool(own_stars),
             }
         )
 
-    for a in aspects:
-        # Orb precision matters more than aspect type per the methodology
-        # ("точность важнее типа") — score purely on how exact the aspect
-        # is, plus a small bonus for touching an angle (Ascendant/MC),
-        # which the priority rules also call out as amplifying relevance.
-        score = max(0.0, 8.0 - a.orbit)
-        if a.p1_name in ("Ascendant", "Medium_Coeli") or a.p2_name in ("Ascendant", "Medium_Coeli"):
-            score += 1.0
-        p1_ru, p2_ru, aspect_ru = _point_ru(a.p1_name), _point_ru(a.p2_name), _aspect_ru(a.aspect)
-        facts.append(
-            {
-                "kind": "aspect",
-                "text": f"{p1_ru} — {aspect_ru} — {p2_ru} (орбис {a.orbit:.1f}°)",
-                "queries": [f"{aspect_ru} {p1_ru} и {p2_ru}"],
-                "score": score,
-            }
-        )
-
-    # Planet and aspect scores aren't on comparable scales (aspect scores
-    # run up to ~8 from orb precision alone, planet scores top out around
-    # ~5), so a single global sort/cutoff was found in testing to silently
-    # exclude every planet-in-sign/house fact in favor of aspects — exactly
-    # the fact type responsible for the real errors this whole mechanism
-    # exists to fix (e.g. a Cancer Sun described as "leadership"). Ranking
-    # each kind separately and taking half the budget from each guarantees
-    # both are represented regardless of the scale mismatch.
-    planets = sorted((f for f in facts if f["kind"] == "planet"), key=lambda f: f["score"], reverse=True)
-    aspects = sorted((f for f in facts if f["kind"] == "aspect"), key=lambda f: f["score"], reverse=True)
-    half = max(1, top_n // 2)
-    return planets[:half] + aspects[:top_n - half]
+    forced = [p for p in profiles if p["force_include"]]
+    rest = sorted(
+        (p for p in profiles if not p["force_include"]), key=lambda p: p["score"], reverse=True
+    )
+    # top_n is a floor on forced items, not a hard cap on the whole list —
+    # a chart with several fixed-star conjunctions (a real, tested case:
+    # this one has six) can legitimately have more force-included profiles
+    # than top_n on its own, and truncating forced[top_n:] would silently
+    # drop exactly the rare points (Pars Fortunae, star conjunctions) this
+    # mechanism exists to guarantee. Only the score-ranked "rest" fill is
+    # ever capped.
+    return forced + rest[: max(0, top_n - len(forced))]
 
 
 def attr_to_kerykeion_name(attr: str) -> str:
     """Maps a subject attribute name (e.g. "true_north_lunar_node") back to
     kerykeion's own point-name literal (e.g. "True_North_Lunar_Node") as
-    used in aspect.p1_name/p2_name — small helper so get_significant_facts
+    used in aspect.p1_name/p2_name — small helper so get_planet_profiles
     can look up per-planet aspect counts without a second parallel table."""
     return {
         "sun": "Sun", "moon": "Moon", "mercury": "Mercury", "venus": "Venus",
         "mars": "Mars", "jupiter": "Jupiter", "saturn": "Saturn",
         "uranus": "Uranus", "neptune": "Neptune", "pluto": "Pluto",
         "true_north_lunar_node": "True_North_Lunar_Node",
+        "true_south_lunar_node": "True_South_Lunar_Node",
+        "chiron": "Chiron", "true_lilith": "True_Lilith",
+        "pars_fortunae": "Pars_Fortunae", "vertex": "Vertex",
+        # Angles — missing here was a real bug: the fallback below (the
+        # plain lowercase attr name) doesn't match kerykeion's actual
+        # p1_name/p2_name capitalization ("Ascendant", not "ascendant"),
+        # so get_planet_profiles' reverse lookup (kerykeion name -> label)
+        # silently failed for any aspect to an angle, printing the raw
+        # English kerykeion name ("к Ascendant") instead of the Russian
+        # label with its sign/house — confirmed via a real digest-prompt
+        # inspection.
+        "ascendant": "Ascendant", "medium_coeli": "Medium_Coeli",
     }.get(attr, attr)
 
 
@@ -820,13 +1196,14 @@ def run_transit(spec: str) -> str:
         )
 
     try:
-        from kerykeion import AstrologicalSubject
+        from kerykeion.astrological_subject_factory import AstrologicalSubjectFactory
 
-        transit_subject = AstrologicalSubject(
+        transit_subject = AstrologicalSubjectFactory.from_birth_data(
             name="Transit",
             year=dt.year, month=dt.month, day=dt.day, hour=dt.hour, minute=dt.minute,
             lat=moment_lat, lng=moment_lon, tz_str=moment_tz,
             online=False,
+            active_points=_ACTIVE_POINTS_TRANSIT,
         )
     except Exception as e:
         return f"Не удалось рассчитать текущие положения планет: {e}"

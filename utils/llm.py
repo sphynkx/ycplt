@@ -60,6 +60,12 @@ def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: fl
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
         temperature=temperature,
+        # See config.REPEAT_PENALTY's comment: set explicitly (rather than
+        # relying on llama-cpp-python's own 1.1 default) after a real
+        # generation glitch — a long, repetition-heavy answer started
+        # emitting stray Chinese characters instead of rephrasing in
+        # Russian.
+        repeat_penalty=config.REPEAT_PENALTY,
     )
     return out["choices"][0]["message"]["content"]
 

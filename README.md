@@ -64,6 +64,12 @@ GeForce 940M (2 GB) — no usable GPU acceleration for LLM inference. Hence:
 
 ## Installation
 
+Verified end-to-end on a fresh Fedora install. System packages up front cover
+everything RAG source ingestion needs (`antiword`/`.doc`, `p7zip`+
+`p7zip-plugins`/`unrar-free` for archives, `gcc`/`cmake`/`python-devel` to
+build the `ha` archiver from source — see "RAG — search over your own
+documents" below for what each package is for):
+
 ```bash
 dnf install gcc cmake python-devel antiword p7zip p7zip-plugins unrar-free
 cd /tmp
@@ -72,13 +78,25 @@ cd ha
 cmake . -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 make all
 cp ha /usr/local/bin
-cd /opt
+cd /var/www
 git clone https://github.com/sphynkx/ycplt
 cd ycplt
 python -m venv .venv
 source .venv/bin/activate
 pip install -r install/requirements.txt
 ```
+
+On Debian/Ubuntu, substitute the first line with:
+```bash
+apt install gcc cmake python3-dev antiword p7zip-full unrar
+```
+(building `ha` from source is the same either way — it isn't packaged for
+either distro).
+
+`val-khokhlov/ha` is a modern buildable reimplementation of the old
+early-1990s DOS `HA` archiver — the format itself is dead and unpackaged
+everywhere, but this gives `build_index.py` a real way to read `.ha` source
+archives instead of skipping them outright.
 
 ## Configuration (.env)
 
@@ -113,13 +131,14 @@ Key variables:
 | `N_THREADS` | `4` | Inference threads |
 | `N_CTX` | `32768` | Context window (Qwen2.5's native length — lower it if RAM is tight) |
 | `N_GPU_LAYERS` | `0` | Layers offloaded to GPU (0 = CPU only) |
+| `REPEAT_PENALTY` | `1.15` | Generation repetition penalty — raise if the model glitches into repeated or foreign-script text on long answers, lower toward llama-cpp-python's own default (1.1) if answers start avoiding necessary repeated terms (planet/sign names) |
 | `DB_PATH` | `data/chat.sqlite3` | Chat history database |
 | `RAG_DATA_DIR` | `rag_data` | RAG source documents folder |
 | `INDEX_PATH` | `data/faiss_index.bin` | Built FAISS index |
 | `META_PATH` | `data/meta.pkl` | RAG chunk metadata |
 | `EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers embedding model |
 | `TOP_K` | `3` | Number of RAG chunks retrieved per query |
-| `RAG_ALWAYS_INCLUDE_MAX_CHARS` | `6000` | Cap on methodology-doc auto-inclusion size (see utils/rag.py) |
+| `RAG_ALWAYS_INCLUDE_MAX_CHARS` | `16000` | Cap on methodology-doc auto-inclusion size (see utils/rag.py) |
 | `HF_TOKEN` | (unset) | Optional Hugging Face Hub token (rate limit / warning) |
 | `HF_HUB_OFFLINE` | (unset) | Set to `1` once models are cached, to skip Hub network checks entirely |
 | `IMAGE_SERVICE_HOST` | `192.168.7.7` | ycplt_img host |
@@ -135,15 +154,34 @@ Download a GGUF model and place it at `models/` (or point `MODEL_PATH` at it):
 wget https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf -O models/qwen2.5-3b-instruct-q4_k_m.gguf
 ```
 
-Recommendation for the reference hardware:
+Recommendation for the original reference hardware (i7-5500U, 2c/4t, 12 GB
+RAM, no usable GPU):
 
 - **Qwen2.5-3B-Instruct-GGUF** (file `qwen2.5-3b-instruct-q4_k_m.gguf`, ~2 GB) —
   https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF — good speed/quality
   balance, handles Russian well.
 - If too slow — **Qwen2.5-1.5B-Instruct-GGUF** (faster, lower quality).
-- If you want more capability and don't mind the slowdown — 7B models in
-  Q4_K_M (Qwen2.5-7B-Instruct, Mistral-7B-Instruct-v0.3), though not
-  comfortable on this CPU.
+
+On more capable CPU-only hardware (tested on an i7-8700, 6c/12t, 16 GB
+RAM, no discrete GPU) a bigger quant is comfortably usable and noticeably
+better at Russian instruction-following and long structured answers (the
+astro interpretation feature in particular benefits — see below):
+
+- **Qwen2.5-7B-Instruct, Q4_K_M** (~4.7 GB) — meaningful step up from 3B
+  while still comfortably fast on a modern 6+ core CPU:
+  https://huggingface.co/paultimothymooney/Qwen2.5-7B-Instruct-Q4_K_M-GGUF
+  (direct file: https://huggingface.co/paultimothymooney/Qwen2.5-7B-Instruct-Q4_K_M-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf)
+- **Qwen2.5-14B-Instruct, Q4_K_M** (~9 GB) — noticeably slower per token but
+  fits in 16 GB RAM alongside the default `N_CTX=32768`; the strongest
+  option confirmed to work well for this project's astro-interpretation
+  path (correct grammar, good adherence to the sectioned-answer format,
+  minimal hallucination) on this hardware tier so far:
+  https://huggingface.co/TheRains/Qwen2.5-14B-Instruct-Q4_K_M-GGUF
+  (direct file: https://huggingface.co/TheRains/Qwen2.5-14B-Instruct-Q4_K_M-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf)
+- If 14B feels tight on RAM together with the full 32768-token context,
+  lower `N_CTX` (e.g. to 8192-16384) rather than dropping back to a
+  smaller model — a single astro answer's actual prompt rarely needs the
+  full window.
 
 ## Running
 
@@ -165,9 +203,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ycplt
 ```
 
-The unit file uses `EnvironmentFile=/opt/ycplt/.env` and intentionally has no
-`User=` line (this deployment runs as root). Adjust `WorkingDirectory` and
-`ExecStart` if the app lives somewhere other than `/opt/ycplt`.
+The unit file uses `EnvironmentFile=/var/www/ycplt/.env` and intentionally
+has no `User=` line (this deployment runs as root). Adjust
+`WorkingDirectory` and `ExecStart` if the app lives somewhere other than
+`/var/www/ycplt`.
 
 ## Interface
 
@@ -455,19 +494,96 @@ Built-in tools:
   by placement ("Солнце в Раке", "Юпитер в 12 доме") — very different
   wording from a birth-data question, so a single top-k search rarely
   surfaces it however large the indexed corpus is. Instead, for
-  `astro_natal_chart` answers: `utils/astro.py`'s `get_significant_facts()`
-  ranks the chart's own placements/aspects by the same qualitative priority
-  rules the methodology document states in prose (angularity, orb
-  precision, retrogradation — reimplemented in plain Python, not left for
-  the model to apply under time pressure); each significant fact gets one
-  or two targeted retrieval queries via `rag.retrieve_similarity_only()`;
-  and one additional LLM call "digests" the raw fragments found per fact
-  into short, already-reasoned notes (not just quoting the source) before
-  the final answer-synthesis call gets to see any of it. This is a real
-  latency trade — one more model call per natal-chart answer — made
-  deliberately for interpretive accuracy over speed; transit-chart answers
-  don't go through this yet (significance scoring there needs different
-  rules than a static natal chart's angularity/orb).
+  `astro_natal_chart` answers: `utils/astro.py`'s `get_planet_profiles()`
+  builds one PROFILE per significant point — its sign, house, retrograde
+  state, its OWN aspects to other points (each aspect carrying the *other*
+  point's sign/house too, so the digest step can judge how strong that
+  aspecting influence actually is), and any fixed-star conjunction —
+  ranked by the same qualitative priority rules the methodology document
+  states in prose (angularity, orb precision, retrogradation, aspect
+  count), reimplemented in plain Python rather than left for the model to
+  apply on the fly. Each profile gets several targeted retrieval queries
+  (sign, house, one per aspect, one per star conjunction) via
+  `rag.retrieve_similarity_only()`; one additional LLM call then "digests"
+  every profile's raw fragments into one synthesized note each — not a
+  list of separate facts — explicitly weighing how each aspect colors the
+  placement (favorable aspects reinforce only the compatible qualities of
+  the aspecting planet, tense aspects create friction, strength scales
+  with orb tightness and the aspecting planet's own placement) before the
+  final answer-synthesis call gets to see any of it. This replaced an
+  earlier flat, disconnected planet/aspect/house-fact design after real
+  end-to-end review of a full answer showed its actual failure: aspects
+  were being digested in total isolation from the placement they
+  modified, so a hard square was never distinguished from a supportive
+  trine, and a 12th-house placement's normal muting effect was ignored
+  entirely — bundling sign+house+aspects into one profile is what lets a
+  single digest note actually synthesize them together. Standalone
+  "what does house N mean" facts were dropped for the same reason from
+  the other direction: they produced their own free-floating paragraphs
+  that reviewed as unwanted — a house's cusp sign is already visible in
+  the raw computed chart text every answer gets, which is enough context
+  on its own once it's no longer competing as a first-class fact of its
+  own. This is a real latency trade — one more model call per natal-chart
+  answer — made deliberately for interpretive accuracy over speed;
+  transit-chart answers don't go through this yet (significance scoring
+  there needs different rules than a static natal chart's angularity/orb).
+  A per-profile (rather than one-call-for-all) digest pass was considered
+  for even deeper synthesis but ruled out for now given how much it would
+  multiply an already multi-minute CPU-only generation — worth revisiting
+  if hardware/latency allow later.
+
+  Chart coverage beyond the classical 10 planets + Ascendant/MC: houses
+  (all 12 cusps, used as placement context, not their own fact), Chiron,
+  mean/true Lilith, Part of Fortune, Vertex, conjunctions (≤1.5°) to six
+  commonly-used fixed stars (Regulus, Aldebaran, Antares, Fomalhaut,
+  Spica, Algol), and six minor aspects (semi-sextile, semi-square,
+  quintile, sesquiquadrate, biquintile, quincunx — orbs 2-3°, much
+  tighter than the five majors' 5-8°, per standard convention that minor
+  aspects only matter close to exact) alongside the five major aspects,
+  are all computed and eligible for `get_planet_profiles()`. The extended
+  point set required switching from kerykeion's `AstrologicalSubject`
+  class to the lower-level
+  `AstrologicalSubjectFactory.from_birth_data(..., active_points=[...])` —
+  the former is a deprecated compatibility wrapper hardcoding a fixed
+  18-point list with no way to ask for anything more, which is why these
+  points always silently came back empty before. Profile selection always
+  includes the Sun, Moon, Part of Fortune, and any star-conjunct point
+  regardless of score — a pure angularity/aspect-count score has no
+  notion of "fundamental" or "rare/notable" and was confirmed (in a real
+  chart with several fixed-star conjunctions) to otherwise crowd them out
+  entirely; everything else fills the remaining budget by score.
+
+  Astrological terms (signs, points, aspects) are rendered with their
+  Unicode symbols (☉ ☽ ♈ ☌ □ △ ⚺ ⚻ ⚼ etc.) directly in the Russian text
+  `utils/astro.py` produces, rather than relying on an instruction asking
+  the model to recall or insert them — more reliable in practice, since
+  the model already has the real computed data to copy the symbol from
+  instead of having to generate it correctly from scratch. Signs without a
+  widely-standard single-glyph symbol (semi-square, quintile, biquintile)
+  are deliberately left without one rather than an invented glyph.
+
+  The final natal-chart answer is generated from a dedicated sectioned
+  prompt (`interpret.build_sectioned_answer_prompt()`) instead of the
+  generic reasoning-mode template `rag.build_prompt()` uses elsewhere: real
+  repeated testing showed the generic template's answer collapsing into a
+  single short paragraph regardless of how strongly it was told to
+  elaborate, since an abstract "write in detail" instruction isn't a strong
+  forcing function on its own. The sectioned prompt instead names seven
+  concrete section headers (identity, home/emotional life, mind, love,
+  work, growth/challenges, summary), requested as markdown headers, that
+  the model must fill in turn, using the computed chart data plus the
+  digested per-profile notes above — with an explicit instruction to
+  always reuse a point's sign/house exactly as given rather than
+  re-deriving it (added after a real answer stated two different houses
+  for the same planet in two different sections) and a rule against
+  non-Russian/CJK script leakage (added after a real answer, generated by
+  a small quantized model under repetitive phrasing, glitched into stray
+  Chinese characters mid-sentence — see `config.REPEAT_PENALTY` below for
+  the generation-side mitigation for the same issue). This section list is
+  a proposed breakdown, not a fixed schema — `interpret.ASTRO_ANSWER_SECTIONS`
+  is a plain list, easy to add to, rename, or drop sections from. Falls
+  back to the generic template if the digest step produced nothing (or for
+  transit charts, which don't use the digest step yet).
 
   This is meant to grow rather than stay fixed at two operations —
   `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point for
@@ -522,19 +638,14 @@ is unnecessary complexity for now.
    pip install patool                # only needed for *.rar/*.arj/*.7z source archives
    ```
 
-   `.zip` archives are read directly (stdlib, no extra package). `.rar`/`.arj`/`.7z` and
-   legacy binary `.doc` (MS Word 97-2003, NOT `.docx`) need matching **system** tools.
+   `.zip` archives are read directly (stdlib, no extra package). `.rar`/`.arj`/`.7z`,
+   legacy binary `.doc` (MS Word 97-2003, NOT `.docx`), and `.ha` archives need matching
+   **system** tools — see the "Installation" section above for the package names and the
+   `ha` build steps (Debian/Ubuntu and Fedora both covered there).
 
-   Without `antiword`/a working `.rar`/`.arj`/`.7z` tool installed, `build_index.py` doesn't
-   fail — `.doc` files fall back to a cruder built-in text scrape, and archives it can't open
-   are skipped with a printed warning naming the file, so one missing tool never aborts the
-   whole indexing run.
-
-   `.ha` archives (an old, early-1990s DOS archiver) are a special case: this format is
-   genuinely dead and isn't packaged by any current Linux distro, nor recognized by `patool`
-   at all — `build_index.py` will only read one if you happen to have built/obtained a `ha`
-   binary yourself and put it on `PATH`; otherwise it's skipped with an explanation rather
-   than pretending there's a normal install path for it.
+   Without these system tools installed, `build_index.py` doesn't fail: `.doc` files fall
+   back to a cruder built-in text scrape, and archives it can't open are skipped with a
+   printed warning naming the file, so one missing tool never aborts the whole indexing run.
 
 2. Put your files (`.txt`, `.html`/`.htm`, `.rtf`, `.pdf`, `.doc`, or `.zip`/`.rar`/`.arj`/
    `.7z`/`.ha` archives of any of those) in `rag_data/` (created automatically on first run of

@@ -173,7 +173,7 @@ async def chat(req: ChatRequest):
     # silently isn't being used for a message that clearly needed it.
     print(
         f"[tool_router] tool={tool_decision.tool_name!r} "
-        f"arg={tool_decision.tool_arg!r}"
+        f"arg={tool_decision.tool_arg!r} raw={tool_decision.raw_answer!r}"
     )
     if tool_decision.tool_name:
         return await _handle_tool_request(
@@ -395,42 +395,41 @@ async def _handle_tool_request(
         # (a plain top-k search against the user's free-text question
         # essentially never surfaces reference material organized by
         # specific placement/aspect, however large that reference corpus
-        # is). Natal charts only for now (get_significant_facts' own
-        # scoring is natal-specific); transit significance would need
-        # different ranking, left as a follow-up.
-        digest_chunks: List[Dict] = []
+        # is). Natal charts only for now (get_planet_profiles' own scoring
+        # is natal-specific); transit significance would need different
+        # ranking, left as a follow-up.
+        digested = ""
         if decision.tool_name == "astro_natal_chart":
-            facts = astro.get_significant_facts(tool_arg)
-            digested = await interpret.digest_facts_async(facts)
-            if digested:
-                digest_chunks = [
-                    {
-                        "text": (
-                            "ОСМЫСЛЕННЫЕ ЗАМЕТКИ ПО ЗНАЧИМЫМ ФАКТАМ КАРТЫ (уже "
-                            "получены отдельным рассуждением с учётом правил силы/"
-                            "приоритета из методологии и найденных по каждому факту "
-                            "справочных материалов — используй как готовый строительный "
-                            "материал для ответа, не противоречь им и не переспрашивай "
-                            "то, что в них уже объяснено):\n" + digested
-                        ),
-                        "topic": "astrology",
-                        "always_include": True,
-                    }
-                ]
+            profiles = astro.get_planet_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(profiles)
 
-        # Order matters: raw computed data first, then the digested
-        # per-fact notes, then general retrieved/methodology context — a
-        # real failure was observed where the model's "Рассуждение:"
-        # correctly used the raw data but "Ответ:" then claimed no data
-        # was given; putting the actual person's data immediately after
-        # "Context:", ahead of generic reference material, plus the
-        # strengthened wording above and build_prompt's explicit
-        # consistency instruction, are the mitigations for that. The
-        # digested notes sit between the two for the same reason — they're
-        # specific to this chart, not generic reference material.
-        followup_prompt = rag_utils.build_prompt(
-            req.query, [computed_chunk] + digest_chunks + rag_contexts
-        )
+        if decision.tool_name == "astro_natal_chart" and digested:
+            # Sectioned prompt instead of build_prompt's generic reasoning-
+            # mode template: repeated real testing showed the generic
+            # template's final answer collapsing to one short paragraph no
+            # matter how strongly it was told to elaborate. Only used when
+            # a digest actually succeeded — the digest step is what supplies
+            # the already-reasoned material each section weaves together;
+            # without it (digest failed, or non-natal tools below) fall back
+            # to the plain generic prompt.
+            followup_prompt = interpret.build_sectioned_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts
+            )
+        else:
+            # Order matters: raw computed data first, then general
+            # retrieved/methodology context — a real failure was observed
+            # where the model's "Рассуждение:" correctly used the raw data
+            # but "Ответ:" then claimed no data was given; putting the
+            # actual person's data immediately after "Context:", ahead of
+            # generic reference material, plus the strengthened wording
+            # above and build_prompt's explicit consistency instruction,
+            # are the mitigations for that. (No digested-notes chunk here:
+            # this branch is only reached for transit charts, or a natal
+            # chart whose digest step failed — either way there's nothing
+            # digested to include.)
+            followup_prompt = rag_utils.build_prompt(
+                req.query, [computed_chunk] + rag_contexts
+            )
         # Interpretation benefits from a bit more creative latitude than
         # the default chat temperature, and from not being nudged toward
         # brevity the way the generic tool prompt below is ("...concisely").
