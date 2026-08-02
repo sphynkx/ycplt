@@ -154,6 +154,62 @@ _ASPECT_MOVEMENT_RU = {
     "Static": "статичный",
 }
 
+# Deterministic harmonious/tense/neutral classification per aspect TYPE —
+# added after a real, reproducible failure the user caught in a generated
+# synastry answer: a trine (Mars-Venus) and a semisextile (Saturn-Jupiter)
+# were both labeled "Точка напряжения" ("point of tension") in the final
+# prose, despite both being conventionally harmonizing aspects with no
+# standard tense/conflict reading at all. The digest prompt already SPELLS
+# OUT this same classification in prose (_build_digest_prompt's aspect_rule
+# lists "гармоничные (трин, секстиль, ...)" / "напряжённые (квадрат,
+# оппозиция, ...)"), but relying on the model to apply that rule correctly,
+# consistently, for every single aspect, under the same time/context
+# pressure that already produced invented aspect-naming adjectives
+# elsewhere (see _POINT_NAMES_RU_GENITIVE's own comment) turned out not to
+# be reliable enough — the user's own read: "создается такое впечатление,
+# что термины 'напряжение', 'конфликт' итд раскиданы по тексту случайным
+# образом". Same fix as that earlier grammar problem: compute the correct
+# answer once in Python and hand it to the model as an already-labeled
+# fact to copy, rather than a rule to re-derive from scratch each time.
+#
+# Classification follows standard mainstream convention: trine/sextile are
+# unambiguously harmonious; square/opposition are unambiguously tense;
+# conjunction is neither — it blends whatever is conjunct, so its "nature"
+# genuinely depends on the two points involved, not the aspect type alone.
+# Minor aspects: semi-sextile is a mild harmonious aspect (gentle, easy
+# blending); semi-square/sesquiquadrate are the minor-aspect counterparts
+# of square (irritating friction, tighter but real); quintile/biquintile
+# are conventionally read as harmonious-and-creative (talent, a "knack"
+# for something) — the same family as trine/sextile, not tense; quincunx
+# is the one genuinely ambiguous minor aspect (an "awkward fit" needing
+# adjustment rather than a straightforward blend) but is NOT a conflict/
+# friction aspect the way square or opposition are, so it's classified as
+# "неоднозначный" (ambiguous/adjustment-needed) rather than "напряжённый",
+# to avoid the exact overclaiming this table exists to prevent.
+_ASPECT_NATURE = {
+    "conjunction": "нейтральный (зависит от планет)",
+    "opposition": "напряжённый",
+    "trine": "гармоничный",
+    "square": "напряжённый",
+    "sextile": "гармоничный",
+    "semi-sextile": "гармоничный (мягкий)",
+    "semi-square": "напряжённый (мягкий)",
+    "quintile": "гармоничный (творческий)",
+    "sesquiquadrate": "напряжённый",
+    "biquintile": "гармоничный (творческий)",
+    "quincunx": "неоднозначный (требует приспособления, не конфликт)",
+}
+
+
+def _aspect_nature_ru(name: str) -> str:
+    """Aspect-type literal (kerykeion's own English name, e.g. "trine") ->
+    its pre-classified Russian harmonious/tense/neutral label — see
+    _ASPECT_NATURE's own comment for why this exists and the convention it
+    follows. Falls back to the neutral-ish generic label for anything not
+    in the table (there shouldn't be any, since _ALL_ASPECTS is the only
+    source of aspect names used anywhere in this module)."""
+    return _ASPECT_NATURE.get(name, "нейтральный")
+
 # Unicode symbols, embedded directly in the chart text / fact descriptions
 # this module produces — NOT left as a "please use these symbols"
 # instruction for the interpreting model to follow. That was tried first
@@ -590,49 +646,74 @@ def _lookup_city(text: str) -> Optional[dict]:
     words = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
     candidates = words + [f"{a} {b}" for a, b in zip(words, words[1:])]
 
-    exact_matches = [
+    # Exact and stem matches are pooled into ONE list and resolved by a
+    # single population comparison across all of them — NOT "exact always
+    # wins, stem is only a fallback if there's no exact match at all", an
+    # earlier version of this function's actual (if unintended) behavior.
+    # That tiering broke the "most populous match across ALL candidates
+    # wins" promise this docstring already made: a real, reproducible case
+    # found by testing — "года" ("of the year") happens to be listed as an
+    # alternate name for Gōdo, a ~19k-population Japanese town, which is
+    # an EXACT match, so it used to short-circuit and win outright even
+    # when the very same sentence also stem-matched Kyiv (pop. ~2.95M) —
+    # the two were never actually compared against each other at all.
+    # Pooling them together and comparing every candidate's population in
+    # one pass is what makes the "most populous wins" design actually hold.
+    matches: List[dict] = [
         record for record in (_city_index.get(c.lower()) for c in candidates) if record
     ]
-    if exact_matches:
-        return max(exact_matches, key=lambda r: r["population"])
-
-    stem_matches: List[dict] = []
     for candidate in candidates:
         key = candidate.lower()
-        if len(key) >= _CITY_STEM_LEN:
-            stem_matches.extend(_city_stem_index.get(key[:_CITY_STEM_LEN], []))
-    if stem_matches:
-        return max(stem_matches, key=lambda r: r["population"])
+        max_len = min(len(key), _CITY_STEM_LEN)
+        if max_len < 3:
+            continue
+        # Check a few prefix lengths, not just _CITY_STEM_LEN — a second,
+        # independent bug found alongside the one above: a base city name
+        # SHORTER than _CITY_STEM_LEN (e.g. "Киев", 4 letters) is only
+        # ever indexed under its own full-length bucket ("киев"), but a
+        # declined form in the text ("Киеве", 5 letters, "в Киеве") only
+        # ever checked its OWN 5-character bucket ("киеве") — which never
+        # matches "киев" — so a short city name's declined form could
+        # never even become a candidate at all before this fix, regardless
+        # of the tiering issue above. Checking a couple of shorter
+        # prefixes too (down to 3 characters) covers the common case of a
+        # Russian declension only adding/changing the last 1-2 letters.
+        floor = max(3, max_len - 2)
+        for length in range(max_len, floor - 1, -1):
+            matches.extend(_city_stem_index.get(key[:length], []))
+    if matches:
+        return max(matches, key=lambda r: r["population"])
     return None
 
 
-def _extract_fields(spec: str) -> Tuple[Dict[str, str], List[str]]:
-    """Combines the strict key=value fast path with free-text extraction
-    for anything still missing, then auto-resolves tz from lat/lon if it
-    wasn't given explicitly. Returns (fields, missing_field_names).
-
-    Coordinate resolution order: explicit lat/lon (key=value) > DMS/decimal
-    coordinates found in the text > a bare city name looked up via
-    geonamescache (only reached if the first two found nothing) — each
-    step only runs if the previous one came up empty."""
-    fields = _parse_spec(spec)
-
+def _fill_fields_from_text(fields: Dict[str, str], text: str) -> None:
+    """Shared free-text fallback used by both _extract_fields (single
+    person) and _extract_two_person_fields (synastry's two independent
+    text halves, see below) — mutates `fields` in place, only filling
+    keys not already present, so explicit key=value input always takes
+    priority regardless of which caller it came from. Pulled out of
+    _extract_fields (unchanged logic, just no longer duplicated) so
+    synastry's per-person field resolution can't silently drift from the
+    single-person path's own coordinate-resolution order (explicit
+    lat/lon > DMS/decimal coordinates found in the text > a bare city name
+    via geonamescache, tz last, from whichever of the previous steps
+    actually filled lat/lon)."""
     if not fields.get("date"):
-        found = _find_date(spec)
+        found = _find_date(text)
         if found:
             fields["date"] = found
     if not fields.get("time"):
-        found = _find_time(spec)
+        found = _find_time(text)
         if found:
             fields["time"] = found
     if not fields.get("lat") or not fields.get("lon"):
-        lat, lon = _find_coordinates(spec)
+        lat, lon = _find_coordinates(text)
         if lat is not None:
             fields.setdefault("lat", str(lat))
         if lon is not None:
             fields.setdefault("lon", str(lon))
     if not fields.get("lat") or not fields.get("lon"):
-        city = _lookup_city(spec)
+        city = _lookup_city(text)
         if city:
             fields.setdefault("lat", str(city["latitude"]))
             fields.setdefault("lon", str(city["longitude"]))
@@ -645,8 +726,262 @@ def _extract_fields(spec: str) -> Tuple[Dict[str, str], List[str]]:
         if tz:
             fields["tz"] = tz
 
+
+def _extract_fields(spec: str) -> Tuple[Dict[str, str], List[str]]:
+    """Combines the strict key=value fast path with free-text extraction
+    for anything still missing, then auto-resolves tz from lat/lon if it
+    wasn't given explicitly. Returns (fields, missing_field_names)."""
+    fields = _parse_spec(spec)
+    _fill_fields_from_text(fields, spec)
     missing = [k for k in _REQUIRED_FIELDS if not fields.get(k)]
     return fields, missing
+
+
+def _split_two_person_text(spec: str) -> Tuple[str, str]:
+    """Synastry needs TWO independent sets of birth fields out of one
+    free-text message — this splits the raw text into two halves, one per
+    person, as a best-effort heuristic (same accepted-approximation
+    spirit as _lookup_city's stem matching elsewhere in this module, not
+    a real parser).
+
+    Finds every recognizable date anywhere in the text (the same three
+    formats _find_date checks, via finditer instead of search so ALL
+    occurrences are found, not just the first), takes the first two by
+    position, then splits between them at the clearest available
+    separator, checked in priority order:
+      1. The LAST newline strictly between the two dates — a real,
+         common phrasing this needs to handle correctly: two people
+         listed on separate lines ("Мужчина: 5 июля 1976 в 4:30 в
+         Одессе\nЖенщина: 16 февраля 1977 в 16:46 в Днепропетровске"),
+         found via real testing. A line break is an even stronger
+         separator signal than a comma, so it's preferred whenever both
+         happen to be present.
+      2. The LAST comma strictly between the two dates — the other
+         common phrasing this is built for ("Иван, 5 июля 1976 в 4:30 в
+         Одессе, и Мария, 12 марта 1980 в 9:15 в Киеве") separates the
+         two people with exactly that comma.
+      3. If neither is present, the whitespace character closest to the
+         plain midpoint between the two dates — NEVER the raw midpoint
+         itself. A real, reproducible bug found via testing: falling
+         back to a bare midpoint can land INSIDE a word (a multi-line
+         message with no comma between the two dates split "Одесса"
+         into "Одес"/"са", silently breaking that person's city lookup
+         since neither fragment matches anything) — snapping to the
+         nearest whitespace guarantees a word is never cut in half,
+         while staying close to the same "split roughly in the middle"
+         intent.
+
+    Returns (spec, spec) unchanged if fewer than two dates are found —
+    the caller's missing-fields check doesn't specifically catch "both
+    halves resolved to the same person", but a synastry request with only
+    one person's data in it isn't a coherent request in the first place,
+    so there's no meaningfully better degenerate behavior to fall back to
+    here."""
+    matches = []
+    for regex in (_DATE_ISO_RE, _DATE_DMY_NUM_RE, _DATE_RU_RE):
+        matches.extend(regex.finditer(spec))
+    matches.sort(key=lambda m: m.start())
+    if len(matches) < 2:
+        return spec, spec
+
+    first, second = matches[0], matches[1]
+    between = spec[first.end():second.start()]
+
+    newline_pos = between.rfind("\n")
+    comma_pos = between.rfind(",")
+    if newline_pos != -1:
+        split_point = first.end() + newline_pos + 1
+    elif comma_pos != -1:
+        split_point = first.end() + comma_pos + 1
+    else:
+        midpoint_offset = (second.start() - first.end()) // 2
+        ws_positions = [m.start() for m in re.finditer(r"\s", between)]
+        if ws_positions:
+            closest = min(ws_positions, key=lambda p: abs(p - midpoint_offset))
+            split_point = first.end() + closest + 1
+        else:
+            # No whitespace at all between the two dates either (the two
+            # dates are directly adjacent with no separator whatsoever) —
+            # nothing left to snap to; the raw midpoint is the least-bad
+            # option remaining, same as before this fix.
+            split_point = first.end() + midpoint_offset
+    return spec[:split_point], spec[split_point:]
+
+
+_LABEL_JUNK_WORDS = {"и", "а"}
+
+
+def _extract_person_label(prefix_text: str) -> Optional[str]:
+    """Best-effort extraction of a short label for one synastry person —
+    their actual name if given, or a role word like "Мужчина"/"Женщина"
+    — from whatever text immediately precedes their birth date in the
+    message. Purely cosmetic: only used so the final answer refers to
+    each person the way the USER did ("используй обозначения, которыми
+    назвал их сам пользователь" — a real, reported preference: a query
+    that said "Мужчина: ... / Женщина: ..." got back an answer that
+    called them "Человек A"/"Человек B" instead, which read as needlessly
+    generic) — never used for anything that affects the actual chart
+    computation, so a wrong or missing guess here is a cosmetic
+    imperfection, not a correctness risk the way a wrong date/coordinate
+    guess would be.
+
+    Looks at the last few words right before the date, strips trailing
+    punctuation and a leading connector word ("и Мария" -> "Мария", since
+    "и" precedes the SECOND person's own label, not part of it), and
+    accepts the result only if it looks like a plausible label (starts
+    with an uppercase letter, no digits, reasonable length) — returns
+    None rather than a low-confidence guess otherwise, so the generic
+    "Человек A"/"Человек B" fallback (_build_synastry_subjects) is always
+    available.
+
+    Known limitation, accepted rather than solved: in the flowing
+    comma-separated phrasing ("Иван, 5 июля ... в Одессе, и Мария, 12
+    марта ..."), the label for the SECOND person ("Мария") ends up in the
+    tail of the FIRST person's own split half (see
+    _split_two_person_text — the split point falls right after "и
+    Мария,"), not at the head of the second half this function actually
+    looks at — so this only reliably picks up labels in phrasings where
+    each person's own label sits at the START of their own half
+    (`"Мужчина: ...", "Иван - ..."`), not the flowing comma style. Good
+    enough for the common structured case; the flowing style simply falls
+    back to the generic label instead of a wrong one."""
+    text = prefix_text.strip()
+    if not text:
+        return None
+    # Only the CURRENT LINE matters, not any earlier preamble in the same
+    # message — a real bug found via testing: "Проанализируй синастрию
+    # карт:\nМужчина: " has "Мужчина" as the genuine label, but without
+    # this line-restriction the last-3-words heuristic below picked up
+    # "синастрию карт: Мужчина" instead (spanning across the newline into
+    # the unrelated preamble line), which correctly failed the "starts
+    # with an uppercase letter" check (starts with lowercase "синастрию")
+    # and silently produced no label at all.
+    last_line = text.rsplit("\n", 1)[-1]
+    last_line = re.sub(r"[:,\-—\s]+$", "", last_line).strip()  # trailing separator right before the date itself
+    if not last_line:
+        return None
+    words = last_line.split()[-3:]
+    while words and words[0].lower() in _LABEL_JUNK_WORDS:
+        words = words[1:]
+    if not words:
+        return None
+    label = " ".join(words)
+    if not label[:1].isupper() or any(ch.isdigit() for ch in label) or len(label) > 30:
+        return None
+    return label
+
+
+def _extract_person_label_before_date(text_half: str) -> Optional[str]:
+    """Runs _extract_person_label against whatever precedes the FIRST
+    recognizable date within one person's own half of a synastry
+    message."""
+    matches = []
+    for regex in (_DATE_ISO_RE, _DATE_DMY_NUM_RE, _DATE_RU_RE):
+        m = regex.search(text_half)
+        if m:
+            matches.append(m)
+    if not matches:
+        return None
+    earliest = min(matches, key=lambda m: m.start())
+    return _extract_person_label(text_half[: earliest.start()])
+
+
+def _extract_two_person_fields(
+    spec: str, split_hint: Optional[Tuple[str, str]] = None
+) -> Tuple[Dict[str, str], Dict[str, str], List[str]]:
+    """Synastry counterpart to _extract_fields: pulls two independent
+    sets of birth fields ("a"/"b") out of one spec string.
+
+    Fast path: explicit key=value pairs with an _a/_b suffix (date_a=...,
+    time_a=..., lat_a=..., lon_a=..., tz_a=..., name_a=..., and the same
+    with _b) — _parse_spec already parses arbitrary key=value pairs, so
+    no change was needed there; this function just reads the suffixed
+    keys back out.
+
+    Fallback: free-text birth info for two people in one message, split
+    into independent halves either by split_hint if one is given (see
+    below), or otherwise by _split_two_person_text (see its own
+    docstring for the heuristic and its limits) — each half is then
+    resolved via the exact same _fill_fields_from_text single-person logic
+    _extract_fields uses, entirely independently per half, so a field
+    given explicitly for one person can never leak into the other's. A
+    "name" is also filled in this way if not already given via key=value
+    — see _extract_person_label for what it accepts and its known
+    limitation.
+
+    split_hint, if given, is (text_a, text_b) — pre-split halves supplied
+    by an external caller instead of _split_two_person_text's own date-
+    position heuristic. routes/chat.py passes one here as a fallback ONLY
+    when the plain heuristic split above left required fields missing for
+    either person: utils/intent.split_two_person_text_async runs a single,
+    narrow LLM call whose only job is deciding which words of the
+    original free text belong to which person (never reformatting a
+    date/time/coordinate/city itself — see that function's own comment for
+    why this narrow scope keeps it safe to use, unlike the project's
+    already-rejected "let a small model reformat birth data" approach).
+    Each half — heuristic or hinted — is parsed by the exact same
+    deterministic regexes either way, so a bad or hallucinated hint just
+    produces "still missing", never a silently wrong date/coordinate.
+
+    Returns (fields_a, fields_b, missing), where `missing` lists which
+    _REQUIRED_FIELDS ended up absent from EITHER person, prefixed "a:" or
+    "b:" so _missing_synastry_fields_message can tell them apart —
+    synastry needs both people's data complete before a chart can be
+    built at all."""
+    raw = _parse_spec(spec)
+    text_a, text_b = split_hint if split_hint is not None else _split_two_person_text(spec)
+
+    def _fields_for(suffix: str, text_half: str) -> Dict[str, str]:
+        fields: Dict[str, str] = {}
+        for key in ("date", "time", "lat", "lon", "tz", "name"):
+            value = raw.get(f"{key}_{suffix}")
+            if value:
+                fields[key] = value
+        _fill_fields_from_text(fields, text_half)
+        if not fields.get("name"):
+            label = _extract_person_label_before_date(text_half)
+            if label:
+                fields["name"] = label
+        return fields
+
+    fields_a = _fields_for("a", text_a)
+    fields_b = _fields_for("b", text_b)
+
+    missing = [
+        f"{person}:{k}"
+        for person, fields in (("a", fields_a), ("b", fields_b))
+        for k in _REQUIRED_FIELDS
+        if not fields.get(k)
+    ]
+    return fields_a, fields_b, missing
+
+
+def _missing_synastry_fields_message(missing: List[str]) -> str:
+    a_missing = [m.split(":", 1)[1] for m in missing if m.startswith("a:")]
+    b_missing = [m.split(":", 1)[1] for m in missing if m.startswith("b:")]
+    parts = []
+    if a_missing:
+        parts.append(f"для первого человека — {', '.join(a_missing)}")
+    if b_missing:
+        parts.append(f"для второго человека — {', '.join(b_missing)}")
+    # The format example deliberately uses abstract placeholders
+    # (<имя1>/<дата1>/...), NOT plausible-looking names like "Иван"/
+    # "Мария" — a real, reproducible confusion found via testing: an
+    # earlier version of this message used concrete example names, and
+    # the follow-up LLM turning this tool result into a natural-language
+    # answer mistook that illustrative EXAMPLE for actual partially-
+    # recognized data ("Мы знаем что: Мужчина: Иван (или другие
+    # данные)..."), instead of understanding both people's data was
+    # simply missing. Abstract placeholders can't be confused with real
+    # extracted values the same way.
+    return (
+        "Для синастрии (сравнения двух карт) не хватает данных: "
+        + "; ".join(parts) + ". Нужны точная дата и время рождения и место "
+        "(координаты) КАЖДОГО из двух человек — формат: "
+        "'<имя1>, <дата1> в <время1> в <город1>, и <имя2>, <дата2> в "
+        "<время2> в <город2>' (имена не обязательны). Часовой пояс "
+        "определяется автоматически по координатам."
+    )
 
 
 def _missing_fields_message(missing: List[str], fields: Dict[str, str]) -> str:
@@ -699,23 +1034,43 @@ def _format_point_line(label: str, point, house_num_override: Optional[int] = No
 
 
 def _house_cusp_degrees(subject) -> List[float]:
-    """Absolute ecliptic degree of each of a chart's 12 house cusps, in
-    house order (index 0 = house 1's cusp) — the input _house_of_degree
-    needs to place an arbitrary point (e.g. a transiting planet) into
-    THIS chart's houses, regardless of which chart the point itself came
-    from."""
+    """Absolute ecliptic degree (0-360) of each of a chart's 12 house
+    cusps, in house order (index 0 = house 1's cusp) — the input
+    _house_of_degree needs to place an arbitrary point (e.g. a transiting
+    planet) into THIS chart's houses, regardless of which chart the point
+    itself came from.
+
+    Uses `.abs_pos`, NOT `.position` — a real, previously-shipped bug
+    found via testing (a user-reported synastry house mixup, tracked down
+    by recomputing the exact test case in a sandbox): kerykeion's
+    `.position` is the degree WITHIN the point's own sign (0-30, e.g.
+    17.6 for something at 17.6° Libra), while `.abs_pos` is the true
+    ecliptic longitude (0-360, e.g. 197.6 for that same point). Comparing
+    `.position` values across cusps as if they were absolute degrees
+    produces essentially arbitrary house assignments — cusps that are
+    actually far apart around the circle can have coincidentally similar
+    within-sign degrees, and the wrap-around arc math in _house_of_degree
+    is meaningless over a value range that resets every ~30° instead of
+    spanning the full circle once. Confirmed by direct inspection: this
+    function used to return values like [14.88, 3.82, 28.11, 0.07, ...]
+    (all under 30) for a chart whose cusps are actually spread across the
+    full 0-360 range."""
     attrs = [
         "first_house", "second_house", "third_house", "fourth_house",
         "fifth_house", "sixth_house", "seventh_house", "eighth_house",
         "ninth_house", "tenth_house", "eleventh_house", "twelfth_house",
     ]
-    return [getattr(subject, attr).position for attr in attrs]
+    return [getattr(subject, attr).abs_pos for attr in attrs]
 
 
 def _house_of_degree(cusp_degrees: List[float], degree: float) -> int:
     """Which house (1-12) an arbitrary absolute ecliptic degree falls
     into, given a chart's 12 house cusp degrees (house order, index 0 =
-    house 1). This is the standard transit-astrology convention for
+    house 1). `degree` and every value in `cusp_degrees` MUST be absolute
+    ecliptic longitude (0-360, kerykeion's `.abs_pos`) — NOT the
+    within-sign `.position` (0-30) a point also carries; mixing the two up
+    was a real, shipped bug (see _house_cusp_degrees' docstring). This is
+    the standard transit-astrology convention for
     reading a transiting planet's house — compare its own degree against
     the NATAL chart's cusps — confirmed with the user as the intended
     behavior over the alternative (and, until this function existed, the
@@ -919,7 +1274,7 @@ def _format_transit_text(natal, transit) -> str:
     for label, attr in _PLANET_ATTRS:
         point = getattr(transit, attr, None)
         if point is not None:
-            natal_house = _house_of_degree(natal_cusps, point.position)
+            natal_house = _house_of_degree(natal_cusps, point.abs_pos)
             lines.append("  " + _format_point_line(label, point, house_num_override=natal_house))
 
     aspects = AspectsFactory.dual_chart_aspects(
@@ -1102,6 +1457,7 @@ def get_planet_profiles(spec: str, top_n: int = 9) -> List[Dict]:
                     "orb": a.orbit,
                     "aspect_ru": _aspect_ru(a.aspect),
                     "movement_ru": _movement_ru(a.aspect_movement),
+                    "nature_ru": _aspect_nature_ru(a.aspect),
                     "other_label": _point_ru_from_label(other_label),
                     "other_sign": other_sign,
                     "other_house": other_house,
@@ -1199,16 +1555,26 @@ def get_dual_chart_profiles(
     other_subject,
     other_active_points: Optional[List[str]] = None,
     top_n: int = 9,
+    other_point_label: Optional[Callable[[str], str]] = None,
+    reference_house_label: Optional[Callable[[int], str]] = None,
+    own_house_label: Optional[Callable[[int], str]] = None,
+    query_prefix: str = "транзитный",
+    query_aspect_prefix: str = "транзит",
+    force_include_labels: Tuple[str, ...] = ("Солнце", "Луна"),
+    kind: str = "transit_planet",
 ) -> List[Dict]:
     """Two-chart counterpart to get_planet_profiles — one profile per
-    significant point of `other_subject` (currently: a transit moment's
-    moving planets; intended to also serve synastry as its second
-    consumer, see below), each bundling:
+    significant point of `other_subject` (a transit moment's moving
+    planets, or — now that synastry is this function's second consumer,
+    see get_synastry_profiles — a second person's own natal points), each
+    bundling:
       - its placement, with the house computed against
         `reference_subject`'s OWN cusps via _house_of_degree — the
         standard transit-astrology convention (a transiting planet's
         house is which of YOUR houses it's currently moving through, not
-        some house system computed fresh for the transit moment itself);
+        some house system computed fresh for the transit moment itself),
+        and the same overlay convention synastry uses (person B's planet
+        falls into whichever of person A's houses its degree lands in);
       - its own cross-chart aspects to `reference_subject`'s points, each
         carrying that reference point's sign/house too — the same "other
         side of the aspect" context get_planet_profiles already gives for
@@ -1216,34 +1582,58 @@ def get_dual_chart_profiles(
         step can judge how strong/relevant the aspecting relationship is,
         not just that it exists).
 
-    This is the shared layer run_transit is being refactored onto (see
+    This is the shared layer run_transit was refactored onto first (see
     _format_transit_text, which now also uses _house_of_degree directly
-    for its own raw-data listing, and routes/chat.py, which now runs
-    transit answers through the same digest/sectioned-answer pipeline
-    natal charts already have instead of the generic reasoning-mode
-    prompt). Synastry is intended to reuse this same function as its
-    second consumer — most likely by calling it twice, once per
-    direction (person A's points aspecting B's chart, then B's points
-    aspecting A's), since a synastry reading is inherently bidirectional
+    for its own raw-data listing, and routes/chat.py, which runs transit
+    answers through the same digest/sectioned-answer pipeline natal
+    charts have). get_synastry_profiles calls this function TWICE — once
+    per direction (person A's points aspecting B's chart, then B's points
+    aspecting A's) — since a synastry reading is inherently bidirectional
     in a way a transit reading isn't (a moment doesn't have "its own"
-    identity worth profiling the way a second person's chart does) — not
-    yet built, left for that follow-up rather than guessed at here.
+    identity worth profiling the way a second person's chart does).
+
+    other_point_label/reference_house_label/query_prefix/
+    query_aspect_prefix/force_include_labels exist ONLY so
+    get_synastry_profiles can relabel the generic "транзитный .../
+    натальный N дом" phrasing this function was originally written with
+    into person-specific phrasing ("Венера ♀ человека Б" / "7 дом
+    человека А") — every default below reproduces run_transit's exact
+    original wording byte-for-byte, so transit behavior is unchanged
+    unless a caller explicitly overrides them.
+
+    own_house_label is None by default (transit's behavior, unchanged):
+    a transiting planet doesn't meaningfully have "its own" house the way
+    a person does (see _ACTIVE_POINTS_TRANSIT's own comment on why a
+    transiting Vertex isn't a standard reading either), so nothing extra
+    is shown there. get_synastry_profiles passes a label callable here —
+    a real, reported point of confusion (a generated synastry answer
+    conflated one person's overlay house with the other's, and separately
+    the user asked to see a planet's OWN natal house alongside the
+    overlay for easier reading) — so each profile line can show BOTH:
+    other_subject's own natal house of that point (straight from
+    kerykeion's own per-chart computation, not the overlay math at all)
+    together with the overlay house computed against reference_subject's
+    cusps.
 
     other_active_points defaults to _ACTIVE_POINTS_TRANSIT (fixed stars
     and the Vertex excluded from the moving side — see that list's own
-    comment for why neither is meaningfully "transiting"). Scoring
+    comment for why neither is meaningfully "transiting"; get_synastry_
+    profiles passes _ACTIVE_POINTS_NATAL instead, since a second person's
+    Vertex/Chiron/Lilith/Part of Fortune ARE conventionally read in
+    synastry — nothing about them is transiting-only there). Scoring
     mirrors get_planet_profiles: angularity (by the reference-chart house
     computed above, not other_subject's own), aspect count, retrograde.
-    No force-include tier here: Pars Fortunae/star-conjunction force-
-    include is a natal-only concept (a transiting Part of Fortune isn't
-    conventionally read as a moving body, and other_active_points already
-    excludes fixed stars entirely) — only Sun/Moon are force-included,
-    since they're the two bodies every mainstream transit reading treats
-    as significant regardless of house/aspect count (the Moon especially:
-    it moves fast enough that its house/sign alone is often the main
-    short-term theme, even with few exact aspects on a given day)."""
+    No fixed-star/Pars-Fortunae force-include tier here (that's a natal-
+    only concept, see get_planet_profiles) — only force_include_labels
+    (default Sun/Moon) are force-included, since they're the two bodies
+    every mainstream transit OR synastry reading treats as significant
+    regardless of house/aspect count."""
     if other_active_points is None:
         other_active_points = _ACTIVE_POINTS_TRANSIT
+    if other_point_label is None:
+        other_point_label = lambda label_ru: f"транзитный {label_ru}"  # noqa: E731
+    if reference_house_label is None:
+        reference_house_label = lambda house_num: f"натальный {house_num} дом"  # noqa: E731
 
     from kerykeion import AspectsFactory
 
@@ -1270,7 +1660,8 @@ def get_dual_chart_profiles(
         if point is None:
             continue
 
-        natal_house = _house_of_degree(natal_cusps, point.position)
+        natal_house = _house_of_degree(natal_cusps, point.abs_pos)
+        own_house = _house_number(getattr(point, "house", None))
         retrograde = bool(getattr(point, "retrograde", False))
         label_ru = _point_ru_from_label(label)
 
@@ -1313,6 +1704,7 @@ def get_dual_chart_profiles(
                     "orb": a.orbit,
                     "aspect_ru": _aspect_ru(a.aspect),
                     "movement_ru": _movement_ru(a.aspect_movement),
+                    "nature_ru": _aspect_nature_ru(a.aspect),
                     "other_label": _point_ru_from_label(ref_label),
                     "other_sign": ref_sign,
                     "other_house": ref_house,
@@ -1324,24 +1716,30 @@ def get_dual_chart_profiles(
 
         sign_prep = _sign_ru_prepositional(point.sign)
         retro_text = " (ретроградный)" if retrograde else ""
-        house_text = f", натальный {natal_house} дом" if natal_house else ""
+        own_house_text = (
+            f", {own_house_label(own_house)}" if own_house_label is not None and own_house else ""
+        )
+        house_text = f", {reference_house_label(natal_house)}" if natal_house else ""
+        label_text = other_point_label(label_ru)
 
-        queries = [f"транзитный {label} {sign_prep}"] + (
-            [f"транзитный {label} в {natal_house} доме"] if natal_house else []
+        queries = [f"{query_prefix} {label} {sign_prep}"] + (
+            [f"{query_prefix} {label} в {natal_house} доме"] if natal_house else []
         )
         for asp in own_aspects:
-            queries.append(f"транзит {asp['aspect_ru']} {label_ru} и {asp['other_label']}")
+            queries.append(f"{query_aspect_prefix} {asp['aspect_ru']} {label_ru} и {asp['other_label']}")
 
         profiles.append(
             {
-                "kind": "transit_planet",
+                "kind": kind,
                 "label": label_ru,
-                "text": f"транзитный {label_ru} {sign_prep}{house_text}{retro_text}",
+                "text": f"{label_text} {sign_prep}{own_house_text}{house_text}{retro_text}",
                 "aspects": own_aspects,
                 "stars": [],
                 "queries": queries,
                 "score": score,
-                "force_include": label in ("Солнце", "Луна"),
+                "own_house": own_house,
+                "overlay_house": natal_house,
+                "force_include": label in force_include_labels,
             }
         )
 
@@ -1480,12 +1878,184 @@ def get_transit_profiles(spec: str, top_n: int = 9) -> List[Dict]:
         return []
 
 
-# Registry for future operations (synastry, composite, rectification,
-# electional search, ...) — see module docstring. Not yet consumed by
-# anything (utils/tools.py wires run_natal/run_transit directly, since
-# there are only two so far), but kept as the intended extension point so
-# adding a third operation doesn't require inventing a new pattern.
+def _format_synastry_text(person_a, person_b) -> str:
+    """Raw chart text for synastry: each person's OWN placements (sign,
+    house, retrograde — from their own chart, exactly like a natal
+    reading — a synastry reading always starts from "who is each person
+    on their own", not just the cross-aspects between them), then every
+    cross-chart aspect between the two in one pass (kerykeion's
+    dual_chart_aspects already returns the full bidirectional set — A's
+    planets aspecting B's points AND B's planets aspecting A's, in a
+    single symmetric list — so unlike the profile step below, only one
+    aspect computation is needed here, not two)."""
+    from kerykeion import AspectsFactory
+
+    lines = [
+        f"Синастрия (сравнение натальных карт) {person_a.name} и {person_b.name}.",
+        f"Собственные положения планет — {person_a.name}:",
+    ]
+    for label, attr in _PLANET_ATTRS:
+        point = getattr(person_a, attr, None)
+        if point is not None:
+            lines.append("  " + _format_point_line(label, point))
+    lines.append(f"Собственные положения планет — {person_b.name}:")
+    for label, attr in _PLANET_ATTRS:
+        point = getattr(person_b, attr, None)
+        if point is not None:
+            lines.append("  " + _format_point_line(label, point))
+
+    aspects = AspectsFactory.dual_chart_aspects(
+        person_a, person_b, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
+    ).aspects
+    lines.append(f"Межкарточные (синастрические) аспекты между {person_a.name} и {person_b.name}:")
+    if aspects:
+        for a in aspects:
+            p1_owner_name = person_a.name if a.p1_owner == person_a.name else person_b.name
+            p2_owner_name = person_a.name if a.p2_owner == person_a.name else person_b.name
+            lines.append(
+                f"  {_point_ru(a.p1_name)} ({p1_owner_name}) — {_aspect_ru(a.aspect)} — "
+                f"{_point_ru(a.p2_name)} ({p2_owner_name}) "
+                f"(орбис {a.orbit:.1f}°, {_movement_ru(a.aspect_movement)})"
+            )
+    else:
+        lines.append("  (нет аспектов в пределах орбиса)")
+    return "\n".join(lines)
+
+
+def _build_synastry_subjects(
+    fields_a: Dict[str, str], fields_b: Dict[str, str]
+) -> Tuple[Optional[Any], Optional[Any], Optional[str]]:
+    """Builds both people's own natal subjects for synastry — the full
+    _ACTIVE_POINTS_NATAL set for each side (_build_subject's own default),
+    since Vertex/Chiron/Lilith/Part of Fortune ARE conventionally read in
+    synastry, unlike transit's narrower moving-body set. Fixed stars are
+    NOT part of the cross-chart comparison here — _find_star_conjunctions
+    is a natal-only, single-chart mechanism, not reused across two charts
+    (a star sitting on person A's Sun doesn't become more or less
+    meaningful because of anything in person B's chart). Returns
+    (person_a, person_b, None) on success, or (None, None, error_message)
+    on failure — same never-raise convention _build_transit_subjects
+    already uses."""
+    name_a = fields_a.get("name") or "Человек A"
+    name_b = fields_b.get("name") or "Человек B"
+    try:
+        person_a = _build_subject(fields_a, name=name_a)
+        person_b = _build_subject(fields_b, name=name_b)
+    except Exception as e:
+        return None, None, f"Не удалось построить карты для синастрии — некорректные данные ({e})."
+    return person_a, person_b, None
+
+
+def run_synastry(spec: str, split_hint: Optional[Tuple[str, str]] = None) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_synastry_chart"]).
+
+    split_hint is optional and only ever passed by routes/chat.py, never by
+    the generic tool-dispatch mechanism (utils.tools.TOOL_REGISTRY callers
+    invoke run() with a single positional spec string) — see
+    _extract_two_person_fields' own docstring for what it is and why it's
+    safe (segmentation only, never reformatting a date/time/coordinate)."""
+    fields_a, fields_b, missing = _extract_two_person_fields(spec, split_hint=split_hint)
+    if missing:
+        return _missing_synastry_fields_message(missing)
+    person_a, person_b, error = _build_synastry_subjects(fields_a, fields_b)
+    if error:
+        return error
+    try:
+        return _format_synastry_text(person_a, person_b)
+    except Exception as e:
+        return f"Ошибка при расчёте синастрии: {e}"
+
+
+def synastry_fields_missing(spec: str) -> List[str]:
+    """Cheap, side-effect-free check of whether the deterministic
+    heuristic split/extraction already has everything needed for both
+    people — used by routes/chat.py to decide whether the LLM segmentation
+    fallback (utils.intent.split_two_person_text_async) is even worth
+    calling. Returns the same "a:field"/"b:field"-prefixed list
+    _extract_two_person_fields itself returns (empty = nothing missing)."""
+    _, _, missing = _extract_two_person_fields(spec)
+    return missing
+
+
+def get_synastry_profiles(
+    spec: str, top_n_each: int = 9, split_hint: Optional[Tuple[str, str]] = None
+) -> Tuple[List[Dict], List[Dict], str, str]:
+    """Synastry counterpart to get_planet_profiles/get_transit_profiles,
+    for routes/chat.py's digest step. Rebuilds both subjects independently
+    from `spec` (same accepted duplication-of-computation pattern the
+    other two get_*_profiles functions already have relative to their
+    run_*() counterparts), then calls get_dual_chart_profiles TWICE — once
+    per direction — since synastry is inherently bidirectional in a way
+    transit isn't: person A's planets overlaid onto person B's houses are
+    a genuinely different (and equally significant) set of facts from
+    person B's planets overlaid onto person A's, not just the same
+    information read backwards.
+
+    other_point_label/reference_house_label/query_prefix are overridden
+    (relative to get_dual_chart_profiles' transit-oriented defaults) to
+    name each actual person instead of the generic "транзитный"/
+    "натальный N дом" phrasing, since two real people's names (or the
+    "Человек A"/"Человек B" fallback labels) are what the digest/final-
+    answer prompts need to attribute each placement and aspect to the
+    right person.
+
+    Returns (profiles_a, profiles_b, name_a, name_b) — profiles_a is
+    person A's own points (house computed against person B's cusps),
+    profiles_b is person B's own points (house computed against person
+    A's cusps). Returns ([], [], "", "") (never raises) if fields are
+    missing or subject-building fails — same "no profiles available,
+    caller falls back" contract the other two get_*_profiles functions
+    already have."""
+    fields_a, fields_b, missing = _extract_two_person_fields(spec, split_hint=split_hint)
+    if missing:
+        return [], [], "", ""
+    person_a, person_b, error = _build_synastry_subjects(fields_a, fields_b)
+    if error:
+        return [], [], "", ""
+
+    name_a, name_b = person_a.name, person_b.name
+    try:
+        profiles_a = get_dual_chart_profiles(
+            person_b, person_a,
+            other_active_points=_ACTIVE_POINTS_NATAL, top_n=top_n_each,
+            other_point_label=lambda lr, n=name_a: f"{lr} ({n})",
+            reference_house_label=lambda h, n=name_b: f"{h} дом у {n}",
+            # Alongside the overlay house (person A's point read against
+            # person B's cusps, above), also show person A's OWN natal
+            # house of that same point — a real, user-requested addition
+            # ("интереснее анализировать планету не только в своем доме,
+            # но и в доме владельца первой карты") that also happens to
+            # make the overlay reading much less ambiguous to a reader (or
+            # to the interpreting model): "своя 5 дом" vs "2 дом у Женщина"
+            # are visibly two different things, rather than a single bare
+            # house number that's easy to misattribute to the wrong chart.
+            own_house_label=lambda h, n=name_a: f"свой {h} дом ({n})",
+            query_prefix=f"синастрия {name_a}",
+            query_aspect_prefix="синастрия",
+            kind="synastry_planet",
+        )
+        profiles_b = get_dual_chart_profiles(
+            person_a, person_b,
+            other_active_points=_ACTIVE_POINTS_NATAL, top_n=top_n_each,
+            other_point_label=lambda lr, n=name_b: f"{lr} ({n})",
+            reference_house_label=lambda h, n=name_a: f"{h} дом у {n}",
+            own_house_label=lambda h, n=name_b: f"свой {h} дом ({n})",
+            query_prefix=f"синастрия {name_b}",
+            query_aspect_prefix="синастрия",
+            kind="synastry_planet",
+        )
+    except Exception:
+        return [], [], name_a, name_b
+    return profiles_a, profiles_b, name_a, name_b
+
+
+# Registry for future operations (composite, rectification, electional
+# search, progressions, solar/lunar returns, ...) — see module docstring.
+# Not yet consumed by anything (utils/tools.py wires run_natal/run_transit/
+# run_synastry directly), but kept as the intended extension point so
+# adding another operation doesn't require inventing a new pattern.
 ASTRO_OPERATIONS: Dict[str, Callable[[str], str]] = {
     "natal": run_natal,
     "transit": run_transit,
+    "synastry": run_synastry,
 }

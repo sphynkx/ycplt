@@ -128,4 +128,22 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         ),
         "run": astro.run_transit,
     },
+    "astro_synastry_chart": {
+        "description": (
+            "Compares the natal charts of TWO people — for questions about "
+            "compatibility, relationship dynamics, or how two specific "
+            "people relate astrologically. Only use this if birth date, "
+            "time, and place/coordinates for BOTH people actually appear "
+            "somewhere in this conversation — never invent placeholder "
+            "birth data for either person; if either person's data is "
+            "missing, don't use this tool at all (use astro_natal_chart for "
+            "a single person instead). Argument: copy BOTH people's birth "
+            "date, time, and place/coordinates as written, in the order "
+            "they were mentioned, exactly like astro_natal_chart's argument "
+            "but for two people back to back (e.g. 'Иван, 5 июля 1976 в "
+            "4:30 в Одессе, и Мария, 12 марта 1980 в 9:15 в Киеве') — do "
+            "NOT reformat, and do not merge or drop either person's data."
+        ),
+        "run": astro.run_synastry,
+    },
 }

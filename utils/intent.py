@@ -7,7 +7,8 @@ no extra model to load, no keyword list to maintain by hand, and it
 generalizes across phrasing/language better than substring matching would.
 """
 import asyncio
-from typing import Optional
+import re
+from typing import Optional, Tuple
 
 from utils import llm as llm_utils
 
@@ -175,3 +176,94 @@ def get_removal_target(query: str) -> Optional[str]:
 async def get_removal_target_async(query: str) -> Optional[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, get_removal_target, query)
+
+
+# --- synastry two-person text segmentation (LLM fallback) ----------------
+#
+# Why this exists: utils/astro.py's synastry free-text extraction is
+# deliberately heuristic/regex-based, not LLM-based — the project's
+# established, hard-won default (see astro.py's own module docstring: an
+# earlier attempt at having a small model reformat/convert birth data
+# proved unreliable, so plain regex parsing of the user's own wording
+# replaced it). That heuristic (astro._split_two_person_text) finds the
+# first two dates in the text and splits at the nearest comma/newline/
+# whitespace between them — good enough for the phrasings tested so far,
+# but a real, acknowledged limitation: sufficiently free-form phrasing
+# (person labels and data interleaved in an order the heuristic doesn't
+# expect) will keep finding new ways to break a purely positional
+# splitting rule, and patching one specific phrasing at a time (already
+# done twice this project) doesn't converge.
+#
+# Rather than replace the deterministic heuristic outright (rejected —
+# it works fine for the common, already-tested phrasings, and a full LLM
+# reformatting step reintroduces exactly the unreliable-conversion failure
+# mode the project moved away from), this is a NARROW, single-purpose LLM
+# call used only as a fallback when the heuristic split doesn't yield
+# complete data for both people (see routes/chat.py's _handle_tool_request):
+# the model's only job is SEGMENTATION — deciding which words belong to
+# which person — not reformatting dates, converting coordinates, or
+# transcribing anything. It's asked to quote the relevant portion of the
+# original text back VERBATIM for each person, exactly the same
+# "quoting back is reliable, reformatting is not" principle astro.py's own
+# docstring already established for the tool-router's argument extraction.
+# The quoted halves are then run through the exact same deterministic
+# regex field-extraction (_fill_fields_from_text) the heuristic path
+# already uses — this call only ever changes WHERE the text gets split,
+# never what a date/time/coordinate/city string is taken to mean, so a
+# hallucinated or mangled quote just produces "still missing data" (a
+# clarifying question), not silently wrong chart data.
+_TWO_PERSON_SPLIT_PROMPT = """Сообщение пользователя ниже описывает ДВУХ разных людей и их данные рождения (для сравнения гороскопов, синастрии). Раздели его на две части — одну на каждого человека.
+
+В каждой части ДОСЛОВНО процитируй ту часть исходного сообщения, которая относится к этому человеку (имя или обозначение, дата, время, место рождения) — ничего не переводи, не переформатируй, не исправляй и не досочиняй, только скопируй соответствующий фрагмент исходного текста.
+
+Ответь ровно в этом формате, без вступлений и пояснений:
+ЧЕЛОВЕК 1: <дословная цитата из сообщения>
+ЧЕЛОВЕК 2: <дословная цитата из сообщения>
+
+Сообщение пользователя:
+\"\"\"
+{query}
+\"\"\"
+Ответ:"""
+
+_TWO_PERSON_SPLIT_RE = re.compile(
+    r"ЧЕЛОВЕК\s*1\s*:\s*(.*?)\s*\n\s*ЧЕЛОВЕК\s*2\s*:\s*(.*)", re.IGNORECASE | re.DOTALL
+)
+
+
+def _parse_two_person_split(answer: str) -> Optional[Tuple[str, str]]:
+    m = _TWO_PERSON_SPLIT_RE.search(answer)
+    if not m:
+        return None
+    part_a, part_b = m.group(1).strip(), m.group(2).strip()
+    if not part_a or not part_b:
+        return None
+    return part_a, part_b
+
+
+def split_two_person_text(query: str) -> Optional[Tuple[str, str]]:
+    """Best-effort LLM fallback for astro.py's two-person synastry text
+    split — see the module comment above for why this exists and why it's
+    scoped to segmentation only, never reformatting. Returns None (caller
+    falls back to whatever the deterministic heuristic already produced)
+    on any error, an unparseable answer, or an empty half — this is purely
+    additive: it can only help a case the heuristic already failed on, and
+    can never make a working case worse, since routes/chat.py only calls
+    this after confirming the heuristic split left required fields
+    missing for at least one person."""
+    if llm_utils.get_llm() is None:
+        return None
+    try:
+        answer = llm_utils.generate_sync(
+            _TWO_PERSON_SPLIT_PROMPT.format(query=query),
+            max_tokens=400,
+            temperature=0.0,
+        )
+    except Exception:
+        return None
+    return _parse_two_person_split(answer)
+
+
+async def split_two_person_text_async(query: str) -> Optional[Tuple[str, str]]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, split_two_person_text, query)

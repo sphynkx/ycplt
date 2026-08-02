@@ -116,23 +116,42 @@ def _format_aspect_line(aspect: Dict) -> str:
     # invented, sometimes ungrammatical adjectives). "phrase" sidesteps the
     # whole problem by never needing "к" at all.
     phrase = aspect.get("phrase") or f"{aspect['aspect_ru']} и {aspect['other_label']}"
-    return f"{phrase}{other_place}, орбис {aspect['orb']:.1f}°, {aspect['movement_ru']}"
+    # nature_ru ("гармоничный"/"напряжённый"/...) is astro.py's own
+    # pre-computed classification (_ASPECT_NATURE), included here for the
+    # exact same reason "phrase" exists: a real, reported failure showed a
+    # trine and a semisextile — both conventionally harmonious, never
+    # tense — labeled "точка напряжения" in a generated answer, even
+    # though the digest prompt's own prose rules already listed which
+    # aspect types are harmonious vs. tense. Spelling the answer out here,
+    # in the data itself, removes the need for the model to re-derive or
+    # remember that classification under generation pressure — same
+    # "compute it once in Python, hand over the answer" principle already
+    # used for aspect-naming grammar.
+    return (
+        f"{phrase}{other_place}, орбис {aspect['orb']:.1f}° "
+        f"[орбис только для оценки силы аспекта здесь, не для итогового текста], "
+        f"{aspect['movement_ru']}, природа: {aspect.get('nature_ru', 'нейтральный')}"
+    )
 
 
 def _build_digest_prompt(
     profiles: List[Dict], fragments_by_fact: Dict[int, List[str]], chart_kind: str = "natal"
 ) -> str:
-    """Builds the digest prompt from a list of profile bundles — either
+    """Builds the digest prompt from a list of profile bundles —
     astro.get_planet_profiles' (sign+house+retrograde+this point's own
-    aspects+any fixed-star conjunction, chart_kind="natal") or
+    aspects+any fixed-star conjunction, chart_kind="natal"),
     astro.get_transit_profiles'/get_dual_chart_profiles' (a transiting
     planet's sign+NATAL house+its own cross-chart aspects to natal
-    points, chart_kind="transit") — instead of the older flat,
+    points, chart_kind="transit"), or astro.get_synastry_profiles' (one
+    person's own point, the OTHER person's house it overlays, and its
+    synastric cross-aspects to that other person's points,
+    chart_kind="synastry", with both people's profiles passed together in
+    one combined list — see routes/chat.py) — instead of the older flat,
     disconnected planet/aspect/house facts a single-chart design used to
-    produce. Both shapes carry the same dict keys ("text", "aspects",
-    "stars", ...), so only the framing/intro text and one instruction
-    line below actually differ by chart_kind; the fact-block rendering
-    loop is shared.
+    produce. All three shapes carry the same dict keys ("text", "aspects",
+    "stars", ...), so only the framing/intro text and a couple of
+    instruction lines below actually differ by chart_kind; the fact-block
+    rendering loop is shared.
 
     This is the actual fix for a real failure found in end-to-end testing
     (natal case): the old design digested "Юпитер в Овне, 12 дом" and each
@@ -157,11 +176,13 @@ def _build_digest_prompt(
         )
         lines = [f"{i + 1}. {profile['text']}"]
         if profile.get("aspects"):
-            lines.append(
-                "   Аспекты этой точки к натальным точкам:"
-                if chart_kind == "transit"
-                else "   Аспекты этой точки к другим:"
-            )
+            if chart_kind == "transit":
+                aspects_header = "   Аспекты этой точки к натальным точкам:"
+            elif chart_kind == "synastry":
+                aspects_header = "   Синастрические аспекты этой точки к точкам партнёра:"
+            else:
+                aspects_header = "   Аспекты этой точки к другим:"
+            lines.append(aspects_header)
             for a in profile["aspects"]:
                 lines.append(f"    - {_format_aspect_line(a)}")
         if profile.get("stars"):
@@ -199,12 +220,14 @@ def _build_digest_prompt(
         )
         aspect_rule = (
             "— как КАЖДЫЙ аспект к натальной точке окрашивает влияние "
-            "транзитной планеты: гармоничные аспекты (трин, секстиль, "
-            "полусекстиль, квинтиль, биквинтиль) создают лёгкую, "
-            "поддерживающую активацию натальной точки; напряжённые "
-            "(квадрат, оппозиция, полуквадрат, полутораквадрат, квинконс) "
-            "— трение, давление, требующее сознательного усилия; "
-            "соединение зависит от природы обеих планет;\n"
+            "транзитной планеты: используй ГОТОВУЮ пометку «природа: ...» "
+            "у каждого аспекта выше, НЕ переопределяй её сам по типу "
+            "аспекта — «гармоничный» создаёт лёгкую, поддерживающую "
+            "активацию натальной точки; «напряжённый» — трение, давление, "
+            "требующее сознательного усилия; «неоднозначный» — не "
+            "конфликт, а необходимость подстроиться; «нейтральный "
+            "(зависит от планет)» (соединение) — итог зависит от природы "
+            "обеих планет, не от самого аспекта;\n"
         )
         movement_rule = (
             "— направление движения ключевое для транзитов: "
@@ -219,6 +242,55 @@ def _build_digest_prompt(
             "данные не содержат имени; называй его «этот человек» / "
             "«он» / «она». Слова «натальный»/«транзитный» — термины, а "
             "не чьи-то имена.\n\n"
+        )
+    elif chart_kind == "synastry":
+        intro = (
+            "Ниже — синастрические профили ДВУХ людей вместе (различить их "
+            "можно по имени в скобках рядом с названием точки, например "
+            "«Солнце (Человек A)»): для каждой точки одного человека "
+            "указан её собственный знак и дом ДРУГОГО человека, в который "
+            "она попадает при наложении карт («N дом у <имя>» — это дом "
+            "ИМЕННО ДРУГОГО человека, не дом самой этой точки в её "
+            "собственной карте), её синастрические аспекты к точкам "
+            "другого человека (со знаком/домом этой другой точки в ЕЁ "
+            "СОБСТВЕННОЙ карте), и найденные справочные материалы (если "
+            "материалы не найдены — рассуждай по общим принципам "
+            "синастрии)."
+        )
+        house_rule = (
+            "— как дом ДРУГОГО человека, в который попадает эта точка при "
+            "наложении карт, окрашивает, в какой сфере жизни ДРУГОГО "
+            "человека ощущается влияние этой точки и этого человека на "
+            "него (12-й дом партнёра — скрыто, подсознательно; угловые "
+            "дома 1/4/7/10 партнёра — прямо и заметно влияет на партнёра "
+            "и на отношения в целом);\n"
+        )
+        aspect_rule = (
+            "— как КАЖДЫЙ синастрический аспект окрашивает связь между "
+            "этой точкой и точкой партнёра: используй ГОТОВУЮ пометку "
+            "«природа: ...» у каждого аспекта выше — она уже правильно "
+            "классифицирует именно этот тип аспекта, НЕ переопределяй её "
+            "сам и не полагайся на память о том, какой аспект гармоничный, "
+            "а какой напряжённый (реальная, найденная тестированием ошибка: "
+            "трин и полусекстиль — оба гармоничные аспекты без "
+            "стандартного конфликтного значения — были неверно названы "
+            "«точками напряжения» в готовом ответе). «Гармоничный» "
+            "создаёт лёгкость, взаимную поддержку и естественное "
+            "понимание по темам обеих планет; «напряжённый» — трение, "
+            "притяжение через конфликт или взаимное раздражение, "
+            "требующее сознательной работы, и должен называться прямо "
+            "(трение/конфликт/сложность), а не смягчаться до «динамики» "
+            "или «роста»; «неоднозначный» — не конфликт, а необходимость "
+            "подстроиться друг под друга; «нейтральный (зависит от "
+            "планет)» (соединение) — итог зависит от природы обеих "
+            "планет, может быть как усиливающим, так и довлеющим;\n"
+        )
+        movement_rule = ""
+        closing = (
+            "Пиши только на русском языке, без английских слов и без "
+            "иероглифов. Используй имена (или обозначения «Человек A»/"
+            "«Человек B»), указанные в данных, для каждого из двух людей "
+            "— не путай, чья это точка и чей это дом.\n\n"
         )
     else:
         intro = (
@@ -235,14 +307,16 @@ def _build_digest_prompt(
             "заметным для окружающих);\n"
         )
         aspect_rule = (
-            "— как КАЖДЫЙ аспект окрашивает точку: гармоничные аспекты (трин, "
-            "секстиль, полусекстиль, квинтиль, биквинтиль) усиливают только те "
-            "качества точки, что созвучны природе аспектирующей планеты — не "
-            "все её качества подряд; напряжённые аспекты (квадрат, оппозиция, "
-            "полуквадрат, полутораквадрат, квинконс) создают трение и "
-            "внутреннее противоречие между природой этой точки и "
-            "аспектирующей; соединение зависит от природы соединяющейся "
-            "планеты;\n"
+            "— как КАЖДЫЙ аспект окрашивает точку: используй ГОТОВУЮ "
+            "пометку «природа: ...» у каждого аспекта выше, НЕ "
+            "переопределяй её сам по типу аспекта — «гармоничный» "
+            "усиливает только те качества точки, что созвучны природе "
+            "аспектирующей планеты, не все её качества подряд; "
+            "«напряжённый» создаёт трение и внутреннее противоречие между "
+            "природой этой точки и аспектирующей; «неоднозначный» — не "
+            "конфликт, а необходимость приспособления; «нейтральный "
+            "(зависит от планет)» (соединение) — зависит от природы "
+            "соединяющейся планеты;\n"
         )
         movement_rule = ""
         closing = (
@@ -262,7 +336,12 @@ def _build_digest_prompt(
         f"{aspect_rule}"
         "— масштаб влияния аспекта зависит от точности орбиса (чем меньше "
         "орбис, тем сильнее) и от собственной силы аспектирующей планеты "
-        "(её дом/угловатость — та же логика, что и для самой точки);\n"
+        "(её дом/угловатость — та же логика, что и для самой точки) — "
+        "используй само число орбиса ТОЛЬКО чтобы решить, насколько силён "
+        "аспект, но не упоминай его числовое значение (например «орбис "
+        "1.4°») в тексте самой заметки — заметка описывает влияние аспекта "
+        "словами (например «плотный, ощутимый аспект» вместо цифры), а не "
+        "техническую точность его расчёта;\n"
         f"{movement_rule}"
         "— соединение с неподвижной звездой, если есть, — как её "
         "традиционное значение накладывается на природу точки.\n"
@@ -295,9 +374,10 @@ async def digest_facts_async(
 ) -> str:
     """Runs the whole digest pass: per-profile targeted retrieval, then one
     LLM call producing a numbered set of short reinterpreted notes — one
-    per profile bundle (astro.get_planet_profiles' natal bundles, or
+    per profile bundle (astro.get_planet_profiles' natal bundles,
     astro.get_transit_profiles' transiting-planet bundles when
-    chart_kind="transit"), not per isolated fact.
+    chart_kind="transit", or astro.get_synastry_profiles' two combined
+    profile lists when chart_kind="synastry"), not per isolated fact.
     Returns "" (never raises) if there are no profiles or anything in here
     fails — callers should treat that as "no digest available, fall back
     to the plain computed-data + methodology prompt" rather than let a
@@ -430,6 +510,18 @@ def build_sectioned_answer_prompt(
         "Меркурия и Марса») — никогда не изобретай прилагательные вроде "
         "«Лунный», «Марсианский», «Юпитерианский» вместо названия аспекта, "
         "это неинформативно и часто грамматически неверно.\n\n"
+        "Не упоминай числовое значение орбиса (например «орбис 1.4°») в "
+        "тексте ответа — это техническая точность расчёта, а не то, о чём "
+        "пишут в самой интерпретации; вместо цифры описывай силу аспекта "
+        "словами, если это вообще нужно (например «выраженный», "
+        "«ощутимый»).\n\n"
+        "Избегай расплывчатых, ничего не говорящих формулировок вроде "
+        "«структурные качества», «социальные качества», «генетические "
+        "качества» — вместо абстрактной категории называй конкретное "
+        "качество или тему, которая реально следует из данных (например "
+        "не «социальные качества», а «лёгкость в общении на публике» или "
+        "«потребность в признании в коллективе», если это подтверждается "
+        "конкретным домом/аспектом).\n\n"
         "Форматирование: заголовки разделов — markdown (## Заголовок), "
         "при необходимости можно **выделять жирным** ключевые термины; "
         "юникод-значки планет/знаков/аспектов (☉ ♋ ☌ △ и т.п.) уже "
@@ -547,6 +639,13 @@ def build_transit_answer_prompt(
         "Юпитера и Нептуна») — никогда не изобретай прилагательные вроде "
         "«Сатурнианский», «Юпитерианский» вместо названия аспекта, это "
         "неинформативно и часто грамматически неверно.\n\n"
+        "Не упоминай числовое значение орбиса (например «орбис 1.4°») в "
+        "тексте ответа — используй его только чтобы понять силу аспекта, "
+        "а описывай эту силу словами, если нужно, а не цифрой.\n\n"
+        "Избегай расплывчатых формулировок вроде «структурные качества», "
+        "«социальные качества», «генетические качества» — называй "
+        "конкретное качество или тему, реально следующую из данных, а не "
+        "абстрактную категорию.\n\n"
         "Форматирование: заголовки разделов — markdown (## Заголовок), "
         "при необходимости можно **выделять жирным** ключевые термины; "
         "юникод-значки планет/знаков/аспектов (☉ ♋ ☌ △ и т.п.) уже "
@@ -563,4 +662,168 @@ def build_transit_answer_prompt(
         "человека «этот человек» / «он» / «она» (грамматический род бери "
         "из формулировки вопроса), а не выдуманным именем. Слова "
         "«натальный»/«транзитный» в данных — термины, а не чьё-то имя."
+    )
+
+
+# Section headers for the final synastry answer (build_synastry_answer_
+# prompt below) — a third, deliberately different breakdown from both
+# ASTRO_ANSWER_SECTIONS (single-person personality) and TRANSIT_ANSWER_
+# SECTIONS (single-person current period): synastry is about the
+# RELATIONSHIP between two specific people, so every section here is
+# framed around the connection, not either person alone. Seven sections
+# (matching ASTRO_ANSWER_SECTIONS' own count) rather than the original
+# five — a real, reported failure with the five-section version: the
+# answer covered only a handful of aspects total across the whole
+# response even though get_synastry_profiles() had produced far more
+# material, reading as thinner and more one-sidedly harmonious than the
+# actual chart data supported. More named section slots is the same
+# forcing-function lever that already worked for natal charts (repeated
+# testing there showed the model reliably fills however many concrete
+# slots it's given, rather than self-regulating how much to write from an
+# abstract "be thorough" instruction alone) — splitting what was one
+# "Эмоциональная и близкая связь" section into separate emotional and
+# romantic/attraction sections, and one "Общение и вызовы" pairing into
+# separate communication/values and tension/conflict sections, plus a new
+# long-term/practical section, gives the richer aspect set produced by
+# top_n_each more places to actually land instead of being compressed
+# away.
+SYNASTRY_ANSWER_SECTIONS = [
+    "Общая картина совместимости",
+    "Эмоциональная связь и взаимопонимание",
+    "Романтика, влечение и близость",
+    "Общение, ценности и совместные цели",
+    "Точки напряжения и конфликты",
+    "Долгосрочный потенциал и практическая совместимость",
+    "Итог",
+]
+
+
+def build_synastry_answer_prompt(
+    query: str,
+    computed_text: str,
+    digested_notes: str,
+    general_contexts: List[Dict[str, Any]],
+    name_a: str,
+    name_b: str,
+) -> str:
+    """Synastry counterpart to build_sectioned_answer_prompt/
+    build_transit_answer_prompt — same overall mechanism (fixed named
+    markdown sections, consumed after digest_facts_async(...,
+    chart_kind="synastry") already reasoned over each profile), with
+    SYNASTRY_ANSWER_SECTIONS and instructions reframed around the
+    RELATIONSHIP between two people instead of one person's own
+    placements or current transits.
+
+    name_a/name_b are astro.get_synastry_profiles' own subject names —
+    each person's actual name, or a role word like "Мужчина"/"Женщина",
+    if astro._extract_person_label found one right before that person's
+    birth date in the free text (or if the router supplied explicit
+    name_a=/name_b= key=value fields); "Человек A"/"Человек B" only as a
+    last-resort fallback when neither is available. Since name_a/name_b
+    already reflect however the user themselves referred to each person
+    in the common case, the model mostly just has to use them consistently
+    — the instruction below is a safety net for the remaining case where
+    extraction found nothing but the user's own question still names both
+    people some other way (e.g. "Иван и Мария" phrased differently from
+    how their birth data was written), keeping first-mentioned = name_a's
+    data and second-mentioned = name_b's data (matching how
+    astro._split_two_person_text itself orders the two people — first
+    date found in the text becomes person A, second becomes person B)."""
+    context_parts = [f"ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА:\n{computed_text}"]
+    if digested_notes:
+        context_parts.append(f"ОСМЫСЛЕННЫЕ ЗАМЕТКИ ПО СИНАСТРИЧЕСКИМ ТОЧКАМ ОБОИХ ЛЮДЕЙ:\n{digested_notes}")
+    if general_contexts:
+        general_text = "\n\n---\n\n".join(c["text"] for c in general_contexts)
+        context_parts.append(f"ОБЩАЯ МЕТОДОЛОГИЯ И СПРАВОЧНЫЕ МАТЕРИАЛЫ:\n{general_text}")
+    context_block = "\n\n===\n\n".join(context_parts)
+
+    sections_list = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(SYNASTRY_ANSWER_SECTIONS))
+
+    return (
+        f"{context_block}\n\n"
+        f"Вопрос пользователя: {query}\n\n"
+        f"В данных двое людей обозначены как «{name_a}» и «{name_b}» — "
+        "используй именно эти обозначения последовательно во всём "
+        "ответе. Если в вопросе пользователя оба человека названы каким-"
+        "то ДРУГИМ способом (например по-другому написанным именем), "
+        f"используй то, как их назвал пользователь, вместо «{name_a}»/"
+        f"«{name_b}», считая, что «{name_a}» — это тот человек, что "
+        "упомянут в вопросе ПЕРВЫМ, а второй по порядку — это "
+        f"«{name_b}».\n\n"
+        "Напиши развёрнутую астрологическую интерпретацию СОВМЕСТИМОСТИ "
+        "и динамики отношений между этими двумя людьми (синастрия), "
+        "разбитую строго на следующие разделы — используй эти названия "
+        "дословно как markdown-заголовки (## Название раздела), каждый "
+        "раздел — НЕСКОЛЬКО предложений связного текста, а не одна "
+        "фраза, и опирается на НЕСКОЛЬКО разных синастрических аспектов "
+        "и наложений из осмысленных заметок и данных выше (не один-два "
+        "самых ярких, а как можно более полное освещение значимых "
+        "связей между картами, относящихся к теме раздела):\n\n"
+        f"{sections_list}\n\n"
+        "В каждом разделе опирайся на конкретные синастрические аспекты "
+        "и осмысленные заметки выше, относящиеся к этой теме — не "
+        "перечисляй их списком, а свяжи в связное описание, объясняя, "
+        "ПОЧЕМУ именно эта черта отношений характерна именно для этой "
+        "пары (через конкретный синастрический аспект и то, в чей дом "
+        "попадает чья точка), а не общие свойства планет самих по себе. "
+        "Пиши именно про ОТНОШЕНИЯ и взаимодействие двух людей, а не про "
+        "характер одного из них в отрыве от другого. Не повторяй один и "
+        "тот же синастрический аспект в нескольких разделах без "
+        "необходимости.\n\n"
+        "Не рисуй искусственно гармоничную картину: синастрия — это в "
+        "первую очередь исследование того, ГДЕ в паре реальное трение, а "
+        "не просто перечисление того, что и так хорошо сочетается. Если "
+        "аспект помечен в данных как «природа: гармоничный» — упомяни это "
+        "просто как факт, одной-двумя фразами, не нужно его расписывать "
+        "подробнее остального; а если аспект помечен как «природа: "
+        "напряжённый» или «неоднозначный» — раскрой его подробно и "
+        "внимательно (особенно в разделе «Точки напряжения и конфликты»): "
+        "в чём именно трение, между какими конкретно потребностями двух "
+        "людей, как оно может проявляться в быту, и что с этим можно "
+        "сделать — не сворачивай его в одну общую фразу и не смягчай до "
+        "уровня гармоничного. НИКОГДА не называй гармоничный аспект "
+        "(трин, секстиль, полусекстиль, квинтиль, биквинтиль — то, что "
+        "помечено «природа: гармоничный» в данных) точкой напряжения или "
+        "конфликта — используй ТОЛЬКО готовую пометку «природа: ...» "
+        "каждого аспекта, не переопределяй её по памяти о типе аспекта "
+        "(реальная, найденная тестированием ошибка: трин и полусекстиль, "
+        "оба гармоничные, были неверно названы «точками напряжения»). "
+        "Если реальных напряжённых или неоднозначных аспектов в данных "
+        "нет вообще — так и есть, не придумывай их.\n\n"
+        "Важно для точности: каждый раз, когда упоминаешь чью-то точку "
+        "или чей-то дом, используй ТОЛЬКО то, что указано в блоке ДАННЫЕ "
+        "и ОСМЫСЛЕННЫЕ ЗАМЕТКИ выше — не путай, чья это точка и чей это "
+        "дом (дом партнёра, в который попадает точка, это не дом самого "
+        "владельца точки в его собственной карте); если тот же аспект "
+        "упоминается в другом разделе, он должен описываться одинаково "
+        "и там, и там.\n\n"
+        "Если материала по какому-то разделу мало — так и напиши "
+        "коротко, не выдумывай недостающее. Не добавляй отдельный "
+        "мини-«Итог» внутри каждого раздела — итоговый вывод пишется "
+        "только один раз, в последнем разделе «Итог» из списка выше: "
+        "2-3 предложения общего вывода о паре в целом.\n\n"
+        "Как называть аспект между планетами: используй готовую фразу из "
+        "осмысленных заметок дословно («трин Солнца и Луны», «квадрат "
+        "Меркурия и Венеры») — никогда не изобретай прилагательные вроде "
+        "«Лунный», «Венерианский» вместо названия аспекта, это "
+        "неинформативно и часто грамматически неверно.\n\n"
+        "Не упоминай числовое значение орбиса (например «орбис 1.4°») в "
+        "тексте ответа — используй его только чтобы понять силу аспекта, "
+        "а описывай эту силу словами, если нужно, а не цифрой.\n\n"
+        "Избегай расплывчатых формулировок вроде «структурные качества», "
+        "«социальные качества», «генетические качества» — называй "
+        "конкретное качество, потребность или тему отношений, реально "
+        "следующую из конкретного аспекта/дома, а не абстрактную "
+        "категорию.\n\n"
+        "Форматирование: заголовки разделов — markdown (## Заголовок), "
+        "при необходимости можно **выделять жирным** ключевые термины; "
+        "юникод-значки планет/знаков/аспектов (☉ ♋ ☌ △ и т.п.) уже "
+        "используются в данных выше — можешь использовать их и в своём "
+        "тексте рядом с названием для краткости, но не обязательно "
+        "везде. Пиши только на русском языке: никаких иероглифов, "
+        "английских слов или заголовков-переводов (не дублируй русский "
+        "заголовок раздела его английским эквивалентом) и никаких других "
+        "языков вообще — если почувствуешь, что вот-вот повторишь то же "
+        "слово ещё раз или собираешься переключиться на другой язык, "
+        "перефразируй по-русски вместо этого."
     )

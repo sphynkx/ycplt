@@ -301,7 +301,7 @@ async def _handle_chat_request(conversation_id: int, req: ChatRequest, sent_at: 
 # that utils/astro.py's own regex extraction parses (as opposed to e.g.
 # calculate's argument, a math expression that must stay exactly what it
 # is) — see the tool_arg handling below for why that matters.
-_INTERPRETED_TOOL_NAMES = {"astro_natal_chart", "astro_transit_chart"}
+_INTERPRETED_TOOL_NAMES = {"astro_natal_chart", "astro_transit_chart", "astro_synastry_chart"}
 
 
 async def _handle_tool_request(
@@ -371,10 +371,11 @@ async def _handle_tool_request(
         computed_chunk = {
             "text": (
                 "ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА (уже вычислены и предоставлены — "
-                "это не пример и не общий случай, а точная натальная/транзитная "
-                "карта конкретного человека из вопроса пользователя; "
-                "не пересчитывать, не менять и не утверждать, что этих "
-                "данных не хватает или что они не были даны):\n"
+                "это не пример и не общий случай, а точная натальная/"
+                "транзитная/синастрическая карта конкретного человека (или "
+                "двух людей) из вопроса пользователя; не пересчитывать, не "
+                "менять и не утверждать, что этих данных не хватает или что "
+                "они не были даны):\n"
                 f"{tool_result}"
             ),
             "topic": "astrology",
@@ -395,22 +396,34 @@ async def _handle_tool_request(
         # (a plain top-k search against the user's free-text question
         # essentially never surfaces reference material organized by
         # specific placement/aspect, however large that reference corpus
-        # is). Natal and transit charts each get their own profile
-        # extractor (astro.get_planet_profiles / astro.get_transit_profiles
-        # — the latter reads a transiting planet's house against the
-        # NATAL chart's cusps, not the transit moment's own houses; see
-        # astro._house_of_degree) and their own digest framing
-        # (interpret.digest_facts_async's chart_kind parameter) — a
-        # transiting planet's aspects are read very differently from a
-        # natal planet's own (activation/timing vs. permanent character),
-        # so the two can't share one digest prompt.
+        # is). Natal, transit, and synastry charts each get their own
+        # profile extractor (astro.get_planet_profiles /
+        # astro.get_transit_profiles / astro.get_synastry_profiles — the
+        # latter two read a point's house against a DIFFERENT chart's
+        # cusps than its own, via astro._house_of_degree) and their own
+        # digest framing (interpret.digest_facts_async's chart_kind
+        # parameter) — each reads its aspects with a different meaning
+        # (permanent character vs. current activation/timing vs.
+        # relationship dynamics between two people), so none of the three
+        # can share one digest prompt.
         digested = ""
+        name_a = name_b = ""
         if decision.tool_name == "astro_natal_chart":
             profiles = astro.get_planet_profiles(tool_arg)
             digested = await interpret.digest_facts_async(profiles)
         elif decision.tool_name == "astro_transit_chart":
             profiles = astro.get_transit_profiles(tool_arg)
             digested = await interpret.digest_facts_async(profiles, chart_kind="transit")
+        elif decision.tool_name == "astro_synastry_chart":
+            # Both people's profiles are digested together in one combined
+            # list — each profile's own "text" already names which person
+            # it belongs to (see astro.get_synastry_profiles), so the
+            # digest prompt can tell them apart without needing two
+            # separate LLM calls.
+            profiles_a, profiles_b, name_a, name_b = astro.get_synastry_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(
+                profiles_a + profiles_b, chart_kind="synastry"
+            )
 
         if digested and decision.tool_name == "astro_natal_chart":
             # Sectioned prompt instead of build_prompt's generic reasoning-
@@ -431,6 +444,15 @@ async def _handle_tool_request(
             # have, instead of the generic reasoning-mode fallback below.
             followup_prompt = interpret.build_transit_answer_prompt(
                 req.query, str(tool_result), digested, rag_contexts
+            )
+        elif digested and decision.tool_name == "astro_synastry_chart":
+            # Same mechanism again, relationship-framed section list (see
+            # interpret.build_synastry_answer_prompt) — name_a/name_b let
+            # the prompt tell the model which generic label ("Человек A"/
+            # "Человек B") corresponds to which person, and to prefer the
+            # user's own wording if they named both people by name.
+            followup_prompt = interpret.build_synastry_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts, name_a, name_b
             )
         else:
             # Order matters: raw computed data first, then general

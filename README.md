@@ -440,19 +440,22 @@ Built-in tools:
   do arithmetic on numbers, never call functions, import anything, or
   access names, so a malformed or adversarial expression just returns an
   error string instead of executing.
-- **`astro_natal_chart`** / **`astro_transit_chart`** — computes an
-  astrological chart (planet signs/houses, aspects) via
+- **`astro_natal_chart`** / **`astro_transit_chart`** / **`astro_synastry_chart`**
+  — computes an astrological chart (planet signs/houses, aspects) via
   [kerykeion](https://github.com/g-battaglia/kerykeion) (`utils/astro.py`),
   fully offline (Swiss Ephemeris, no API key). `astro_natal_chart` computes
   a birth chart; `astro_transit_chart` computes current (or a given
   moment's) planetary positions and their aspects to a natal chart — for
-  "what's happening right now" style questions. Both require birth date,
-  time, and place (as coordinates) to already be present in the
-  conversation — the tool descriptions explicitly tell the router never to
-  invent placeholder birth data, so if it's missing the model just asks the
-  user for it in the follow-up answer instead of guessing. The argument the
-  router extracts is meant to be a verbatim quote of the birth info from
-  the user's own message, not a reformatted one — `utils/astro.py` parses
+  "what's happening right now" style questions; `astro_synastry_chart`
+  compares TWO people's natal charts — for compatibility/relationship
+  questions (see its own paragraph further down for the two-person-specific
+  parts). All three require birth date, time, and place (as coordinates) to
+  already be present in the conversation — the tool descriptions explicitly
+  tell the router never to invent placeholder birth data, so if it's
+  missing the model just asks the user for it in the follow-up answer
+  instead of guessing. The argument the router extracts is meant to be a
+  verbatim quote of the birth info from the user's own message, not a
+  reformatted one — `utils/astro.py` parses
   common date formats (including "5 июля 1976"), times, and coordinates
   (decimal or degree-minute-second with N/S/E/W) itself, and resolves the
   timezone automatically from the coordinates via `timezonefinder` — this
@@ -464,14 +467,30 @@ Built-in tools:
   cities, bundled with the package — no download or file to place
   anywhere): exact name match first (checked against every alternate-
   language name too, so Cyrillic city names generally work), then a
-  same-first-5-letters "stem" fallback for when the name appears in some
+  same-first-few-letters "stem" fallback (checking a couple of prefix
+  lengths, not just one fixed length) for when the name appears in some
   Russian grammatical case rather than the gazetteer's nominative form
   ("в Одессе" vs "Одесса") — not real morphological analysis, just a cheap
   approximation, but works for most city names. Ambiguous matches (a name
   that exists in more than one country, or an ordinary word that
   coincidentally happens to also be some obscure place's alternate name)
-  are resolved by picking the most populous match, which is right far more
-  often than not. `pip install kerykeion timezonefinder geonamescache`
+  are resolved by picking the most populous match ACROSS every exact and
+  stem match together in one pool — fixed from an earlier version that
+  let an exact match win outright without ever comparing it against a
+  stem match's population, a real bug found via testing: the Russian word
+  "года" ("of the year", present in nearly every birth-info sentence)
+  happens to be listed as an alternate name for a ~19k-population Japanese
+  town, which used to silently win over a same-sentence stem match on
+  Kyiv (pop. ~2.95M) purely because "года" was an *exact* match and Kyiv's
+  declined form ("Киеве") was only a *stem* one — the two were never
+  actually compared. A second, independent bug fixed alongside it: a base
+  city name shorter than the stem-comparison length (e.g. "Киев", 4
+  letters) was previously only ever indexed under its own full-length
+  bucket, but a declined form in the text ("Киеве", 5 letters) only ever
+  checked its own equally-long bucket — which could never match a
+  shorter one — so a short city name's declined form couldn't become a
+  match candidate at all before this fix, regardless of the population
+  comparison above. `pip install kerykeion timezonefinder geonamescache`
   (kerykeion is AGPL-3.0 — see `utils/astro.py`'s docstring if you plan to
   redistribute this project) if you want this tool available; without
   timezonefinder/geonamescache specifically, their part is simply skipped
@@ -555,12 +574,66 @@ Built-in tools:
   aspect's `movement_ru` ("сходящийся, усиливается" / "расходящийся,
   ослабевает") for its dedicated timing section — natal charts have no
   equivalent of "is this fading or intensifying," so that data existed
-  before this rewrite but nothing used it. `get_dual_chart_profiles` is
-  written generically enough that synastry (a second person's chart
-  instead of a transit moment) is meant to become its second consumer —
-  most likely via two calls, one per direction, since a synastry
-  reading is bidirectional in a way a transit reading isn't; not yet
-  built.
+  before this rewrite but nothing used it.
+
+  Synastry (`astro_synastry_chart`) is `get_dual_chart_profiles()`'s
+  second consumer, exactly as planned when the transit rewrite above
+  introduced it: `astro.get_synastry_profiles()` calls it TWICE, once per
+  direction (person A's points overlaid onto person B's houses, then
+  person B's onto person A's) — a synastry reading is genuinely
+  bidirectional in a way a transit reading isn't (a moment doesn't have
+  "its own" chart to profile the way a second person does), so both
+  directions matter and neither is a redundant restatement of the other.
+  `get_dual_chart_profiles()` gained a handful of new parameters
+  (`other_point_label`, `reference_house_label`, `query_prefix`, `kind`)
+  purely so synastry could relabel its generic transit-oriented
+  "транзитный .../натальный N дом" phrasing into person-specific
+  phrasing ("Венера ♀ (Мария)" / "7 дом у Ивана") — every parameter
+  defaults to the exact original transit wording, so `run_transit`'s
+  behavior is unchanged unless a caller explicitly overrides them.
+
+  The one genuinely new problem synastry introduced: pulling TWO
+  independent sets of birth data out of one free-text message, which the
+  existing single-person `_extract_fields()` was never built for.
+  `astro._extract_two_person_fields()` handles this with the same
+  fast-path/fallback structure as the single-person case: explicit
+  `date_a=`/`time_a=`/`lat_a=`/... plus `_b` key=value pairs (parsed for
+  free by the already-generic key=value parser), or — the expected common
+  case — free text naming two people back to back ("Иван, 5 июля 1976 в
+  4:30 в Одессе, и Мария, 12 марта 1980 в 9:15 в Киеве"), split into two
+  independent halves by `astro._split_two_person_text()`: it finds the
+  first two recognizable dates in the text and splits between them at the
+  last comma found in between (falling back to the plain midpoint if
+  there's no comma there) — a best-effort heuristic, not a real parser,
+  in the same accepted-approximation spirit as the city-name stem
+  matching described above. Each half is then resolved via the *exact*
+  same single-person field-resolution logic `_extract_fields()` uses (now
+  shared as `_fill_fields_from_text()`, pulled out specifically so the
+  two-person path can't silently drift from the single-person one),
+  entirely independently per half. Person names are deliberately NOT
+  guessed from the free text (only taken from explicit `name_a=`/`name_b=`
+  key=value input) — a fragile "nearest capitalized word" heuristic risks
+  being *wrong* in a way a safe generic default ("Человек A"/"Человек B")
+  isn't; `interpret.build_synastry_answer_prompt()` instead tells the
+  model to substitute the real names in its own answer if the user's
+  question named both people, using first-mentioned = person A's data,
+  second-mentioned = person B's — a much easier task for the model
+  (loose natural-language mapping) than for a regex in Python.
+
+  The final synastry answer uses its own section list
+  (`interpret.SYNASTRY_ANSWER_SECTIONS`: overall compatibility / emotional
+  connection / communication / friction points / summary) — deliberately
+  framed around the *relationship*, not either person's character in
+  isolation, which is also why `interpret.build_synastry_answer_prompt()`
+  explicitly instructs the model to describe connections between the two
+  charts rather than either person's placements on their own. A
+  project-authored reasoning-methodology document for this technique
+  (mirroring `interpretation_methodology.txt`'s own role — HOW to weigh
+  house overlays/aspects/angularity into a synthesized reading, not a
+  factual planet-meaning corpus) was written separately; put it in its
+  own `rag_data/astro_synastry/` topic subfolder as a `*_methodology.txt`
+  file (see "RAG — search over your own documents" below) alongside
+  whatever factual reference material you assemble for this topic.
 
   Chart coverage beyond the classical 10 planets + Ascendant/MC: houses
   (all 12 cusps, used as placement context, not their own fact), Chiron,
@@ -611,27 +684,29 @@ Built-in tools:
   Chinese characters mid-sentence — see `config.REPEAT_PENALTY` below for
   the generation-side mitigation for the same issue). This section list is
   a proposed breakdown, not a fixed schema — `interpret.ASTRO_ANSWER_SECTIONS`
-  (and transit's own `interpret.TRANSIT_ANSWER_SECTIONS`) are plain lists,
-  easy to add to, rename, or drop sections from. Falls back to the generic
-  reasoning-mode template if the digest step produced nothing for either
-  chart type.
+  (transit's `interpret.TRANSIT_ANSWER_SECTIONS`, and synastry's
+  `interpret.SYNASTRY_ANSWER_SECTIONS`) are plain lists, easy to add to,
+  rename, or drop sections from. Falls back to the generic reasoning-mode
+  template if the digest step produced nothing for any of the three chart
+  types.
 
-  This is meant to grow rather than stay fixed at two operations —
-  `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point for
-  future chart types (synastry between two people, composite charts, event-
-  time/electional search, birth-time rectification): write one function,
-  add one registry entry, wire a new `TOOL_REGISTRY` description when
-  there's a concrete need for it. If you add a technique that needs its own
-  reference corpus (synastry, progressions, solar/lunar returns — each is
-  built and interpreted differently enough that mixing their methodology
-  documents in one place risks confusing the model and bloating the
-  always-include context for every dual-chart question), give it its own
-  topic subfolder under `rag_data/` (e.g. `rag_data/astro_transit/`,
-  `rag_data/astro_synastry/`) rather than dropping it into the existing
-  natal-chart topic — see "RAG — search over your own documents" below for
-  how topic subfolders work; a document's `always_include` methodology
-  chunks only ever pull in other chunks from that *same* topic, so keeping
-  each dual-chart technique in its own subfolder is what keeps their
+  This is meant to keep growing rather than stay fixed at three operations
+  — `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point
+  for future chart types (composite charts, progressions, solar/lunar
+  returns, event-time/electional search, birth-time rectification): write
+  one function, add one registry entry, wire a new `TOOL_REGISTRY`
+  description when there's a concrete need for it. If you add a technique
+  that needs its own reference corpus (progressions, solar/lunar returns —
+  each is built and interpreted differently enough that mixing their
+  methodology documents in one place risks confusing the model and
+  bloating the always-include context for every dual-chart question), give
+  it its own topic subfolder under `rag_data/` (e.g. `rag_data/astro_
+  transit/`, `rag_data/astro_synastry/`, following on from the two that
+  already exist) rather than dropping it into the existing natal-chart
+  topic — see "RAG — search over your own documents" below for how topic
+  subfolders work; a document's `always_include` methodology chunks only
+  ever pull in other chunks from that *same* topic, so keeping each
+  dual-chart technique in its own subfolder is what keeps their
   methodologies from all activating together on every question.
 
 Adding a new tool is meant to be a small, self-contained change:
@@ -766,6 +841,15 @@ e.g. `rag_data/astrology/interpretation_methodology.txt` — and
 `utils/rag.py`'s `retrieve_context` will always include its chunks
 whenever ordinary similarity search already found other chunks from the
 same topic, regardless of the methodology document's own similarity rank.
+**The filename itself isn't fixed or hardcoded anywhere** — only that
+`_methodology` suffix (checked by `build_index.py`'s `_is_methodology()`)
+matters; call it `synastry_methodology.txt`, `natal_methodology.pdf`,
+`метод_транзитов_methodology.txt`, whatever fits your own naming scheme.
+This also means every topic subfolder gets its own independent
+methodology document(s) — the suffix is checked per file, and
+`always_include` expansion (below) only ever pulls in other chunks from
+the *same* topic, so `rag_data/astro_transit/foo_methodology.txt` and
+`rag_data/astro_synastry/bar_methodology.txt` never activate each other.
 When any such chunk is present, `build_prompt` also switches from a plain
 "answer using this context" prompt to one that asks the model to reason
 step by step — list the relevant facts, think through how they interact
