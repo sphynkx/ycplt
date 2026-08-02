@@ -89,7 +89,7 @@ a real geocoding service.
 """
 import re
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Chart text (below) is rendered directly in Russian, not left for the
 # follow-up LLM call to translate — an earlier version kept this in
@@ -682,12 +682,63 @@ def _house_number(house_name: Optional[str]) -> Optional[int]:
     return None
 
 
-def _format_point_line(label: str, point) -> str:
+def _format_point_line(label: str, point, house_num_override: Optional[int] = None) -> str:
+    """house_num_override lets a caller supply a house number computed
+    against a DIFFERENT chart's cusps than `point`'s own (see
+    _house_of_degree) — used by _format_transit_text so a transiting
+    planet's house is read against the natal chart, not the transit
+    moment's own independently-computed houses."""
     sign = _sign_ru(point.sign)
-    house_num = _house_number(getattr(point, "house", None))
+    house_num = (
+        house_num_override if house_num_override is not None
+        else _house_number(getattr(point, "house", None))
+    )
     house_part = f", дом {house_num}" if house_num else ""
     retro = " (ретроградный)" if getattr(point, "retrograde", False) else ""
     return f"{label}: {sign} {point.position:.1f}°{house_part}{retro}"
+
+
+def _house_cusp_degrees(subject) -> List[float]:
+    """Absolute ecliptic degree of each of a chart's 12 house cusps, in
+    house order (index 0 = house 1's cusp) — the input _house_of_degree
+    needs to place an arbitrary point (e.g. a transiting planet) into
+    THIS chart's houses, regardless of which chart the point itself came
+    from."""
+    attrs = [
+        "first_house", "second_house", "third_house", "fourth_house",
+        "fifth_house", "sixth_house", "seventh_house", "eighth_house",
+        "ninth_house", "tenth_house", "eleventh_house", "twelfth_house",
+    ]
+    return [getattr(subject, attr).position for attr in attrs]
+
+
+def _house_of_degree(cusp_degrees: List[float], degree: float) -> int:
+    """Which house (1-12) an arbitrary absolute ecliptic degree falls
+    into, given a chart's 12 house cusp degrees (house order, index 0 =
+    house 1). This is the standard transit-astrology convention for
+    reading a transiting planet's house — compare its own degree against
+    the NATAL chart's cusps — confirmed with the user as the intended
+    behavior over the alternative (and, until this function existed, the
+    actual behavior): computing an entirely separate house system for the
+    transit moment's own time/location via a second AstrologicalSubject
+    build, which is not how transits are conventionally read (a transit
+    reading is about which of YOUR houses a planet is currently moving
+    through, not what house it would occupy in a chart cast for that
+    moment at your birthplace).
+
+    Houses aren't evenly spaced (real house systems, Placidus included,
+    have unequal arcs), so this can't just divide by 30° — each house's
+    actual arc (cusp i to the next cusp, wrapping past 360° when it
+    crosses 0° Aries) has to be checked directly."""
+    n = len(cusp_degrees)
+    d = degree % 360.0
+    for i in range(n):
+        start = cusp_degrees[i] % 360.0
+        end = cusp_degrees[(i + 1) % n] % 360.0
+        in_arc = (start <= d < end) if start <= end else (d >= start or d < end)
+        if in_arc:
+            return i + 1
+    return 12  # unreachable in practice (the loop above is exhaustive) — safe fallback
 
 
 def _build_subject(fields: Dict[str, str], name: str, active_points: Optional[List[str]] = None):
@@ -850,16 +901,26 @@ def _format_natal_text(subject) -> str:
 def _format_transit_text(natal, transit) -> str:
     from kerykeion import AspectsFactory
 
+    # Each transiting planet's house is read against the NATAL chart's own
+    # cusps (_house_of_degree), not `transit`'s own house attribute — see
+    # that function's docstring for why. `transit` (built via
+    # _ACTIVE_POINTS_TRANSIT) still supplies each planet's current
+    # sign/degree/retrograde state; only its OWN house computation is
+    # discarded here.
+    natal_cusps = _house_cusp_degrees(natal)
+
     lines = [
         f"Положения планет на {transit.year:04d}-{transit.month:02d}-{transit.day:02d} "
         f"{transit.hour:02d}:{transit.minute:02d} ({transit.tz_str}), в сравнении с натальной "
         f"картой {natal.name}.",
-        "Текущие положения планет:",
+        "Текущие положения планет (дом — натальный, т.е. дом натальной карты, "
+        "через который сейчас проходит планета):",
     ]
     for label, attr in _PLANET_ATTRS:
         point = getattr(transit, attr, None)
         if point is not None:
-            lines.append("  " + _format_point_line(label, point))
+            natal_house = _house_of_degree(natal_cusps, point.position)
+            lines.append("  " + _format_point_line(label, point, house_num_override=natal_house))
 
     aspects = AspectsFactory.dual_chart_aspects(
         natal, transit, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
@@ -985,17 +1046,10 @@ def get_planet_profiles(spec: str, top_n: int = 9) -> List[Dict]:
         point_label = sf["text"].split(" — ", 1)[0]
         stars_by_label.setdefault(point_label, []).append(sf)
 
-    # Kerykeion point-name -> (Russian label, subject attribute) for
-    # looking up the *other* side of an aspect's own sign/house — built
-    # once here rather than as a module-level constant since it depends on
-    # attr_to_kerykeion_name, defined further down this file.
-    all_points = _PLANET_ATTRS + _ANGLE_ATTRS
-    kery_name_to_point = {
-        attr_to_kerykeion_name(attr): (label, attr) for label, attr in all_points
-    }
+    kery_name_to_point = _kery_name_to_point_map()
 
     profiles: List[Dict] = []
-    for label, attr in all_points:
+    for label, attr in _PLANET_ATTRS + _ANGLE_ATTRS:
         point = getattr(subject, attr, None)
         if point is None:
             continue
@@ -1129,6 +1183,175 @@ def attr_to_kerykeion_name(attr: str) -> str:
     }.get(attr, attr)
 
 
+def _kery_name_to_point_map() -> Dict[str, Tuple[str, str]]:
+    """kerykeion point-name literal (e.g. "True_North_Lunar_Node") ->
+    (Russian label, subject attribute) — shared by get_planet_profiles
+    and get_dual_chart_profiles for looking up the *other* side of an
+    aspect's own sign/house. Pulled out as its own function (rather than a
+    module-level constant) since it depends on attr_to_kerykeion_name,
+    defined just above."""
+    all_points = _PLANET_ATTRS + _ANGLE_ATTRS
+    return {attr_to_kerykeion_name(attr): (label, attr) for label, attr in all_points}
+
+
+def get_dual_chart_profiles(
+    reference_subject,
+    other_subject,
+    other_active_points: Optional[List[str]] = None,
+    top_n: int = 9,
+) -> List[Dict]:
+    """Two-chart counterpart to get_planet_profiles — one profile per
+    significant point of `other_subject` (currently: a transit moment's
+    moving planets; intended to also serve synastry as its second
+    consumer, see below), each bundling:
+      - its placement, with the house computed against
+        `reference_subject`'s OWN cusps via _house_of_degree — the
+        standard transit-astrology convention (a transiting planet's
+        house is which of YOUR houses it's currently moving through, not
+        some house system computed fresh for the transit moment itself);
+      - its own cross-chart aspects to `reference_subject`'s points, each
+        carrying that reference point's sign/house too — the same "other
+        side of the aspect" context get_planet_profiles already gives for
+        single-chart aspects, needed for the same reason (so the digest
+        step can judge how strong/relevant the aspecting relationship is,
+        not just that it exists).
+
+    This is the shared layer run_transit is being refactored onto (see
+    _format_transit_text, which now also uses _house_of_degree directly
+    for its own raw-data listing, and routes/chat.py, which now runs
+    transit answers through the same digest/sectioned-answer pipeline
+    natal charts already have instead of the generic reasoning-mode
+    prompt). Synastry is intended to reuse this same function as its
+    second consumer — most likely by calling it twice, once per
+    direction (person A's points aspecting B's chart, then B's points
+    aspecting A's), since a synastry reading is inherently bidirectional
+    in a way a transit reading isn't (a moment doesn't have "its own"
+    identity worth profiling the way a second person's chart does) — not
+    yet built, left for that follow-up rather than guessed at here.
+
+    other_active_points defaults to _ACTIVE_POINTS_TRANSIT (fixed stars
+    and the Vertex excluded from the moving side — see that list's own
+    comment for why neither is meaningfully "transiting"). Scoring
+    mirrors get_planet_profiles: angularity (by the reference-chart house
+    computed above, not other_subject's own), aspect count, retrograde.
+    No force-include tier here: Pars Fortunae/star-conjunction force-
+    include is a natal-only concept (a transiting Part of Fortune isn't
+    conventionally read as a moving body, and other_active_points already
+    excludes fixed stars entirely) — only Sun/Moon are force-included,
+    since they're the two bodies every mainstream transit reading treats
+    as significant regardless of house/aspect count (the Moon especially:
+    it moves fast enough that its house/sign alone is often the main
+    short-term theme, even with few exact aspects on a given day)."""
+    if other_active_points is None:
+        other_active_points = _ACTIVE_POINTS_TRANSIT
+
+    from kerykeion import AspectsFactory
+
+    natal_cusps = _house_cusp_degrees(reference_subject)
+    aspects = AspectsFactory.dual_chart_aspects(
+        reference_subject, other_subject,
+        active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
+    ).aspects
+
+    other_name = other_subject.name
+    aspect_counts: Dict[str, int] = {}
+    for a in aspects:
+        other_side = a.p1_name if a.p1_owner == other_name else a.p2_name
+        aspect_counts[other_side] = aspect_counts.get(other_side, 0) + 1
+
+    kery_name_to_point = _kery_name_to_point_map()
+
+    profiles: List[Dict] = []
+    for label, attr in _PLANET_ATTRS:
+        kery_name = attr_to_kerykeion_name(attr)
+        if kery_name not in other_active_points:
+            continue
+        point = getattr(other_subject, attr, None)
+        if point is None:
+            continue
+
+        natal_house = _house_of_degree(natal_cusps, point.position)
+        retrograde = bool(getattr(point, "retrograde", False))
+        label_ru = _point_ru_from_label(label)
+
+        score = 0.0
+        if natal_house in _ANGULAR_HOUSES:
+            score += 3.0
+        elif natal_house in _SUCCEDENT_HOUSES:
+            score += 1.5
+        if retrograde:
+            score += 0.5
+        score += 0.5 * aspect_counts.get(kery_name, 0)
+
+        # This planet's own cross-chart aspects, each carrying the
+        # REFERENCE (natal) point's sign/house too — mirrors
+        # get_planet_profiles' own_aspects exactly, just across two
+        # subjects instead of one.
+        own_aspects = []
+        for a in aspects:
+            if a.p1_owner == other_name and a.p1_name == kery_name:
+                other_kery = a.p2_name
+            elif a.p2_owner == other_name and a.p2_name == kery_name:
+                other_kery = a.p1_name
+            else:
+                continue
+            ref_label, ref_attr = kery_name_to_point.get(other_kery, (other_kery, None))
+            ref_point = getattr(reference_subject, ref_attr, None) if ref_attr else None
+            ref_sign = _sign_ru(ref_point.sign) if ref_point is not None else ""
+            ref_house = (
+                _house_number(getattr(ref_point, "house", None)) if ref_point is not None else None
+            )
+            # Pre-formatted, grammatically correct phrase, same convention
+            # as get_planet_profiles' "phrase" — e.g. "квадрат Марса и
+            # Сатурна" for a transiting Mars square natal Saturn.
+            phrase = (
+                f"{_aspect_ru(a.aspect)} {_point_ru_genitive_from_label(label)} "
+                f"и {_point_ru_genitive_from_label(ref_label)}"
+            )
+            own_aspects.append(
+                {
+                    "orb": a.orbit,
+                    "aspect_ru": _aspect_ru(a.aspect),
+                    "movement_ru": _movement_ru(a.aspect_movement),
+                    "other_label": _point_ru_from_label(ref_label),
+                    "other_sign": ref_sign,
+                    "other_house": ref_house,
+                    "phrase": phrase,
+                }
+            )
+        own_aspects.sort(key=lambda x: x["orb"])
+        own_aspects = own_aspects[:_MAX_ASPECTS_PER_PROFILE]
+
+        sign_prep = _sign_ru_prepositional(point.sign)
+        retro_text = " (ретроградный)" if retrograde else ""
+        house_text = f", натальный {natal_house} дом" if natal_house else ""
+
+        queries = [f"транзитный {label} {sign_prep}"] + (
+            [f"транзитный {label} в {natal_house} доме"] if natal_house else []
+        )
+        for asp in own_aspects:
+            queries.append(f"транзит {asp['aspect_ru']} {label_ru} и {asp['other_label']}")
+
+        profiles.append(
+            {
+                "kind": "transit_planet",
+                "label": label_ru,
+                "text": f"транзитный {label_ru} {sign_prep}{house_text}{retro_text}",
+                "aspects": own_aspects,
+                "stars": [],
+                "queries": queries,
+                "score": score,
+                "force_include": label in ("Солнце", "Луна"),
+            }
+        )
+
+    forced = [p for p in profiles if p["force_include"]]
+    rest = sorted(
+        (p for p in profiles if not p["force_include"]), key=lambda p: p["score"], reverse=True
+    )
+    return forced + rest[: max(0, top_n - len(forced))]
+
+
 # Every non-chart string run_natal/run_transit can return starts with one
 # of these — used by routes/chat.py to skip the RAG-augmented reasoning
 # prompt when there's no actual chart data to interpret yet (just a
@@ -1161,15 +1384,22 @@ def run_natal(spec: str) -> str:
         return f"Ошибка при расчёте натальной карты: {e}"
 
 
-def run_transit(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_transit_chart"])."""
-    fields, missing = _extract_fields(spec)
-    if missing:
-        return _missing_fields_message(missing, fields)
+def _build_transit_subjects(fields: Dict[str, str], name: str) -> Tuple[Optional[Any], Optional[Any], Optional[str]]:
+    """Shared by run_transit and get_transit_profiles — both need the same
+    pair of subjects (natal + the transit-moment subject), and duplicating
+    this parsing/building logic in two places risked exactly the kind of
+    drift that would silently make the digest step (get_transit_profiles)
+    see a different moment/location than the raw chart text
+    (run_transit/_format_transit_text) shows. Returns (natal,
+    transit_subject, None) on success, or (None, None, error_message) on
+    any failure — following this module's established "never raise, return
+    an explanatory Russian string instead" convention (see run_natal's own
+    docstring) rather than letting callers each reimplement their own
+    try/except around three separate failure points."""
     try:
-        natal = _build_subject(fields, name=fields.get("name") or "Subject")
+        natal = _build_subject(fields, name=name)
     except Exception as e:
-        return f"Не удалось построить натальную карту — некорректные данные ({e})."
+        return None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
 
     moment = (fields.get("moment") or "now").strip()
     try:
@@ -1178,7 +1408,7 @@ def run_transit(spec: str) -> str:
         else:
             dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
     except Exception as e:
-        return (
+        return None, None, (
             f"Не удалось разобрать момент времени '{moment}' ({e}); "
             "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
         )
@@ -1206,12 +1436,48 @@ def run_transit(spec: str) -> str:
             active_points=_ACTIVE_POINTS_TRANSIT,
         )
     except Exception as e:
-        return f"Не удалось рассчитать текущие положения планет: {e}"
+        return None, None, f"Не удалось рассчитать текущие положения планет: {e}"
 
+    return natal, transit_subject, None
+
+
+def run_transit(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_transit_chart"])."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields)
+    natal, transit_subject, error = _build_transit_subjects(fields, name=fields.get("name") or "Subject")
+    if error:
+        return error
     try:
         return _format_transit_text(natal, transit_subject)
     except Exception as e:
         return f"Ошибка при расчёте транзитов: {e}"
+
+
+def get_transit_profiles(spec: str, top_n: int = 9) -> List[Dict]:
+    """Transit counterpart to get_planet_profiles, for routes/chat.py's
+    digest step — rebuilds both subjects from `spec` (same duplication-of-
+    computation pattern get_planet_profiles already has relative to
+    run_natal: the tool call already computed a subject once for the raw
+    chart text, and this recomputes it independently for profiling; kept
+    consistent with that existing precedent rather than plumbing the
+    already-built subject through routes/chat.py) and hands them to
+    get_dual_chart_profiles.
+
+    Returns [] (not an error) if fields are missing or subject-building
+    fails — same "no profiles available, caller falls back" contract
+    get_planet_profiles already has."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return []
+    natal, transit_subject, error = _build_transit_subjects(fields, name=fields.get("name") or "Subject")
+    if error:
+        return []
+    try:
+        return get_dual_chart_profiles(natal, transit_subject, top_n=top_n)
+    except Exception:
+        return []
 
 
 # Registry for future operations (synastry, composite, rectification,

@@ -387,32 +387,49 @@ async def _handle_tool_request(
             "always_include": True,
         }
 
-        # Multi-stage RAG: rank the chart's own significant facts, run a
-        # targeted retrieval query per fact, and have the model "digest"
-        # those raw fragments into already-reasoned notes in one extra
-        # call, before the final answer call below even starts — see
-        # utils/interpret.py's module docstring for the full rationale
+        # Multi-stage RAG: rank the chart's own significant facts/points,
+        # run a targeted retrieval query per one, and have the model
+        # "digest" those raw fragments into already-reasoned notes in one
+        # extra call, before the final answer call below even starts —
+        # see utils/interpret.py's module docstring for the full rationale
         # (a plain top-k search against the user's free-text question
         # essentially never surfaces reference material organized by
         # specific placement/aspect, however large that reference corpus
-        # is). Natal charts only for now (get_planet_profiles' own scoring
-        # is natal-specific); transit significance would need different
-        # ranking, left as a follow-up.
+        # is). Natal and transit charts each get their own profile
+        # extractor (astro.get_planet_profiles / astro.get_transit_profiles
+        # — the latter reads a transiting planet's house against the
+        # NATAL chart's cusps, not the transit moment's own houses; see
+        # astro._house_of_degree) and their own digest framing
+        # (interpret.digest_facts_async's chart_kind parameter) — a
+        # transiting planet's aspects are read very differently from a
+        # natal planet's own (activation/timing vs. permanent character),
+        # so the two can't share one digest prompt.
         digested = ""
         if decision.tool_name == "astro_natal_chart":
             profiles = astro.get_planet_profiles(tool_arg)
             digested = await interpret.digest_facts_async(profiles)
+        elif decision.tool_name == "astro_transit_chart":
+            profiles = astro.get_transit_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(profiles, chart_kind="transit")
 
-        if decision.tool_name == "astro_natal_chart" and digested:
+        if digested and decision.tool_name == "astro_natal_chart":
             # Sectioned prompt instead of build_prompt's generic reasoning-
             # mode template: repeated real testing showed the generic
             # template's final answer collapsing to one short paragraph no
             # matter how strongly it was told to elaborate. Only used when
             # a digest actually succeeded — the digest step is what supplies
             # the already-reasoned material each section weaves together;
-            # without it (digest failed, or non-natal tools below) fall back
-            # to the plain generic prompt.
+            # without it (digest failed) fall back to the plain generic
+            # prompt.
             followup_prompt = interpret.build_sectioned_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts
+            )
+        elif digested and decision.tool_name == "astro_transit_chart":
+            # Same mechanism, transit-specific section list/framing (see
+            # interpret.build_transit_answer_prompt) — brings transit
+            # answers up to the same quality bar natal charts already
+            # have, instead of the generic reasoning-mode fallback below.
+            followup_prompt = interpret.build_transit_answer_prompt(
                 req.query, str(tool_result), digested, rag_contexts
             )
         else:
@@ -424,9 +441,8 @@ async def _handle_tool_request(
             # generic reference material, plus the strengthened wording
             # above and build_prompt's explicit consistency instruction,
             # are the mitigations for that. (No digested-notes chunk here:
-            # this branch is only reached for transit charts, or a natal
-            # chart whose digest step failed — either way there's nothing
-            # digested to include.)
+            # this branch is only reached when the digest step above
+            # failed — either way there's nothing digested to include.)
             followup_prompt = rag_utils.build_prompt(
                 req.query, [computed_chunk] + rag_contexts
             )

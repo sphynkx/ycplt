@@ -524,13 +524,43 @@ Built-in tools:
   the raw computed chart text every answer gets, which is enough context
   on its own once it's no longer competing as a first-class fact of its
   own. This is a real latency trade — one more model call per natal-chart
-  answer — made deliberately for interpretive accuracy over speed;
-  transit-chart answers don't go through this yet (significance scoring
-  there needs different rules than a static natal chart's angularity/orb).
-  A per-profile (rather than one-call-for-all) digest pass was considered
+  answer — made deliberately for interpretive accuracy over speed. A
+  per-profile (rather than one-call-for-all) digest pass was considered
   for even deeper synthesis but ruled out for now given how much it would
   multiply an already multi-minute CPU-only generation — worth revisiting
   if hardware/latency allow later.
+
+  Transit-chart answers go through the same digest/sectioned-answer
+  pipeline now too, via a shared two-chart layer
+  (`utils/astro.py`'s `get_dual_chart_profiles()`, consumed by
+  `get_transit_profiles()`), not a lesser-quality fallback anymore. Two
+  things worth knowing if you're extending this further (e.g. towards
+  synastry): first, a transiting planet's **house is computed against
+  the natal chart's own cusps** (`astro._house_of_degree`), not from an
+  independent house system built for the transit moment/location itself
+  — this is the standard transit-astrology convention (a transit reading
+  is about which of *your* houses a planet is currently moving through),
+  and fixes a real bug where the raw chart text used to report the
+  transit moment's own houses instead; `_format_transit_text` and
+  `get_dual_chart_profiles` both now go through the same
+  `_house_of_degree` helper so the two can never disagree with each
+  other. Second, the digest prompt (`interpret._build_digest_prompt`)
+  and the final-answer prompt (`interpret.build_transit_answer_prompt`)
+  are each parameterized/duplicated rather than reusing the natal
+  versions unmodified — a transiting planet's aspects are read as
+  current activation/timing, not permanent character, and
+  `TRANSIT_ANSWER_SECTIONS` (general picture / support / tension /
+  timing / summary) is accordingly a different breakdown from
+  `ASTRO_ANSWER_SECTIONS`, built specifically to make use of each
+  aspect's `movement_ru` ("сходящийся, усиливается" / "расходящийся,
+  ослабевает") for its dedicated timing section — natal charts have no
+  equivalent of "is this fading or intensifying," so that data existed
+  before this rewrite but nothing used it. `get_dual_chart_profiles` is
+  written generically enough that synastry (a second person's chart
+  instead of a transit moment) is meant to become its second consumer —
+  most likely via two calls, one per direction, since a synastry
+  reading is bidirectional in a way a transit reading isn't; not yet
+  built.
 
   Chart coverage beyond the classical 10 planets + Ascendant/MC: houses
   (all 12 cusps, used as placement context, not their own fact), Chiron,
@@ -581,16 +611,28 @@ Built-in tools:
   Chinese characters mid-sentence — see `config.REPEAT_PENALTY` below for
   the generation-side mitigation for the same issue). This section list is
   a proposed breakdown, not a fixed schema — `interpret.ASTRO_ANSWER_SECTIONS`
-  is a plain list, easy to add to, rename, or drop sections from. Falls
-  back to the generic template if the digest step produced nothing (or for
-  transit charts, which don't use the digest step yet).
+  (and transit's own `interpret.TRANSIT_ANSWER_SECTIONS`) are plain lists,
+  easy to add to, rename, or drop sections from. Falls back to the generic
+  reasoning-mode template if the digest step produced nothing for either
+  chart type.
 
   This is meant to grow rather than stay fixed at two operations —
   `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point for
   future chart types (synastry between two people, composite charts, event-
   time/electional search, birth-time rectification): write one function,
   add one registry entry, wire a new `TOOL_REGISTRY` description when
-  there's a concrete need for it.
+  there's a concrete need for it. If you add a technique that needs its own
+  reference corpus (synastry, progressions, solar/lunar returns — each is
+  built and interpreted differently enough that mixing their methodology
+  documents in one place risks confusing the model and bloating the
+  always-include context for every dual-chart question), give it its own
+  topic subfolder under `rag_data/` (e.g. `rag_data/astro_transit/`,
+  `rag_data/astro_synastry/`) rather than dropping it into the existing
+  natal-chart topic — see "RAG — search over your own documents" below for
+  how topic subfolders work; a document's `always_include` methodology
+  chunks only ever pull in other chunks from that *same* topic, so keeping
+  each dual-chart technique in its own subfolder is what keeps their
+  methodologies from all activating together on every question.
 
 Adding a new tool is meant to be a small, self-contained change:
 

@@ -119,23 +119,34 @@ def _format_aspect_line(aspect: Dict) -> str:
     return f"{phrase}{other_place}, орбис {aspect['orb']:.1f}°, {aspect['movement_ru']}"
 
 
-def _build_digest_prompt(profiles: List[Dict], fragments_by_fact: Dict[int, List[str]]) -> str:
-    """Builds the digest prompt from astro.get_planet_profiles' bundles —
-    sign+house+retrograde+this point's own aspects (each with the OTHER
-    point's sign/house)+any fixed-star conjunction — instead of the older
-    flat, disconnected planet/aspect/house facts.
+def _build_digest_prompt(
+    profiles: List[Dict], fragments_by_fact: Dict[int, List[str]], chart_kind: str = "natal"
+) -> str:
+    """Builds the digest prompt from a list of profile bundles — either
+    astro.get_planet_profiles' (sign+house+retrograde+this point's own
+    aspects+any fixed-star conjunction, chart_kind="natal") or
+    astro.get_transit_profiles'/get_dual_chart_profiles' (a transiting
+    planet's sign+NATAL house+its own cross-chart aspects to natal
+    points, chart_kind="transit") — instead of the older flat,
+    disconnected planet/aspect/house facts a single-chart design used to
+    produce. Both shapes carry the same dict keys ("text", "aspects",
+    "stars", ...), so only the framing/intro text and one instruction
+    line below actually differ by chart_kind; the fact-block rendering
+    loop is shared.
 
-    This is the actual fix for a real failure found in end-to-end testing:
-    the old design digested "Юпитер в Овне, 12 дом" and each of its
-    aspects as entirely separate, unrelated notes, so the final answer
-    never once let an aspect color a planet's description (a hard square
-    from a personal planet was never distinguished from a supportive
-    trine), and a 12th-house placement's normal muting/hiding effect was
-    ignored even when explicitly asked about. Explicitly instructing the
-    model to weigh aspects by the aspecting planet's own strength (its
-    house/angularity) and by orb tightness, and to apply favorable-vs-
-    tense distinctions per aspect type, is meant to produce a genuinely
-    synthesized characterization instead of a list of isolated facts."""
+    This is the actual fix for a real failure found in end-to-end testing
+    (natal case): the old design digested "Юпитер в Овне, 12 дом" and each
+    of its aspects as entirely separate, unrelated notes, so the final
+    answer never once let an aspect color a planet's description (a hard
+    square from a personal planet was never distinguished from a
+    supportive trine), and a 12th-house placement's normal muting/hiding
+    effect was ignored even when explicitly asked about. Explicitly
+    instructing the model to weigh aspects by the aspecting planet's own
+    strength (its house/angularity) and by orb tightness, and to apply
+    favorable-vs-tense distinctions per aspect type, is meant to produce a
+    genuinely synthesized characterization instead of a list of isolated
+    facts — equally true whether the aspecting planet is natal or
+    transiting."""
     blocks = []
     for i, profile in enumerate(profiles):
         fragments = fragments_by_fact.get(i) or []
@@ -146,7 +157,11 @@ def _build_digest_prompt(profiles: List[Dict], fragments_by_fact: Dict[int, List
         )
         lines = [f"{i + 1}. {profile['text']}"]
         if profile.get("aspects"):
-            lines.append("   Аспекты этой точки к другим:")
+            lines.append(
+                "   Аспекты этой точки к натальным точкам:"
+                if chart_kind == "transit"
+                else "   Аспекты этой точки к другим:"
+            )
             for a in profile["aspects"]:
                 lines.append(f"    - {_format_aspect_line(a)}")
         if profile.get("stars"):
@@ -162,32 +177,93 @@ def _build_digest_prompt(profiles: List[Dict], fragments_by_fact: Dict[int, List
         blocks.append("\n".join(lines))
 
     facts_block = "\n\n".join(blocks)
+
+    if chart_kind == "transit":
+        intro = (
+            "Ниже — транзитные (текущие) положения значимых планет одного "
+            "человека: для каждой указан её текущий знак и НАТАЛЬНЫЙ дом "
+            "(дом карты рождения, через который эта планета сейчас "
+            "проходит — не дом, вычисленный отдельно для текущего "
+            "момента), её аспекты к натальным точкам (со знаком/домом "
+            "натальной точки — чтобы можно было оценить, насколько сильна "
+            "и уместна эта транзитная связь), и найденные справочные "
+            "материалы (если материалы не найдены — рассуждай по общим "
+            "принципам транзитной астрологии)."
+        )
+        house_rule = (
+            "— как натальный дом, через который сейчас проходит эта "
+            "транзитная планета, окрашивает, В КАКОЙ ОБЛАСТИ ЖИЗНИ "
+            "ощущается её текущее влияние (12-й дом — скрыто, "
+            "внутренне; угловые дома 1/4/7/10 — заметно для окружающих "
+            "и по внешним обстоятельствам);\n"
+        )
+        aspect_rule = (
+            "— как КАЖДЫЙ аспект к натальной точке окрашивает влияние "
+            "транзитной планеты: гармоничные аспекты (трин, секстиль, "
+            "полусекстиль, квинтиль, биквинтиль) создают лёгкую, "
+            "поддерживающую активацию натальной точки; напряжённые "
+            "(квадрат, оппозиция, полуквадрат, полутораквадрат, квинконс) "
+            "— трение, давление, требующее сознательного усилия; "
+            "соединение зависит от природы обеих планет;\n"
+        )
+        movement_rule = (
+            "— направление движения ключевое для транзитов: "
+            "«сходящийся, усиливается» значит влияние ещё нарастает, "
+            "«расходящийся, ослабевает» — уже проходит и слабеет; "
+            "учитывай это при оценке актуальности каждого аспекта прямо "
+            "сейчас.\n"
+        )
+        closing = (
+            "Пиши только на русском языке, без английских слов и без "
+            "иероглифов. Не придумывай имя человеку, чья это карта, — "
+            "данные не содержат имени; называй его «этот человек» / "
+            "«он» / «она». Слова «натальный»/«транзитный» — термины, а "
+            "не чьи-то имена.\n\n"
+        )
+    else:
+        intro = (
+            "Ниже — натальные точки одного человека, для каждой: её знак, дом, "
+            "её собственные аспекты к другим точкам (со знаком/домом ДРУГОЙ "
+            "точки — чтобы можно было оценить, насколько сильна и уместна её "
+            "аспектирующая роль), соединения с неподвижными звёздами (если "
+            "есть), и найденные справочные материалы (если материалы не "
+            "найдены — рассуждай по общим принципам)."
+        )
+        house_rule = (
+            "— как дом видоизменяет проявление точки (например, 12-й дом "
+            "приглушает и скрывает, угловые дома 1/4/7/10 усиливают и делают "
+            "заметным для окружающих);\n"
+        )
+        aspect_rule = (
+            "— как КАЖДЫЙ аспект окрашивает точку: гармоничные аспекты (трин, "
+            "секстиль, полусекстиль, квинтиль, биквинтиль) усиливают только те "
+            "качества точки, что созвучны природе аспектирующей планеты — не "
+            "все её качества подряд; напряжённые аспекты (квадрат, оппозиция, "
+            "полуквадрат, полутораквадрат, квинконс) создают трение и "
+            "внутреннее противоречие между природой этой точки и "
+            "аспектирующей; соединение зависит от природы соединяющейся "
+            "планеты;\n"
+        )
+        movement_rule = ""
+        closing = (
+            "Пиши только на русском языке, без английских слов и без "
+            "иероглифов. Не придумывай имя человеку, чья это карта, — данные "
+            "не содержат имени; называй его «этот человек» / «он» / «она». "
+            "Слово «натальный» — термин («карта рождения»), а не чьё-то имя.\n\n"
+        )
+
     return (
-        "Ниже — натальные точки одного человека, для каждой: её знак, дом, "
-        "её собственные аспекты к другим точкам (со знаком/домом ДРУГОЙ "
-        "точки — чтобы можно было оценить, насколько сильна и уместна её "
-        "аспектирующая роль), соединения с неподвижными звёздами (если "
-        "есть), и найденные справочные материалы (если материалы не "
-        "найдены — рассуждай по общим принципам).\n\n"
+        f"{intro}\n\n"
         f"{facts_block}\n\n"
         "Для КАЖДОЙ точки по отдельности напиши одну синтезированную "
         "заметку (3-5 предложений) — не список фактов, а итоговую "
-        "характеристику ЭТОЙ конкретной точки в ЭТОЙ карте, обязательно "
-        "учитывая:\n"
-        "— как дом видоизменяет проявление точки (например, 12-й дом "
-        "приглушает и скрывает, угловые дома 1/4/7/10 усиливают и делают "
-        "заметным для окружающих);\n"
-        "— как КАЖДЫЙ аспект окрашивает точку: гармоничные аспекты (трин, "
-        "секстиль, полусекстиль, квинтиль, биквинтиль) усиливают только те "
-        "качества точки, что созвучны природе аспектирующей планеты — не "
-        "все её качества подряд; напряжённые аспекты (квадрат, оппозиция, "
-        "полуквадрат, полутораквадрат, квинконс) создают трение и "
-        "внутреннее противоречие между природой этой точки и "
-        "аспектирующей; соединение зависит от природы соединяющейся "
-        "планеты;\n"
+        "характеристику ЭТОЙ конкретной точки, обязательно учитывая:\n"
+        f"{house_rule}"
+        f"{aspect_rule}"
         "— масштаб влияния аспекта зависит от точности орбиса (чем меньше "
         "орбис, тем сильнее) и от собственной силы аспектирующей планеты "
         "(её дом/угловатость — та же логика, что и для самой точки);\n"
+        f"{movement_rule}"
         "— соединение с неподвижной звездой, если есть, — как её "
         "традиционное значение накладывается на природу точки.\n"
         "Используй найденные материалы там, где они есть, но не "
@@ -208,20 +284,20 @@ def _build_digest_prompt(profiles: List[Dict], fragments_by_fact: Dict[int, List
         "«Марсианский», «Юпитерианский» вместо названия аспекта: это "
         "неинформативно (непонятно, какой именно аспект) и часто "
         "грамматически неверно.\n\n"
-        "Пиши только на русском языке, без английских слов и без "
-        "иероглифов. Не придумывай имя человеку, чья это карта, — данные "
-        "не содержат имени; называй его «этот человек» / «он» / «она». "
-        "Слово «натальный» — термин («карта рождения»), а не чьё-то имя.\n\n"
+        f"{closing}"
         "Пронумеруй заметки так же, как точки выше (1, 2, 3, ...), без "
         "лишних вступлений."
     )
 
 
-async def digest_facts_async(profiles: List[Dict], max_tokens: Optional[int] = None) -> str:
+async def digest_facts_async(
+    profiles: List[Dict], max_tokens: Optional[int] = None, chart_kind: str = "natal"
+) -> str:
     """Runs the whole digest pass: per-profile targeted retrieval, then one
     LLM call producing a numbered set of short reinterpreted notes — one
-    per astro.get_planet_profiles() bundle (sign+house+its own aspects+any
-    star conjunction), not per isolated fact.
+    per profile bundle (astro.get_planet_profiles' natal bundles, or
+    astro.get_transit_profiles' transiting-planet bundles when
+    chart_kind="transit"), not per isolated fact.
     Returns "" (never raises) if there are no profiles or anything in here
     fails — callers should treat that as "no digest available, fall back
     to the plain computed-data + methodology prompt" rather than let a
@@ -246,7 +322,7 @@ async def digest_facts_async(profiles: List[Dict], max_tokens: Optional[int] = N
                 f"(aspects={len(profile.get('aspects', []))}, stars={len(profile.get('stars', []))}) "
                 f"-> {status}"
             )
-        prompt = _build_digest_prompt(profiles, fragments_by_fact)
+        prompt = _build_digest_prompt(profiles, fragments_by_fact, chart_kind=chart_kind)
         # Lower temperature than the final answer's 0.5 — this step is
         # meant to be literal and rule-applying, not creatively phrased;
         # the final synthesis call is where narrative latitude belongs.
@@ -372,4 +448,119 @@ def build_sectioned_answer_prompt(
         "«родившейся» = женский), а не выдуманным именем вроде «Наталья» "
         "или похожим. Слово «натальный» в данных — термин ( = «карта "
         "рождения»), а не чьё-то имя."
+    )
+
+
+# Section headers for the final transit-chart answer (build_transit_
+# answer_prompt below) — deliberately a DIFFERENT breakdown from
+# ASTRO_ANSWER_SECTIONS, not a reuse of it: a transit reading is about
+# what's currently activated and how long it lasts, not a static
+# personality portrait, so "Любовь и отношения"/"Работа, призвание и
+# статус"-style life-domain sections would either sit mostly empty (most
+# transits don't touch every life domain at once) or force material into
+# a section it doesn't really belong in. This breakdown instead follows
+# what a transit reading conventionally organizes around: the overall
+# theme, what's supportive, what's tense, and — the piece unique to
+# transits and not applicable to natal charts at all — timing (each
+# profiled aspect already carries "сходящийся, усиливается" / "расходящийся,
+# ослабевает" from astro.get_transit_profiles, which this section is
+# built to make use of).
+TRANSIT_ANSWER_SECTIONS = [
+    "Общая картина текущего периода",
+    "Возможности и поддерживающие тенденции",
+    "Вызовы и внутреннее напряжение",
+    "Сроки: что нарастает, что уже проходит",
+    "Итог",
+]
+
+
+def build_transit_answer_prompt(
+    query: str, computed_text: str, digested_notes: str, general_contexts: List[Dict[str, Any]]
+) -> str:
+    """Transit-chart counterpart to build_sectioned_answer_prompt — same
+    overall mechanism (fixed named markdown sections as a concrete forcing
+    function, consumed after digest_facts_async(..., chart_kind="transit")
+    already did the per-planet reasoning), but with TRANSIT_ANSWER_SECTIONS
+    instead of ASTRO_ANSWER_SECTIONS and instructions reframed around
+    transiting-vs-natal relationships rather than single-chart placements.
+
+    Reuses essentially the same hard-won guardrails build_sectioned_
+    answer_prompt already has (markdown headers, no CJK/English leakage, no
+    invented personal name, no per-section repeated stock references, no
+    invented aspect-naming adjectives) — those failure modes are properties
+    of the underlying small model's generation behavior, not specific to
+    natal charts, so there's no reason to expect a transit answer would be
+    immune to any of them."""
+    context_parts = [f"ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА:\n{computed_text}"]
+    if digested_notes:
+        context_parts.append(f"ОСМЫСЛЕННЫЕ ЗАМЕТКИ ПО ТРАНЗИТНЫМ ПЛАНЕТАМ:\n{digested_notes}")
+    if general_contexts:
+        general_text = "\n\n---\n\n".join(c["text"] for c in general_contexts)
+        context_parts.append(f"ОБЩАЯ МЕТОДОЛОГИЯ И СПРАВОЧНЫЕ МАТЕРИАЛЫ:\n{general_text}")
+    context_block = "\n\n===\n\n".join(context_parts)
+
+    sections_list = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(TRANSIT_ANSWER_SECTIONS))
+
+    return (
+        f"{context_block}\n\n"
+        f"Вопрос пользователя: {query}\n\n"
+        "Напиши развёрнутую астрологическую интерпретацию ТЕКУЩЕГО ПЕРИОДА "
+        "(транзитов) для этого человека, разбитую строго на следующие "
+        "разделы — используй эти названия дословно как markdown-заголовки "
+        "(## Название раздела), каждый раздел — несколько предложений "
+        "связного текста, а не одна фраза:\n\n"
+        f"{sections_list}\n\n"
+        "В каждом разделе опирайся на конкретные транзитные аспекты и "
+        "осмысленные заметки выше, относящиеся к этой теме — не "
+        "перечисляй их списком, а свяжи в связное описание, объясняя, "
+        "ПОЧЕМУ именно сейчас активирована та или иная тема (через "
+        "конкретный транзитный аспект и натальный дом/точку, которую он "
+        "затрагивает), а не общие свойства планеты-транзитёра самой по "
+        "себе. Не описывай натальный дом сам по себе в отрыве от того, "
+        "какая транзитная планета через него сейчас проходит. Не повторяй "
+        "одну и ту же транзитную планету в нескольких разделах без "
+        "необходимости — за исключением раздела «Сроки», где допустимо "
+        "вернуться к уже упомянутым аспектам именно ради их временной "
+        "динамики. Если одна и та же отсылка или формулировка напрашивается "
+        "для нескольких разных аспектов, используй её не больше "
+        "одного-двух раз на весь ответ, а не в каждом разделе подряд.\n\n"
+        "Важно для точности: каждый раз, когда упоминаешь транзитную или "
+        "натальную точку, используй ТОЛЬКО её знак и дом ровно так, как "
+        "указано в блоке ДАННЫЕ и ОСМЫСЛЕННЫЕ ЗАМЕТКИ выше (натальный дом "
+        "транзитной планеты — это дом натальной карты, через который она "
+        "сейчас проходит, а не отдельно вычисленный дом момента) — не "
+        "пересчитывай и не переформулируй их по памяти; если та же точка "
+        "упоминается в другом разделе, её знак и дом должны совпадать с "
+        "первым упоминанием слово в слово.\n\n"
+        "Раздел «Сроки: что нарастает, что уже проходит» — используй "
+        "именно то, что указано в данных для каждого аспекта "
+        "(«сходящийся, усиливается» значит влияние ещё растёт; "
+        "«расходящийся, ослабевает» — уже проходит), не придумывай сроки "
+        "от себя.\n\n"
+        "Если материала по какому-то разделу мало — так и напиши коротко, "
+        "не выдумывай недостающее. Не добавляй отдельный мини-«Итог» "
+        "внутри каждого раздела — итоговый вывод пишется только один раз, "
+        "в последнем разделе «Итог» из списка выше: 2-3 предложения общего "
+        "вывода.\n\n"
+        "Как называть аспект между планетами: используй готовую фразу из "
+        "осмысленных заметок дословно («квадрат Сатурна и Солнца», «трин "
+        "Юпитера и Нептуна») — никогда не изобретай прилагательные вроде "
+        "«Сатурнианский», «Юпитерианский» вместо названия аспекта, это "
+        "неинформативно и часто грамматически неверно.\n\n"
+        "Форматирование: заголовки разделов — markdown (## Заголовок), "
+        "при необходимости можно **выделять жирным** ключевые термины; "
+        "юникод-значки планет/знаков/аспектов (☉ ♋ ☌ △ и т.п.) уже "
+        "используются в данных выше — можешь использовать их и в своём "
+        "тексте рядом с названием для краткости, но не обязательно "
+        "везде. Пиши только на русском языке: никаких иероглифов, "
+        "английских слов или заголовков-переводов (не дублируй русский "
+        "заголовок раздела его английским эквивалентом) и никаких других "
+        "языков вообще — если почувствуешь, что вот-вот повторишь то же "
+        "слово ещё раз или собираешься переключиться на другой язык, "
+        "перефразируй по-русски вместо этого.\n\n"
+        "Не придумывай имя человеку: birth-данные не содержат имени, если "
+        "оно не было явно названо в вопросе пользователя — называй "
+        "человека «этот человек» / «он» / «она» (грамматический род бери "
+        "из формулировки вопроса), а не выдуманным именем. Слова "
+        "«натальный»/«транзитный» в данных — термины, а не чьё-то имя."
     )
