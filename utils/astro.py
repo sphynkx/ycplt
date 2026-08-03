@@ -88,7 +88,7 @@ larger population. Good enough for the common case, not a substitute for
 a real geocoding service.
 """
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Chart text (below) is rendered directly in Russian, not left for the
@@ -1888,6 +1888,204 @@ def get_transit_profiles(spec: str, top_n: int = 12) -> List[Dict]:
         return []
 
 
+# --- secondary progressions ------------------------------------------------
+#
+# "Day for a year": the standard secondary-progression convention treats
+# each day AFTER birth as symbolically standing for one YEAR of life, so a
+# 50-year-old's progressed chart for today is cast for a moment only ~50
+# DAYS after their actual birth — not for today's real calendar date at
+# all. This is why _format_progression_text below explicitly states both
+# the real target date/age and the internal symbolic progressed date: the
+# raw numbers otherwise look like an obvious bug (a chart "for 2026"
+# showing planetary positions from a date in 1976) if not labeled clearly.
+#
+# Structurally this reuses the exact same natal-vs-"other moment" overlay
+# machinery run_transit/get_transit_profiles already established
+# (get_dual_chart_profiles, _house_of_degree against the NATAL cusps) —
+# a progressed chart is read the same way a transit is (which of the
+# natal houses is now activated), just for a differently-computed moment.
+# The one thing that's genuinely different is the moment's own timescale:
+# transit's moment is real, exact "now"; progression's is symbolic and
+# computed from age, never an independently-meaningful calendar date on
+# its own.
+
+
+def _secondary_progressed_datetime(birth_dt: datetime, target_dt: datetime) -> datetime:
+    """The core "day for a year" formula: elapsed real time since birth,
+    expressed in years (using the standard 365.25-day tropical-year
+    approximation), becomes the same number of DAYS added to the birth
+    moment. Fractional days are kept (not rounded) for precision — over a
+    50-year span a whole-day rounding error would shift the progressed
+    Moon (the fastest-moving progressed point, ~1° per progressed day) by
+    a measurable fraction of a degree."""
+    elapsed_days = (target_dt - birth_dt).total_seconds() / 86400.0
+    age_years = elapsed_days / 365.25
+    return birth_dt + timedelta(days=age_years)
+
+
+def _build_progression_subjects(
+    fields: Dict[str, str], name: str
+) -> Tuple[Optional[Any], Optional[Any], Optional[datetime], Optional[float], Optional[str]]:
+    """Shared by run_progression and get_progression_profiles — mirrors
+    _build_transit_subjects' role and shape exactly, just computing the
+    progressed moment via _secondary_progressed_datetime instead of using
+    a real target moment directly. Returns (natal, progressed_subject,
+    target_dt, age_years, None) on success, or (None, None, None, None,
+    error_message) on failure — same never-raise convention as the rest of
+    this module.
+
+    Reuses the "moment" field convention run_transit already established
+    (a key=value ISO moment, or "now"/omitted) — it means the same thing
+    here: the real date/time to compute progressions FOR, not the
+    internal symbolic progressed date itself (which this function derives,
+    not accepts as input). Progressions keep the birth location/timezone
+    — no moment_lat/moment_lon/moment_tz override here, unlike transit,
+    since a progressed chart isn't conventionally relocated the way a
+    transit reading sometimes is; relocated progressions are a real, more
+    specialized technique that can be added later if wanted."""
+    try:
+        natal = _build_subject(fields, name=name)
+    except Exception as e:
+        return None, None, None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
+
+    moment = (fields.get("moment") or "now").strip()
+    try:
+        if moment.lower() in ("", "now", "сейчас"):
+            target_dt = datetime.now()
+        else:
+            target_dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
+    except Exception as e:
+        return None, None, None, None, (
+            f"Не удалось разобрать момент времени '{moment}' ({e}); "
+            "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
+        )
+
+    try:
+        date_str = fields["date"]
+        time_str = fields.get("time", "12:00")
+        year, month, day = (int(x) for x in date_str.split("-"))
+        hour, minute = (int(x) for x in time_str.split(":"))
+        birth_dt = datetime(year, month, day, hour, minute)
+    except Exception as e:
+        return None, None, None, None, f"Не удалось разобрать дату рождения ({e})."
+
+    age_years = (target_dt - birth_dt).total_seconds() / 86400.0 / 365.25
+    progressed_dt = _secondary_progressed_datetime(birth_dt, target_dt)
+
+    try:
+        from kerykeion.astrological_subject_factory import AstrologicalSubjectFactory
+
+        progressed_subject = AstrologicalSubjectFactory.from_birth_data(
+            name="Progressed",
+            year=progressed_dt.year, month=progressed_dt.month, day=progressed_dt.day,
+            hour=progressed_dt.hour, minute=progressed_dt.minute,
+            lat=float(fields["lat"]), lng=float(fields["lon"]), tz_str=fields["tz"],
+            online=False,
+            # Same active-point set as transit (see _ACTIVE_POINTS_TRANSIT's
+            # own comment: no fixed stars, no Vertex) — a reasonable first
+            # scope, not a principled exclusion specific to progressions;
+            # revisit if a progressed Vertex/fixed-star reading is wanted
+            # later.
+            active_points=_ACTIVE_POINTS_TRANSIT,
+        )
+    except Exception as e:
+        return None, None, None, None, f"Не удалось рассчитать прогрессивные положения планет: {e}"
+
+    return natal, progressed_subject, target_dt, age_years, None
+
+
+def _format_progression_text(natal, progressed, target_dt: datetime, age_years: float) -> str:
+    from kerykeion import AspectsFactory
+
+    natal_cusps = _house_cusp_degrees(natal)
+
+    lines = [
+        f"Вторичные прогрессии (secondary progressions) для {natal.name} на "
+        f"{target_dt.year:04d}-{target_dt.month:02d}-{target_dt.day:02d} "
+        f"(возраст {age_years:.1f} лет) — по принципу «день за год» это "
+        f"символически представлено датой "
+        f"{progressed.year:04d}-{progressed.month:02d}-{progressed.day:02d} "
+        f"{progressed.hour:02d}:{progressed.minute:02d} — НЕ реальная дата "
+        f"события, а техническая точка расчёта; описывай эти планеты как "
+        f"текущее прогрессивное состояние человека, а не как что-то, "
+        f"происходящее в этот прогрессивный день буквально.",
+        "Прогрессивные положения планет (дом — натальный, т.е. дом "
+        "натальной карты, в котором сейчас находится прогрессивная планета):",
+    ]
+    for label, attr in _PLANET_ATTRS:
+        point = getattr(progressed, attr, None)
+        if point is not None:
+            natal_house = _house_of_degree(natal_cusps, point.abs_pos)
+            lines.append("  " + _format_point_line(label, point, house_num_override=natal_house))
+
+    aspects = AspectsFactory.dual_chart_aspects(
+        natal, progressed, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
+    ).aspects
+    lines.append("Прогрессивные аспекты к натальной карте:")
+    shown = 0
+    for a in aspects:
+        progressing, to_natal = (
+            (a.p1_name, a.p2_name) if a.p1_owner == progressed.name else (a.p2_name, a.p1_name)
+        )
+        if progressing in ("Ascendant", "Medium_Coeli"):
+            continue
+        lines.append(
+            f"  прогрессивный {_point_ru(progressing)} — {_aspect_ru(a.aspect)} — "
+            f"натальный {_point_ru(to_natal)} "
+            f"(орбис {a.orbit:.1f}°, {_movement_ru(a.aspect_movement)})"
+        )
+        shown += 1
+    if not shown:
+        lines.append("  (нет аспектов в пределах орбиса)")
+    return "\n".join(lines)
+
+
+def run_progression(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_progression_chart"])."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields)
+    natal, progressed, target_dt, age_years, error = _build_progression_subjects(
+        fields, name=fields.get("name") or "Subject"
+    )
+    if error:
+        return error
+    try:
+        return _format_progression_text(natal, progressed, target_dt, age_years)
+    except Exception as e:
+        return f"Ошибка при расчёте прогрессий: {e}"
+
+
+def get_progression_profiles(spec: str, top_n: int = 12) -> List[Dict]:
+    """Progression counterpart to get_transit_profiles, for routes/chat.py's
+    digest step — same duplication-of-computation pattern relative to
+    run_progression the other get_*_profiles functions already have
+    relative to their own run_*() counterparts.
+
+    Returns [] (not an error) if fields are missing or subject-building
+    fails — same "no profiles available, caller falls back" contract
+    every other get_*_profiles function already has."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return []
+    natal, progressed, _target_dt, _age_years, error = _build_progression_subjects(
+        fields, name=fields.get("name") or "Subject"
+    )
+    if error:
+        return []
+    try:
+        return get_dual_chart_profiles(
+            natal, progressed, top_n=top_n,
+            other_point_label=lambda lr: f"прогрессивный {lr}",
+            reference_house_label=lambda h: f"натальный {h} дом",
+            query_prefix="прогрессивный",
+            query_aspect_prefix="прогрессия",
+            kind="progression_planet",
+        )
+    except Exception:
+        return []
+
+
 def _format_synastry_text(person_a, person_b) -> str:
     """Raw chart text for synastry: each person's OWN placements (sign,
     house, retrograde — from their own chart, exactly like a natal
@@ -2068,4 +2266,5 @@ ASTRO_OPERATIONS: Dict[str, Callable[[str], str]] = {
     "natal": run_natal,
     "transit": run_transit,
     "synastry": run_synastry,
+    "progression": run_progression,
 }

@@ -301,7 +301,9 @@ async def _handle_chat_request(conversation_id: int, req: ChatRequest, sent_at: 
 # that utils/astro.py's own regex extraction parses (as opposed to e.g.
 # calculate's argument, a math expression that must stay exactly what it
 # is) — see the tool_arg handling below for why that matters.
-_INTERPRETED_TOOL_NAMES = {"astro_natal_chart", "astro_transit_chart", "astro_synastry_chart"}
+_INTERPRETED_TOOL_NAMES = {
+    "astro_natal_chart", "astro_transit_chart", "astro_synastry_chart", "astro_progression_chart",
+}
 
 
 async def _handle_tool_request(
@@ -402,10 +404,10 @@ async def _handle_tool_request(
             "text": (
                 "ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА (уже вычислены и предоставлены — "
                 "это не пример и не общий случай, а точная натальная/"
-                "транзитная/синастрическая карта конкретного человека (или "
-                "двух людей) из вопроса пользователя; не пересчитывать, не "
-                "менять и не утверждать, что этих данных не хватает или что "
-                "они не были даны):\n"
+                "транзитная/прогрессивная/синастрическая карта конкретного "
+                "человека (или двух людей) из вопроса пользователя; не "
+                "пересчитывать, не менять и не утверждать, что этих данных "
+                "не хватает или что они не были даны):\n"
                 f"{tool_result}"
             ),
             "topic": "astrology",
@@ -444,6 +446,9 @@ async def _handle_tool_request(
         elif decision.tool_name == "astro_transit_chart":
             profiles = astro.get_transit_profiles(tool_arg)
             digested = await interpret.digest_facts_async(profiles, chart_kind="transit")
+        elif decision.tool_name == "astro_progression_chart":
+            profiles = astro.get_progression_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(profiles, chart_kind="progression")
         elif decision.tool_name == "astro_synastry_chart":
             # Both people's profiles are digested together in one combined
             # list — each profile's own "text" already names which person
@@ -480,6 +485,14 @@ async def _handle_tool_request(
             # answers up to the same quality bar natal charts already
             # have, instead of the generic reasoning-mode fallback below.
             followup_prompt = interpret.build_transit_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts
+            )
+        elif digested and decision.tool_name == "astro_progression_chart":
+            # Same mechanism again, progression-specific section list/
+            # framing (see interpret.build_progression_answer_prompt) —
+            # reframed around a slow, decades-long unfolding instead of
+            # transit's short current-period timescale.
+            followup_prompt = interpret.build_progression_answer_prompt(
                 req.query, str(tool_result), digested, rag_contexts
             )
         elif digested and decision.tool_name == "astro_synastry_chart":

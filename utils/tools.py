@@ -146,4 +146,20 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         ),
         "run": astro.run_synastry,
     },
+    "astro_progression_chart": {
+        "description": (
+            "Computes SECONDARY PROGRESSIONS ('day for a year') for "
+            "someone's chart — how their planets have symbolically evolved "
+            "over their life so far, for questions about long-term "
+            "personal development, life stages/chapters, or 'where they "
+            "are now' in a slower, deeper sense than current transits "
+            "(use astro_transit_chart instead for short-term current "
+            "events/mood). Requires the same birth data as "
+            "astro_natal_chart, in the same free-text form (never invent "
+            "it — skip this tool if it isn't in the conversation). Only "
+            "add ';moment=YYYY-MM-DDTHH:MM' if a specific non-current "
+            "target date/age was asked about (default: right now)."
+        ),
+        "run": astro.run_progression,
+    },
 }

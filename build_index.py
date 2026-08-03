@@ -3,7 +3,8 @@ Builds the FAISS index for RAG.
 
 What it does:
   1. Reads documents from RAG_DATA_DIR (default rag_data/), recursively —
-     *.txt, *.html/*.htm, *.pdf, *.doc, and *.zip/*.rar/*.arj/*.7z archives
+     *.txt, *.html/*.htm, *.pdf (OCR'd automatically for pages with no text
+     layer), *.doc, *.djvu/*.djv, and *.zip/*.rar/*.arj/*.7z/*.chm archives
      (whose contents are extracted and read the same way, recursively,
      including archives nested inside archives), directly inside it or in
      any subfolder.
@@ -60,12 +61,34 @@ Supported source formats and their dependencies:
   .html/.htm — same encoding handling as .txt, then tags/scripts/styles are
            stripped (requires beautifulsoup4).
   .rtf   — text-based format, no system tool needed (requires striprtf).
-  .pdf   — requires pypdf.
+  .pdf   — requires pypdf for the text layer. Checked PAGE BY PAGE: any
+           page pypdf extracts little/nothing from (a scanned page with no
+           real text layer, common in old scanned books mixed with a
+           text-layer title page) is rendered to an image via `pdftoppm`
+           (poppler-utils) and OCR'd via `tesseract` instead — the same
+           OCR pipeline as the .djvu fallback below, just page-by-page
+           rather than whole-document. Only the actually-thin pages are
+           OCR'd, so a mostly-text PDF with one scanned insert page doesn't
+           pay the OCR cost for pages that didn't need it.
   .doc   — legacy binary MS Word (97-2003, NOT .docx — python-docx doesn't
            read this format). Prefers the antiword CLI tool if installed
            for a clean extraction; falls back to a crude best-effort byte
            scrape otherwise, which is rougher but still searchable rather
            than skipping the file outright.
+  .djvu/.djv — scanned documents (common for old/rare books and journal
+           scans). Two very different cases, handled automatically:
+           (a) the file already has an embedded OCR text layer (common for
+           scans someone else already OCR'd before distributing) — read
+           directly and fast via the `djvutxt` CLI tool; (b) no text layer
+           at all (a "raw" photographic scan) — each page is rendered to an
+           image via `ddjvu` and OCR'd on the fly via `tesseract`, which is
+           much slower (one subprocess pair per page) but still fully
+           automatic. Requires djvulibre (`djvutxt`, `ddjvu`, `djvused`) for
+           either case, plus `tesseract` with a Russian language pack
+           (`tesseract-ocr-rus` / `tesseract-langpack-rus`) for case (b) —
+           see README.md for exact package names per distro. Missing tools
+           are treated like everywhere else here: the file is skipped with
+           an explanatory warning, the rest of the build continues.
   .zip   — read directly (Python's stdlib zipfile, no extra dependency).
   .rar/.arj/.7z — requires the patool package plus a matching system tool
            it shells out to. See README.md for exact package names on
@@ -79,6 +102,15 @@ Supported source formats and their dependencies:
            README.md's "Installation" section. Works once a "ha" binary
            built from that (or any other) source is on PATH; otherwise
            skipped with an explanatory warning.
+  .chm   — Compiled HTML Help (WinHelp's successor) — really just a
+           compressed container of HTML "chapter" pages plus a sidebar
+           table-of-contents/index in a proprietary, non-HTML format
+           (.hhc/.hhk — not readable text, silently skipped like any other
+           unrecognized file found inside a container). Requires the
+           `extract_chmLib` CLI tool (package `chmlib` on Fedora,
+           `libchm-bin` on Debian/Ubuntu) to unpack it; once unpacked, its
+           .html/.htm chapters are read exactly like any other HTML file
+           above — no CHM-specific text extraction of its own.
   Archives are extracted to a temporary directory, walked recursively
   (nested archives are extracted too, up to a small depth limit to guard
   against runaway/zip-bomb-style nesting), and every recognized file found
@@ -100,6 +132,7 @@ startup. Re-run this script any time source documents change, or after
 changing EMBED_MODEL (embeddings from a different model aren't compatible
 with an existing index even if the vector dimension happens to match).
 """
+import glob
 import os
 import pickle
 import re
@@ -120,7 +153,31 @@ MAX_CHUNK_CHARS = 800
 
 _METHODOLOGY_SUFFIX = "_methodology"
 
-_TEXT_LIKE_EXTENSIONS = (".txt", ".html", ".htm", ".pdf", ".doc", ".rtf")
+_TEXT_LIKE_EXTENSIONS = (".txt", ".html", ".htm", ".pdf", ".doc", ".rtf", ".djvu", ".djv")
+
+# A djvu with no embedded OCR text layer still makes `djvutxt` exit 0 with
+# empty or near-empty output (just page-break control chars) — not an
+# error, just nothing usable to extract this way. Below this many
+# characters for the WHOLE document, treat it as "no text layer" and fall
+# back to page-by-page OCR rather than silently indexing an almost-empty
+# document.
+_DJVU_MIN_TEXT_LAYER_CHARS = 40
+
+# Language pack(s) passed to tesseract for every OCR fallback in this file
+# (djvu pages with no text layer, scanned PDF pages) — Russian plus English
+# covers this project's own corpus; add more codes (e.g. "+ukr") if your
+# own rag_data/ documents need them, as long as the matching tesseract
+# language pack is installed (see README.md).
+_OCR_LANGUAGES = "rus+eng"
+
+# Below this many extracted characters for a single PDF page, treat pypdf's
+# text-layer extraction as having found effectively nothing on that page
+# (a scanned page with no real text layer) and OCR it instead. Checked
+# per-page rather than per-document, since it's common for a scanned PDF to
+# mix a handful of real text-layer pages (e.g. a title page exported from a
+# word processor) with the rest as raw photographic scans.
+_PDF_MIN_PAGE_TEXT_CHARS = 20
+
 # .ha is the old "HA" DOS-era archiver (Harri Hirvola, ~1995) — genuinely
 # dead, not packaged by any current Linux distro and not recognized by
 # patool at all (unlike .rar/.arj/.7z, where patool at least knows the
@@ -128,8 +185,11 @@ _TEXT_LIKE_EXTENSIONS = (".txt", ".html", ".htm", ".pdf", ".doc", ".rtf")
 # _extract_archive() below: if a "ha" binary happens to be on PATH — e.g.
 # built from github.com/val-khokhlov/ha per README.md's "Installation"
 # section — it's used; otherwise the file is skipped with an explanatory
-# warning.
-_ARCHIVE_EXTENSIONS = (".zip", ".rar", ".arj", ".7z", ".ha")
+# warning. .chm (Compiled HTML Help) is handled as a special case there
+# too — it's not a general-purpose archive format patool understands, but
+# `extract_chmLib` unpacks it into a directory of HTML chapters just the
+# same way _read_archive_members() below expects.
+_ARCHIVE_EXTENSIONS = (".zip", ".rar", ".arj", ".7z", ".ha", ".chm")
 _ALL_EXTENSIONS = _TEXT_LIKE_EXTENSIONS + _ARCHIVE_EXTENSIONS
 
 # Guards against archive-in-archive-in-archive recursion (accidental or a
@@ -209,12 +269,98 @@ def _read_txt(path: str) -> str:
 
 
 def _read_pdf(path: str) -> str:
+    """Extracts each page's text layer via pypdf; any page that comes back
+    with (near-)nothing — a scanned page with no real text layer, common in
+    old scanned books that mix a handful of text-layer pages with the rest
+    as raw photographic scans — is OCR'd instead via _ocr_pdf_pages(), the
+    same tesseract-based pipeline used for .djvu scans, just rendered with
+    pdftoppm instead of ddjvu. A fully "born-digital" PDF never touches the
+    OCR path at all: this only kicks in for pages that actually need it."""
     try:
         from pypdf import PdfReader
     except ImportError:
         raise RuntimeError("Reading PDF requires the pypdf package: pip install pypdf")
     reader = PdfReader(path)
-    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    texts: List[str] = []
+    thin_pages: List[int] = []
+    for i, page in enumerate(reader.pages):
+        page_text = page.extract_text() or ""
+        if len(page_text.strip()) < _PDF_MIN_PAGE_TEXT_CHARS:
+            thin_pages.append(i)
+        texts.append(page_text)
+
+    if thin_pages:
+        print(
+            f"{path} — {len(thin_pages)} of {len(texts)} page(s) have no usable text layer, "
+            "OCR'ing them instead (slower)"
+        )
+        for i, ocr_text in _ocr_pdf_pages(path, thin_pages).items():
+            texts[i] = ocr_text
+
+    return "\n\n".join(texts)
+
+
+def _ocr_pdf_pages(path: str, page_indices: List[int]) -> Dict[int, str]:
+    """OCR fallback for PDF pages pypdf couldn't extract text from: renders
+    each such page to an image via `pdftoppm` (poppler-utils), then runs
+    `tesseract` on it — the same two-tool pipeline as the .djvu OCR
+    fallback above, just with a different renderer for the page image.
+    page_indices are 0-based (matching enumerate(reader.pages) above);
+    pdftoppm's own -f/-l page numbering is 1-based. A missing system tool
+    is a skip (with whatever pages were already OCR'd before it went
+    missing still returned), same pattern as the rest of this file."""
+    results: Dict[int, str] = {}
+    with tempfile.TemporaryDirectory(prefix="ycplt_pdf_ocr_") as tmp:
+        for i in page_indices:
+            page_num = i + 1
+            prefix = os.path.join(tmp, f"page_{page_num}")
+            try:
+                subprocess.run(
+                    ["pdftoppm", "-f", str(page_num), "-l", str(page_num), "-r", "300", "-gray", "-png", path, prefix],
+                    capture_output=True, timeout=120, check=True,
+                )
+            except FileNotFoundError:
+                print(
+                    f"Warning: skipping OCR for {path} — pdftoppm is not installed (or not on "
+                    "PATH); reading scanned PDF pages requires poppler-utils — see README.md's "
+                    "\"Installation\" section."
+                )
+                return results
+            except Exception as e:
+                print(f"Warning: pdftoppm failed on {path} page {page_num}: {e}")
+                continue
+
+            rendered = sorted(glob.glob(f"{prefix}*.png"))
+            if not rendered:
+                print(f"Warning: pdftoppm produced no image for {path} page {page_num}")
+                continue
+
+            try:
+                ocr_result = subprocess.run(
+                    ["tesseract", rendered[0], "stdout", "-l", _OCR_LANGUAGES],
+                    capture_output=True, timeout=120,
+                )
+            except FileNotFoundError:
+                print(
+                    f"Warning: skipping OCR for {path} — tesseract is not installed (or not on "
+                    "PATH); install tesseract-ocr plus its Russian language pack — see "
+                    "README.md's \"Installation\" section."
+                )
+                return results
+            except Exception as e:
+                print(f"Warning: tesseract failed on {path} page {page_num}: {e}")
+                continue
+
+            if ocr_result.returncode == 0:
+                results[i] = ocr_result.stdout.decode("utf-8", errors="replace")
+            else:
+                stderr_text = (ocr_result.stderr or b"").decode("utf-8", errors="replace").strip()
+                print(
+                    f"Warning: tesseract produced no text for {path} page {page_num}"
+                    + (f": {stderr_text}" if stderr_text else "")
+                )
+
+    return results
 
 
 def _read_html(path: str) -> str:
@@ -299,6 +445,97 @@ def _read_rtf(path: str) -> str:
     return rtf_to_text(raw_text)
 
 
+def _read_djvu(path: str) -> str:
+    """Reads a .djvu/.djv scanned document. Tries the fast path first — an
+    embedded OCR text layer, extracted directly via the `djvutxt` CLI tool
+    (djvulibre) — and only falls back to the slow path (rendering each page
+    to an image via `ddjvu` and OCR'ing it with `tesseract`) if that comes
+    back empty, i.e. this particular scan has no text layer at all. Missing
+    `djvutxt` itself is a hard skip (no cruder fallback makes sense for a
+    binary image container the way it does for legacy .doc) rather than
+    aborting the whole index build."""
+    try:
+        result = subprocess.run(["djvutxt", path], capture_output=True, timeout=60)
+    except FileNotFoundError:
+        print(
+            f"Warning: skipping {path} — djvutxt is not installed (or not on PATH). "
+            "Reading .djvu/.djv files requires djvulibre (djvutxt/ddjvu/djvused) — "
+            "see README.md's \"Installation\" section for the package name on your distro."
+        )
+        return ""
+    except Exception as e:
+        print(f"Warning: djvutxt failed to run on {path}: {e}")
+        return ""
+
+    text = result.stdout.decode("utf-8", errors="replace") if result.returncode == 0 else ""
+    if len(text.strip()) >= _DJVU_MIN_TEXT_LAYER_CHARS:
+        return text
+
+    print(f"{path} — no usable embedded text layer, OCR'ing each page instead (slower)")
+    return _ocr_djvu(path)
+
+
+def _ocr_djvu(path: str) -> str:
+    """OCR fallback for a .djvu with no embedded text layer: renders each
+    page to a TIFF via `ddjvu`, then runs `tesseract` on it. Both are
+    external system tools (djvulibre and tesseract-ocr respectively, plus a
+    tesseract language pack — see README.md); a missing tool is a skip with
+    an explanatory warning, same pattern as the rest of this file, rather
+    than a crash."""
+    try:
+        page_count_result = subprocess.run(["djvused", "-e", "n", path], capture_output=True, timeout=30)
+        page_count = int(page_count_result.stdout.decode("utf-8", errors="replace").strip())
+    except FileNotFoundError:
+        print(f"Warning: skipping {path} — djvused (part of djvulibre) is not installed (or not on PATH)")
+        return ""
+    except Exception as e:
+        print(f"Warning: could not determine page count for {path}: {e}")
+        return ""
+
+    pages_text: List[str] = []
+    with tempfile.TemporaryDirectory(prefix="ycplt_djvu_ocr_") as tmp:
+        for page in range(1, page_count + 1):
+            image_path = os.path.join(tmp, f"page_{page}.tiff")
+            try:
+                subprocess.run(
+                    ["ddjvu", "-format=tiff", f"-page={page}", path, image_path],
+                    capture_output=True, timeout=120, check=True,
+                )
+            except FileNotFoundError:
+                print(f"Warning: skipping {path} — ddjvu (part of djvulibre) is not installed (or not on PATH)")
+                return "\n\n".join(pages_text)
+            except Exception as e:
+                print(f"Warning: ddjvu failed on {path} page {page}: {e}")
+                continue
+
+            try:
+                ocr_result = subprocess.run(
+                    ["tesseract", image_path, "stdout", "-l", _OCR_LANGUAGES],
+                    capture_output=True, timeout=120,
+                )
+            except FileNotFoundError:
+                print(
+                    f"Warning: skipping OCR for {path} — tesseract is not installed (or not on "
+                    "PATH); install tesseract-ocr plus its Russian language pack — see "
+                    "README.md's \"Installation\" section."
+                )
+                return "\n\n".join(pages_text)
+            except Exception as e:
+                print(f"Warning: tesseract failed on {path} page {page}: {e}")
+                continue
+
+            if ocr_result.returncode == 0:
+                pages_text.append(ocr_result.stdout.decode("utf-8", errors="replace"))
+            else:
+                stderr_text = (ocr_result.stderr or b"").decode("utf-8", errors="replace").strip()
+                print(
+                    f"Warning: tesseract produced no text for {path} page {page}"
+                    + (f": {stderr_text}" if stderr_text else "")
+                )
+
+    return "\n\n".join(pages_text)
+
+
 def _read_any(path: str) -> str:
     """Dispatches to the right reader based on extension — the single
     entry point used both for files found directly under rag_data/ and
@@ -312,6 +549,8 @@ def _read_any(path: str) -> str:
         return _read_doc(path)
     if lower.endswith(".rtf"):
         return _read_rtf(path)
+    if lower.endswith((".djvu", ".djv")):
+        return _read_djvu(path)
     return _read_txt(path)
 
 
@@ -354,6 +593,33 @@ def _extract_archive(path: str, dest_dir: str) -> bool:
             return False
         except Exception as e:
             print(f"Warning: `ha` failed to extract {path}: {e}")
+            return False
+
+    if lower.endswith(".chm"):
+        # CHM (Compiled HTML Help) isn't a general-purpose archive format
+        # patool understands — it's unpacked with chmlib's own
+        # `extract_chmLib` tool instead, into a plain directory of HTML
+        # "chapter" pages (plus a proprietary, non-HTML sidebar
+        # table-of-contents/index that _read_archive_members() below will
+        # just skip, same as any other unrecognized file type inside a
+        # container). Package name differs by distro — chmlib on Fedora,
+        # libchm-bin on Debian/Ubuntu — see README.md's "Installation"
+        # section.
+        try:
+            subprocess.run(
+                ["extract_chmLib", os.path.abspath(path), dest_dir],
+                capture_output=True, timeout=60, check=True,
+            )
+            return True
+        except FileNotFoundError:
+            print(
+                f"Warning: skipping {path} — extract_chmLib is not installed (or not on "
+                "PATH); reading .chm files requires chmlib's extract_chmLib tool — see "
+                "README.md's \"Installation\" section for the package name on your distro."
+            )
+            return False
+        except Exception as e:
+            print(f"Warning: extract_chmLib failed to extract {path}: {e}")
             return False
 
     try:

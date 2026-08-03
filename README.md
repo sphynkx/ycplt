@@ -42,7 +42,7 @@ install/
   .env.example                 — template for .env (copy and adjust)
   ycplt.service                — systemd unit file
 models/model.gguf          — the model file (you provide it, see below)
-rag_data/                  — RAG source documents (.txt/.html/.rtf/.pdf/.doc/.zip/.rar/.arj/.7z/.ha) — you provide them
+rag_data/                  — RAG source documents (.txt/.html/.rtf/.pdf/.doc/.djvu/.chm/.zip/.rar/.arj/.7z/.ha) — you provide them
 data/                      — generated data:
   faiss_index.bin, meta.pkl  — RAG index (build_index.py)
   chat.sqlite3                — conversations/messages/files (created at startup)
@@ -66,12 +66,16 @@ GeForce 940M (2 GB) — no usable GPU acceleration for LLM inference. Hence:
 
 Verified end-to-end on a fresh Fedora install. System packages up front cover
 everything RAG source ingestion needs (`antiword`/`.doc`, `p7zip`+
-`p7zip-plugins`/`unrar-free` for archives, `gcc`/`cmake`/`python-devel` to
-build the `ha` archiver from source — see "RAG — search over your own
-documents" below for what each package is for):
+`p7zip-plugins`/`unrar-free` for archives, `djvulibre`/`.djvu` scans,
+`poppler-utils`/rendering scanned PDF pages, `tesseract`+its Russian
+language pack for OCR'ing anything with no embedded text layer (djvu or
+PDF), `chmlib`/`.chm` help files, `gcc`/`cmake`/`python-devel` to build the
+`ha` archiver from source — see "RAG — search over your own documents"
+below for what each package is for):
 
 ```bash
-dnf install gcc cmake python-devel antiword p7zip p7zip-plugins unrar-free
+dnf install gcc cmake python-devel antiword p7zip p7zip-plugins unrar-free \
+  djvulibre poppler-utils tesseract tesseract-langpack-rus chmlib
 cd /tmp
 git clone https://github.com/val-khokhlov/ha
 cd ha
@@ -88,10 +92,21 @@ pip install -r install/requirements.txt
 
 On Debian/Ubuntu, substitute the first line with:
 ```bash
-apt install gcc cmake python3-dev antiword p7zip-full unrar
+apt install gcc cmake python3-dev antiword p7zip-full unrar \
+  djvulibre-bin poppler-utils tesseract-ocr tesseract-ocr-rus libchm-bin
 ```
 (building `ha` from source is the same either way — it isn't packaged for
 either distro).
+
+Already have the project installed and just need `.djvu`/scanned-PDF-OCR/`.chm`
+support added after the fact? Only the new system packages are needed — no
+venv/pip changes:
+```bash
+# Fedora
+dnf install djvulibre poppler-utils tesseract tesseract-langpack-rus chmlib
+# Debian/Ubuntu
+apt install djvulibre-bin poppler-utils tesseract-ocr tesseract-ocr-rus libchm-bin
+```
 
 `val-khokhlov/ha` is a modern buildable reimplementation of the old
 early-1990s DOS `HA` archiver — the format itself is dead and unpackaged
@@ -440,16 +455,23 @@ Built-in tools:
   do arithmetic on numbers, never call functions, import anything, or
   access names, so a malformed or adversarial expression just returns an
   error string instead of executing.
-- **`astro_natal_chart`** / **`astro_transit_chart`** / **`astro_synastry_chart`**
+- **`astro_natal_chart`** / **`astro_transit_chart`** / **`astro_progression_chart`** /
+  **`astro_synastry_chart`**
   — computes an astrological chart (planet signs/houses, aspects) via
   [kerykeion](https://github.com/g-battaglia/kerykeion) (`utils/astro.py`),
   fully offline (Swiss Ephemeris, no API key). `astro_natal_chart` computes
   a birth chart; `astro_transit_chart` computes current (or a given
   moment's) planetary positions and their aspects to a natal chart — for
-  "what's happening right now" style questions; `astro_synastry_chart`
+  "what's happening right now" style questions; `astro_progression_chart`
+  computes secondary progressions ("day for a year") — a slow, symbolic,
+  decades-long unfolding read the same way a transit is (natal-house
+  overlay via `_house_of_degree`), just for a computed "progressed" moment
+  instead of the real current one (`_secondary_progressed_datetime`) — for
+  "what stage of life/development" style questions, as opposed to
+  transit's short-term "what's happening now"; `astro_synastry_chart`
   compares TWO people's natal charts — for compatibility/relationship
   questions (see its own paragraph further down for the two-person-specific
-  parts). All three require birth date, time, and place (as coordinates) to
+  parts). All four require birth date, time, and place (as coordinates) to
   already be present in the conversation — the tool descriptions explicitly
   tell the router never to invent placeholder birth data, so if it's
   missing the model just asks the user for it in the follow-up answer
@@ -684,19 +706,21 @@ Built-in tools:
   Chinese characters mid-sentence — see `config.REPEAT_PENALTY` below for
   the generation-side mitigation for the same issue). This section list is
   a proposed breakdown, not a fixed schema — `interpret.ASTRO_ANSWER_SECTIONS`
-  (transit's `interpret.TRANSIT_ANSWER_SECTIONS`, and synastry's
+  (transit's `interpret.TRANSIT_ANSWER_SECTIONS`, progression's
+  `interpret.PROGRESSION_ANSWER_SECTIONS`, and synastry's
   `interpret.SYNASTRY_ANSWER_SECTIONS`) are plain lists, easy to add to,
   rename, or drop sections from. Falls back to the generic reasoning-mode
-  template if the digest step produced nothing for any of the three chart
+  template if the digest step produced nothing for any of the four chart
   types.
 
-  This is meant to keep growing rather than stay fixed at three operations
+  This is meant to keep growing rather than stay fixed at four operations
   — `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point
-  for future chart types (composite charts, progressions, solar/lunar
-  returns, event-time/electional search, birth-time rectification): write
-  one function, add one registry entry, wire a new `TOOL_REGISTRY`
-  description when there's a concrete need for it. If you add a technique
-  that needs its own reference corpus (progressions, solar/lunar returns —
+  for future chart types (composite charts, solar/lunar returns via
+  kerykeion's own `PlanetaryReturnFactory`, profections, event-time/
+  electional search, birth-time rectification): write one function, add
+  one registry entry, wire a new `TOOL_REGISTRY` description when there's
+  a concrete need for it. If you add a technique that needs its own
+  reference corpus (solar/lunar returns, profections —
   each is built and interpreted differently enough that mixing their
   methodology documents in one place risks confusing the model and
   bloating the always-include context for every dual-chart question), give
@@ -756,16 +780,40 @@ is unnecessary complexity for now.
    ```
 
    `.zip` archives are read directly (stdlib, no extra package). `.rar`/`.arj`/`.7z`,
-   legacy binary `.doc` (MS Word 97-2003, NOT `.docx`), and `.ha` archives need matching
-   **system** tools — see the "Installation" section above for the package names and the
-   `ha` build steps (Debian/Ubuntu and Fedora both covered there).
+   legacy binary `.doc` (MS Word 97-2003, NOT `.docx`), `.ha` and `.chm` archives, `.djvu`/`.djv`
+   scans, and scanned (no-text-layer) `.pdf` pages all need matching **system** tools — see the
+   "Installation" section above for the package names and the `ha` build steps (Debian/Ubuntu
+   and Fedora both covered there).
+
+   `.djvu`/`.djv` specifically needs `djvulibre` (provides the `djvutxt`, `ddjvu`, and
+   `djvused` CLI tools) always, plus `tesseract` with a Russian language pack
+   (`tesseract-ocr-rus` on Debian/Ubuntu, `tesseract-langpack-rus` on Fedora) *only* for
+   scans that have no embedded OCR text layer — `build_index.py` tries the fast direct
+   extraction first (`djvutxt`) and only falls back to rendering pages and OCR'ing them
+   (`ddjvu` + `tesseract`) if that comes back empty, so tesseract is only actually invoked
+   for scans that genuinely need it.
+
+   `.pdf` gets the same OCR treatment, page by page rather than whole-document: pypdf's
+   normal text extraction is tried first for every page, and only pages that come back
+   (near-)empty — genuinely scanned pages with no text layer, which do turn up mixed into
+   otherwise "born-digital" PDFs — are rendered via `pdftoppm` (**`poppler-utils`**) and
+   OCR'd via the same `tesseract` as `.djvu`. A fully text-based PDF never touches
+   `pdftoppm`/`tesseract` at all.
+
+   `.chm` (Compiled HTML Help, WinHelp's successor) needs `extract_chmLib` — package
+   `chmlib` on Fedora, `libchm-bin` on Debian/Ubuntu — which unpacks it into a plain
+   directory of HTML "chapter" files, each then read exactly like any other `.html` file
+   (no CHM-specific parsing of its own).
 
    Without these system tools installed, `build_index.py` doesn't fail: `.doc` files fall
-   back to a cruder built-in text scrape, and archives it can't open are skipped with a
-   printed warning naming the file, so one missing tool never aborts the whole indexing run.
+   back to a cruder built-in text scrape, scanned `.pdf` pages and `.djvu`/`.djv` files
+   without their OCR tools are indexed with whatever text pypdf/djvutxt *could* extract
+   (possibly none, for a fully scanned document), and archives (including `.chm`) it can't
+   open are skipped with a printed warning — one missing tool never aborts the whole
+   indexing run.
 
-2. Put your files (`.txt`, `.html`/`.htm`, `.rtf`, `.pdf`, `.doc`, or `.zip`/`.rar`/`.arj`/
-   `.7z`/`.ha` archives of any of those) in `rag_data/` (created automatically on first run of
+2. Put your files (`.txt`, `.html`/`.htm`, `.rtf`, `.pdf`, `.doc`, `.djvu`/`.djv`, or
+   `.zip`/`.rar`/`.arj`/`.7z`/`.ha`/`.chm` archives of any of those) in `rag_data/` (created automatically on first run of
    the script if missing). Archives are extracted and their contents indexed the same way as
    loose files, recursively (including archives nested inside archives, up to a small depth
    limit). Group documents into topic subfolders if you have more than one subject —
