@@ -1853,7 +1853,7 @@ def run_transit(spec: str) -> str:
         return f"Ошибка при расчёте транзитов: {e}"
 
 
-def get_transit_profiles(spec: str, top_n: int = 9) -> List[Dict]:
+def get_transit_profiles(spec: str, top_n: int = 12) -> List[Dict]:
     """Transit counterpart to get_planet_profiles, for routes/chat.py's
     digest step — rebuilds both subjects from `spec` (same duplication-of-
     computation pattern get_planet_profiles already has relative to
@@ -1862,6 +1862,16 @@ def get_transit_profiles(spec: str, top_n: int = 9) -> List[Dict]:
     consistent with that existing precedent rather than plumbing the
     already-built subject through routes/chat.py) and hands them to
     get_dual_chart_profiles.
+
+    top_n raised from 9 to 12 after real user feedback that a transit
+    answer felt thinner and less specific than it could be — the same
+    "more material available to the digest step produces a more thorough
+    answer" lever already used for synastry (top_n_each 7 -> 9). A
+    real chart tested here has 15 active transiting points, so 12 still
+    leaves real room for the score-based ranking to matter, while giving
+    the digest/final-answer steps enough profiles to actually cover
+    "several simultaneous transits" (see transit_methodology.txt point 5)
+    instead of just the top 2-3.
 
     Returns [] (not an error) if fields are missing or subject-building
     fails — same "no profiles available, caller falls back" contract

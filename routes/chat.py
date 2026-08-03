@@ -349,7 +349,37 @@ async def _handle_tool_request(
         tool_arg = decision.tool_arg
 
     loop = asyncio.get_running_loop()
-    tool_result = await loop.run_in_executor(None, tool_spec["run"], tool_arg)
+
+    # Synastry-only hybrid extraction: try the plain deterministic
+    # heuristic first (astro.run_synastry's own default), and only fall
+    # back to a narrow, single-purpose LLM call when that heuristic left
+    # required fields missing for either person — a real, reported
+    # limitation of the pure date-position heuristic (free-form phrasing
+    # it doesn't expect keeps finding new ways to break a purely
+    # positional split). The LLM's only job is deciding which words
+    # belong to which person (utils.intent.split_two_person_text_async
+    # quotes the original text back verbatim, never reformats a date/
+    # time/coordinate/city itself) — see astro._extract_two_person_fields'
+    # own docstring for why this stays safe. Every OTHER tool (natal,
+    # transit, datetime, calculator, ...) is untouched by this branch and
+    # keeps using the generic tool_spec["run"] dispatch below.
+    split_hint = None
+    if decision.tool_name == "astro_synastry_chart":
+        heuristic_missing = await loop.run_in_executor(
+            None, astro.synastry_fields_missing, tool_arg
+        )
+        if heuristic_missing:
+            split_hint = await intent.split_two_person_text_async(tool_arg)
+            print(
+                f"[tool_request] synastry heuristic split incomplete "
+                f"(missing={heuristic_missing!r}); LLM segmentation hint: "
+                f"{split_hint!r}"
+            )
+        tool_result = await loop.run_in_executor(
+            None, lambda: astro.run_synastry(tool_arg, split_hint=split_hint)
+        )
+    else:
+        tool_result = await loop.run_in_executor(None, tool_spec["run"], tool_arg)
     # Same rationale as the [tool_router] print above: the model's final
     # answer is a paraphrase of tool_result, one more LLM call removed from
     # what the tool actually computed — printing the raw result here is
@@ -419,8 +449,15 @@ async def _handle_tool_request(
             # list — each profile's own "text" already names which person
             # it belongs to (see astro.get_synastry_profiles), so the
             # digest prompt can tell them apart without needing two
-            # separate LLM calls.
-            profiles_a, profiles_b, name_a, name_b = astro.get_synastry_profiles(tool_arg)
+            # separate LLM calls. split_hint (computed above, possibly
+            # None) is passed through so the profiles reflect the exact
+            # same person-A/person-B split that produced tool_result —
+            # without this they'd redo the plain heuristic split
+            # independently and could come back empty even when the LLM
+            # hint just fixed tool_result above.
+            profiles_a, profiles_b, name_a, name_b = astro.get_synastry_profiles(
+                tool_arg, split_hint=split_hint
+            )
             digested = await interpret.digest_facts_async(
                 profiles_a + profiles_b, chart_kind="synastry"
             )
