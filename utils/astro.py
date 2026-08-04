@@ -89,6 +89,7 @@ a real geocoding service.
 """
 import re
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Chart text (below) is rendered directly in Russian, not left for the
@@ -1562,6 +1563,7 @@ def get_dual_chart_profiles(
     query_aspect_prefix: str = "транзит",
     force_include_labels: Tuple[str, ...] = ("Солнце", "Луна"),
     kind: str = "transit_planet",
+    include_angles: bool = False,
 ) -> List[Dict]:
     """Two-chart counterpart to get_planet_profiles — one profile per
     significant point of `other_subject` (a transit moment's moving
@@ -1627,7 +1629,20 @@ def get_dual_chart_profiles(
     only concept, see get_planet_profiles) — only force_include_labels
     (default Sun/Moon) are force-included, since they're the two bodies
     every mainstream transit OR synastry reading treats as significant
-    regardless of house/aspect count."""
+    regardless of house/aspect count.
+
+    include_angles (default False, unchanged behavior for every existing
+    caller — transit/progression/synastry) additionally profiles
+    other_subject's own Ascendant/MC (_ANGLE_ATTRS) the same way its
+    planets are profiled. Added for lunar/solar returns: unlike a transit
+    moment's Ascendant (just reflects time-of-day, not a real "transit" —
+    see _ACTIVE_POINTS_TRANSIT's own comment), a RETURN chart's own
+    Ascendant is a real, independently meaningful point — solar_return_
+    methodology.txt flags the return's own Ascendant/its ruler as the
+    single most important point in a solar return, which would otherwise
+    never surface as a profiled fact at all (aspects TO it were already
+    computed via _ASPECT_ACTIVE_POINTS, but no profile entry ever
+    summarized its own sign/house the way a planet's does)."""
     if other_active_points is None:
         other_active_points = _ACTIVE_POINTS_TRANSIT
     if other_point_label is None:
@@ -1651,8 +1666,10 @@ def get_dual_chart_profiles(
 
     kery_name_to_point = _kery_name_to_point_map()
 
+    attrs_to_profile = _PLANET_ATTRS + (_ANGLE_ATTRS if include_angles else [])
+
     profiles: List[Dict] = []
-    for label, attr in _PLANET_ATTRS:
+    for label, attr in attrs_to_profile:
         kery_name = attr_to_kerykeion_name(attr)
         if kery_name not in other_active_points:
             continue
@@ -2257,14 +2274,814 @@ def get_synastry_profiles(
     return profiles_a, profiles_b, name_a, name_b
 
 
+# --- solar arc directions ---------------------------------------------------
+#
+# Solar arc directions move EVERY natal point by the same arc (the angular
+# distance the secondary-progressed Sun has moved from its own natal
+# position — reusing _build_progression_subjects/_secondary_progressed_
+# datetime rather than recomputing "day for a year" separately), unlike
+# secondary progressions where different points move at their own real
+# speeds. This is the key thing direction_methodology.txt calls out as
+# specific to this technique, and the reason the implementation below
+# can't just reuse get_dual_chart_profiles/AspectsFactory the way
+# progression did: there is no independent kerykeion chart for a
+# "directed" moment at all (no real date/time/place a directed Mars
+# actually occupies) — it's a synthetic set of points obtained by adding
+# one arc to every natal degree, so AspectsFactory.dual_chart_aspects
+# (which requires two real, independently-built subjects) simply isn't
+# usable here. Aspect matching below is done directly against
+# _ASPECT_ANGLES instead.
+_ZODIAC_SIGN_CODES = list(_SIGN_NAMES_RU.keys())
+
+# Standard aspect angles (degrees) — needed only for directions' custom
+# aspect matching (see above); every other technique in this module gets
+# its aspects from kerykeion's own AspectsFactory, which doesn't need this.
+_ASPECT_ANGLES = {
+    "conjunction": 0.0, "opposition": 180.0, "trine": 120.0, "square": 90.0,
+    "sextile": 60.0, "semi-sextile": 30.0, "semi-square": 45.0,
+    "quintile": 72.0, "sesquiquadrate": 135.0, "biquintile": 144.0,
+    "quincunx": 150.0,
+}
+
+
+def _sign_from_abs_pos(abs_pos: float) -> Tuple[str, float]:
+    """Absolute ecliptic degree (0-360, kerykeion's own convention — see
+    _house_cusp_degrees' docstring for why this matters and not
+    the within-sign 0-30 `.position`) -> (sign code, within-sign degree),
+    e.g. 197.6 -> ("Lib", 17.6). _ZODIAC_SIGN_CODES is in the same
+    zodiacal order _SIGN_NAMES_RU already uses (Aries first, Pisces
+    last), so a plain 30°-wide bucket lookup is enough — no wraparound
+    edge case, since `% 360.0` already normalizes the input."""
+    d = abs_pos % 360.0
+    idx = int(d // 30.0)
+    return _ZODIAC_SIGN_CODES[idx], d - idx * 30.0
+
+
+def _angular_separation(deg_a: float, deg_b: float) -> float:
+    """Shortest angular distance (0-180°) between two absolute ecliptic
+    degrees — the input every aspect-angle comparison below needs."""
+    diff = abs(deg_a - deg_b) % 360.0
+    return diff if diff <= 180.0 else 360.0 - diff
+
+
+def _direction_aspect_movement(base_abs_pos: float, target_abs_pos: float, aspect_angle: float) -> str:
+    """Directions have no real "applying/separating" motion the way a
+    transit does (nothing is actually moving at the moment being asked
+    about) — but the solar arc itself grows monotonically with age
+    (~0.9856°/year, matching the progressed Sun's own mean motion), so
+    whether a given direction is still tightening or has already passed
+    exact IS a well-defined, real fact about it. Nudging the arc forward
+    by a small step and checking whether the resulting orb shrinks or
+    grows reuses the exact same "Applying"/"Separating" literals
+    _ASPECT_MOVEMENT_RU already knows how to render, so this plugs
+    straight into the same _movement_ru/_format_aspect_line machinery as
+    every other technique."""
+    def _diff(pos: float) -> float:
+        return abs(_angular_separation(pos, target_abs_pos) - aspect_angle)
+
+    current = _diff(base_abs_pos)
+    nudged = _diff((base_abs_pos + 0.01) % 360.0)
+    if nudged < current - 1e-9:
+        return "Applying"
+    if nudged > current + 1e-9:
+        return "Separating"
+    return "Static"
+
+
+def _build_direction_subjects(
+    fields: Dict[str, str], name: str
+) -> Tuple[
+    Optional[Any], Optional[Dict[str, Any]], Optional[datetime], Optional[float], Optional[float], Optional[str]
+]:
+    """Shared by run_direction and get_direction_profiles — mirrors
+    _build_transit_subjects/_build_progression_subjects' role and shape,
+    but builds a plain dict of synthetic "directed point" objects
+    (kerykeion point-name literal -> a SimpleNamespace exposing .sign/
+    .position/.abs_pos/.retrograde, everything _format_point_line and the
+    aspect-matching helpers above need) instead of a second real kerykeion
+    subject — see this section's module comment for why no real subject
+    exists to build here.
+
+    Returns (natal, directed_points, target_dt, age_years, arc_degrees,
+    None) on success, or (None, None, None, None, None, error_message) on
+    failure — same never-raise convention as the rest of this module."""
+    natal, progressed, target_dt, age_years, error = _build_progression_subjects(fields, name=name)
+    if error:
+        return None, None, None, None, None, error
+
+    # The solar arc: how far the progressed Sun has moved from its own
+    # natal position — the single number every natal point below gets
+    # shifted by identically (see this section's module comment for why
+    # that "same arc for every point" behavior is what defines this
+    # technique, unlike progression's per-point speeds).
+    arc_degrees = (progressed.sun.abs_pos - natal.sun.abs_pos) % 360.0
+
+    directed_points: Dict[str, Any] = {}
+    for label, attr in _PLANET_ATTRS + _ANGLE_ATTRS:
+        natal_point = getattr(natal, attr, None)
+        if natal_point is None:
+            continue
+        new_abs = (natal_point.abs_pos + arc_degrees) % 360.0
+        sign_code, within_sign = _sign_from_abs_pos(new_abs)
+        kery_name = attr_to_kerykeion_name(attr)
+        directed_points[kery_name] = SimpleNamespace(
+            sign=sign_code,
+            position=within_sign,
+            abs_pos=new_abs,
+            retrograde=bool(getattr(natal_point, "retrograde", False)),
+        )
+    return natal, directed_points, target_dt, age_years, arc_degrees, None
+
+
+def _format_direction_text(
+    natal, directed_points: Dict[str, Any], target_dt: datetime, age_years: float, arc_degrees: float
+) -> str:
+    natal_cusps = _house_cusp_degrees(natal)
+    kery_name_to_point = _kery_name_to_point_map()
+
+    lines = [
+        f"Дирекции (солнечная дуга) для {natal.name} на "
+        f"{target_dt.year:04d}-{target_dt.month:02d}-{target_dt.day:02d} "
+        f"(возраст {age_years:.1f} лет), дуга направления {arc_degrees:.2f}° — "
+        "ВСЕ натальные точки смещены на этот ОДИН И ТОТ ЖЕ угол (в отличие "
+        "от прогрессий, где разные точки движутся с разной скоростью).",
+        "Направленные положения (дом — натальный, т.е. дом натальной "
+        "карты, через который сейчас проходит направленная точка):",
+    ]
+    for label, attr in _PLANET_ATTRS + _ANGLE_ATTRS:
+        kery_name = attr_to_kerykeion_name(attr)
+        point = directed_points.get(kery_name)
+        if point is None:
+            continue
+        natal_house = _house_of_degree(natal_cusps, point.abs_pos)
+        lines.append("  " + _format_point_line(label, point, house_num_override=natal_house))
+
+    lines.append("Аспекты направленных точек к натальной карте:")
+    shown = 0
+    for label, attr in _PLANET_ATTRS + _ANGLE_ATTRS:
+        kery_name = attr_to_kerykeion_name(attr)
+        point = directed_points.get(kery_name)
+        if point is None:
+            continue
+        for label2, attr2 in _PLANET_ATTRS + _ANGLE_ATTRS:
+            natal_point2 = getattr(natal, attr2, None)
+            if natal_point2 is None:
+                continue
+            sep = _angular_separation(point.abs_pos, natal_point2.abs_pos)
+            for aspect_spec in _ALL_ASPECTS:
+                angle = _ASPECT_ANGLES.get(aspect_spec["name"])
+                if angle is None:
+                    continue
+                orb = abs(sep - angle)
+                if orb <= aspect_spec["orb"]:
+                    movement = _direction_aspect_movement(point.abs_pos, natal_point2.abs_pos, angle)
+                    lines.append(
+                        f"  направленный {_point_ru_from_label(label)} — "
+                        f"{_aspect_ru(aspect_spec['name'])} — натальный {_point_ru_from_label(label2)} "
+                        f"(орбис {orb:.1f}°, {_movement_ru(movement)})"
+                    )
+                    shown += 1
+    if not shown:
+        lines.append("  (нет аспектов в пределах орбиса)")
+    return "\n".join(lines)
+
+
+def run_direction(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_direction_chart"])."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields)
+    natal, directed_points, target_dt, age_years, arc_degrees, error = _build_direction_subjects(
+        fields, name=fields.get("name") or "Subject"
+    )
+    if error:
+        return error
+    try:
+        return _format_direction_text(natal, directed_points, target_dt, age_years, arc_degrees)
+    except Exception as e:
+        return f"Ошибка при расчёте дирекций: {e}"
+
+
+def get_direction_profiles(spec: str, top_n: int = 12) -> List[Dict]:
+    """Direction counterpart to get_transit_profiles/get_progression_
+    profiles, for routes/chat.py's digest step — bespoke rather than a
+    call to get_dual_chart_profiles, since there's no real second subject
+    for AspectsFactory.dual_chart_aspects to compare against (see this
+    section's module comment); aspect matching is done directly against
+    _ASPECT_ANGLES instead. The resulting per-profile shape (text/aspects/
+    stars/queries/score, and each aspect's orb/aspect_ru/movement_ru/
+    nature_ru/other_label/other_sign/other_house/phrase keys) matches
+    get_dual_chart_profiles' output exactly, so the shared digest/answer-
+    prompt machinery in utils/interpret.py works completely unchanged.
+
+    Force-includes the Sun, Moon, Ascendant, and MC regardless of score —
+    direction_methodology.txt explicitly treats the directed Ascendant/MC
+    as being just as significant as directed planets, unlike transit/
+    progression where the moving angles aren't a standard reading at all.
+
+    Returns [] (not an error) if fields are missing or subject-building
+    fails — same "no profiles available, caller falls back" contract
+    every other get_*_profiles function already has."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return []
+    natal, directed_points, _target_dt, _age_years, _arc_degrees, error = _build_direction_subjects(
+        fields, name=fields.get("name") or "Subject"
+    )
+    if error:
+        return []
+    try:
+        natal_cusps = _house_cusp_degrees(natal)
+
+        # Every directed point's own aspects, computed once up front so
+        # per-point scoring (aspect count) and the profile's own "aspects"
+        # list can both reuse the same pass instead of recomputing it.
+        aspects_by_point: Dict[str, List[Dict]] = {}
+        for label, attr in _PLANET_ATTRS + _ANGLE_ATTRS:
+            kery_name = attr_to_kerykeion_name(attr)
+            point = directed_points.get(kery_name)
+            if point is None:
+                continue
+            own_aspects = []
+            for label2, attr2 in _PLANET_ATTRS + _ANGLE_ATTRS:
+                natal_point2 = getattr(natal, attr2, None)
+                if natal_point2 is None:
+                    continue
+                sep = _angular_separation(point.abs_pos, natal_point2.abs_pos)
+                for aspect_spec in _ALL_ASPECTS:
+                    angle = _ASPECT_ANGLES.get(aspect_spec["name"])
+                    if angle is None:
+                        continue
+                    orb = abs(sep - angle)
+                    if orb <= aspect_spec["orb"]:
+                        movement = _direction_aspect_movement(point.abs_pos, natal_point2.abs_pos, angle)
+                        phrase = (
+                            f"{_aspect_ru(aspect_spec['name'])} "
+                            f"{_point_ru_genitive_from_label(label)} и "
+                            f"{_point_ru_genitive_from_label(label2)}"
+                        )
+                        own_aspects.append(
+                            {
+                                "orb": orb,
+                                "aspect_ru": _aspect_ru(aspect_spec["name"]),
+                                "movement_ru": _movement_ru(movement),
+                                "nature_ru": _aspect_nature_ru(aspect_spec["name"]),
+                                "other_label": _point_ru_from_label(label2),
+                                "other_sign": _sign_ru(natal_point2.sign),
+                                "other_house": _house_number(getattr(natal_point2, "house", None)),
+                                "phrase": phrase,
+                            }
+                        )
+            own_aspects.sort(key=lambda x: x["orb"])
+            aspects_by_point[kery_name] = own_aspects
+
+        profiles: List[Dict] = []
+        for label, attr in _PLANET_ATTRS + _ANGLE_ATTRS:
+            kery_name = attr_to_kerykeion_name(attr)
+            point = directed_points.get(kery_name)
+            if point is None:
+                continue
+            natal_house = _house_of_degree(natal_cusps, point.abs_pos)
+            retrograde = bool(point.retrograde)
+            label_ru = _point_ru_from_label(label)
+            own_aspects_full = aspects_by_point.get(kery_name, [])
+
+            score = 0.0
+            if natal_house in _ANGULAR_HOUSES:
+                score += 3.0
+            elif natal_house in _SUCCEDENT_HOUSES:
+                score += 1.5
+            if retrograde:
+                score += 0.5
+            score += 0.5 * len(own_aspects_full)
+
+            own_aspects = own_aspects_full[:_MAX_ASPECTS_PER_PROFILE]
+
+            sign_prep = _sign_ru_prepositional(point.sign)
+            retro_text = " (ретроградный)" if retrograde else ""
+            house_text = f", натальный {natal_house} дом" if natal_house else ""
+
+            queries = [f"направленный {label} {sign_prep}"] + (
+                [f"направленный {label} в {natal_house} доме"] if natal_house else []
+            )
+            for asp in own_aspects:
+                queries.append(f"дирекция {asp['aspect_ru']} {label_ru} и {asp['other_label']}")
+
+            profiles.append(
+                {
+                    "kind": "direction_planet",
+                    "label": label_ru,
+                    "text": f"направленный {label_ru} {sign_prep}{house_text}{retro_text}",
+                    "aspects": own_aspects,
+                    "stars": [],
+                    "queries": queries,
+                    "score": score,
+                    "force_include": label in ("Солнце", "Луна", "Асцендент", "Середина неба (MC)"),
+                }
+            )
+
+        forced = [p for p in profiles if p["force_include"]]
+        rest = sorted((p for p in profiles if not p["force_include"]), key=lambda p: p["score"], reverse=True)
+        return forced + rest[: max(0, top_n - len(forced))]
+    except Exception:
+        return []
+
+
+# --- lunar & solar returns ---------------------------------------------------
+#
+# Both built on kerykeion's own PlanetaryReturnFactory (a real Swiss-
+# Ephemeris search for the exact moment the Sun/Moon returns to its natal
+# degree), so — unlike directions — there IS a genuine independent
+# kerykeion subject here (PlanetReturnModel), fully compatible with
+# get_dual_chart_profiles/AspectsFactory exactly like a transit or
+# progression subject is. Location is ALWAYS the natal birth place's own
+# lat/lon/tz — per the user's explicit, confirmed choice — relocated
+# returns are a real, more specialized technique deliberately left out for
+# now (see lunar_return_methodology.txt/solar_return_methodology.txt).
+_RETURN_CYCLE_MARGIN_DAYS = {"Solar": 400, "Lunar": 30}
+_RETURN_KIND_RU = {"Solar": "солярный", "Lunar": "лунарный"}
+_RETURN_LABEL_RU = {"Solar": "Солнечное возвращение (солар)", "Lunar": "Лунное возвращение (лунар)"}
+
+
+def _parse_kerykeion_iso(value: str) -> datetime:
+    """PlanetReturnModel doesn't expose .year/.month/.day/... directly the
+    way a subject built via from_birth_data does — only iso_formatted_
+    local_datetime/iso_formatted_utc_datetime strings — so every caller
+    that needs the return's own calendar moment as a real datetime parses
+    it through here. The 'Z' replacement guards against a UTC-suffixed
+    string Python's own fromisoformat can't parse on its own on some
+    versions; every other offset form it already handles natively.
+
+    Returns a NAIVE datetime (tzinfo stripped) even when the source string
+    carried a UTC offset — target_dt (this module's "now"/moment,
+    everywhere else too) is always naive, and subtracting an aware from a
+    naive datetime raises TypeError; a real, caught-in-testing failure
+    here. Comparing/subtracting wall-clock times without carrying tzinfo
+    through is the same convention _build_transit_subjects/_build_
+    progression_subjects already use for "now", not a new inconsistency
+    introduced here."""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt.replace(tzinfo=None)
+
+
+def _build_return_subjects(
+    fields: Dict[str, str], name: str, return_type: str
+) -> Tuple[
+    Optional[Any], Optional[Any], Optional[datetime], Optional[datetime], Optional[datetime], Optional[str]
+]:
+    """Shared by run_lunar_return/run_solar_return and get_lunar_return_
+    profiles/get_solar_return_profiles. return_type is kerykeion's own
+    literal ("Solar" or "Lunar").
+
+    PlanetaryReturnFactory.next_return_from_iso_formatted_time() finds the
+    NEXT return strictly after the given moment, not the most recently
+    started one — so the "current" (still-active) return period is found
+    by first probing from (target_dt - a safety margin: 400 days for
+    Solar, comfortably past the ~365.25-day tropical year; 30 days for
+    Lunar, past the ~27.3-day sidereal month), which is guaranteed to land
+    at or before the real current return, then WALKING FORWARD one return
+    at a time until passing target_dt.
+
+    The walk (not just the single probe) is required, not a nice-to-have:
+    a real, caught-in-testing failure showed a margin picked to be "just
+    over one cycle" landing a full EXTRA cycle behind (the probe found a
+    return from over a year ago instead of last month's), because
+    kerykeion's real return period isn't exactly 365.25/27.3 days — it
+    varies by hours depending on where the body actually is in its orbit
+    that cycle, so no single fixed margin can be proven tight enough to
+    land in exactly the right cycle on its own. Walking forward from a
+    safely-early starting probe is robust to that variation regardless of
+    how far back the probe itself happened to land.
+
+    Returns (natal, current_return_subject, target_dt, current_return_dt,
+    next_return_dt, None) on success, or (None, None, None, None, None,
+    error_message) on failure — same never-raise convention as the rest of
+    this module."""
+    try:
+        natal = _build_subject(fields, name=name)
+    except Exception as e:
+        return None, None, None, None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
+
+    moment = (fields.get("moment") or "now").strip()
+    try:
+        if moment.lower() in ("", "now", "сейчас"):
+            target_dt = datetime.now()
+        else:
+            target_dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
+    except Exception as e:
+        return None, None, None, None, None, (
+            f"Не удалось разобрать момент времени '{moment}' ({e}); "
+            "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
+        )
+
+    try:
+        from kerykeion.planetary_return_factory import PlanetaryReturnFactory
+
+        factory = PlanetaryReturnFactory(
+            natal, lat=float(fields["lat"]), lng=float(fields["lon"]), tz_str=fields["tz"], online=False,
+        )
+        margin_days = _RETURN_CYCLE_MARGIN_DAYS[return_type]
+        search_start = target_dt - timedelta(days=margin_days)
+        probe = factory.next_return_from_iso_formatted_time(search_start.isoformat(), return_type=return_type)
+        current_return_dt = _parse_kerykeion_iso(probe.iso_formatted_local_datetime)
+        current_return = probe
+
+        next_return, next_return_dt = None, None
+        for _ in range(8):
+            candidate = factory.next_return_from_iso_formatted_time(
+                (current_return_dt + timedelta(hours=1)).isoformat(), return_type=return_type
+            )
+            candidate_dt = _parse_kerykeion_iso(candidate.iso_formatted_local_datetime)
+            if candidate_dt > target_dt:
+                next_return, next_return_dt = candidate, candidate_dt
+                break
+            current_return, current_return_dt = candidate, candidate_dt
+        if next_return is None:
+            # Shouldn't happen in practice — 8 iterations comfortably
+            # covers the margin/actual-cycle-length mismatch this loop
+            # exists to correct for. Fail loudly rather than silently
+            # hand back a stale current/next pair.
+            raise RuntimeError("не удалось сойтись на текущем цикле возвращения за разумное число шагов")
+    except Exception as e:
+        return None, None, None, None, None, f"Не удалось рассчитать возвращение: {e}"
+
+    return natal, current_return, target_dt, current_return_dt, next_return_dt, None
+
+
+def _format_return_text(
+    natal, return_subject, return_type: str, target_dt: datetime,
+    current_return_dt: datetime, next_return_dt: datetime,
+) -> str:
+    from kerykeion import AspectsFactory
+
+    kind_ru = _RETURN_KIND_RU[return_type]
+    label_ru = _RETURN_LABEL_RU[return_type]
+    natal_cusps = _house_cusp_degrees(natal)
+    cycle_days = (next_return_dt - current_return_dt).days
+    day_in_cycle = (target_dt - current_return_dt).days
+    days_to_next = (next_return_dt - target_dt).days
+
+    lines = [
+        f"{label_ru} для {natal.name}. Текущий цикл начался "
+        f"{current_return_dt.year:04d}-{current_return_dt.month:02d}-{current_return_dt.day:02d} "
+        f"{current_return_dt.hour:02d}:{current_return_dt.minute:02d} и длится {cycle_days} дней — "
+        f"следующее возвращение "
+        f"{next_return_dt.year:04d}-{next_return_dt.month:02d}-{next_return_dt.day:02d} "
+        f"(сейчас {day_in_cycle}-й день цикла, до следующего возвращения {days_to_next} дней). "
+        "Карта возвращения рассчитана ТОЛЬКО для натального места рождения, без релокации.",
+        f"Собственные положения планет {kind_ru} карты:",
+    ]
+    for label, attr in _PLANET_ATTRS:
+        point = getattr(return_subject, attr, None)
+        if point is not None:
+            lines.append("  " + _format_point_line(label, point))
+    lines.append(f"Собственные углы {kind_ru} карты:")
+    for label, attr in _ANGLE_ATTRS:
+        point = getattr(return_subject, attr, None)
+        if point is not None:
+            lines.append("  " + _format_point_line(label, point))
+    lines.append(f"Куспиды домов {kind_ru} карты (собственная система домов возвращения):")
+    for i, attr in enumerate(
+        ["first_house", "second_house", "third_house", "fourth_house",
+         "fifth_house", "sixth_house", "seventh_house", "eighth_house",
+         "ninth_house", "tenth_house", "eleventh_house", "twelfth_house"],
+        start=1,
+    ):
+        cusp = getattr(return_subject, attr, None)
+        if cusp is not None:
+            lines.append(f"  Дом {i}: {_sign_ru(cusp.sign)} {cusp.position:.1f}°")
+
+    lines.append(f"Положения планет {kind_ru} карты в НАТАЛЬНЫХ домах (для сравнения с натальной картой):")
+    for label, attr in _PLANET_ATTRS:
+        point = getattr(return_subject, attr, None)
+        if point is not None:
+            natal_house = _house_of_degree(natal_cusps, point.abs_pos)
+            lines.append(f"  {label}: натальный {natal_house} дом")
+
+    aspects = AspectsFactory.dual_chart_aspects(
+        natal, return_subject, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
+    ).aspects
+    lines.append(f"Аспекты {kind_ru} карты к натальной карте:")
+    shown = 0
+    for a in aspects:
+        returning, to_natal = (
+            (a.p1_name, a.p2_name) if a.p1_owner == return_subject.name else (a.p2_name, a.p1_name)
+        )
+        lines.append(
+            f"  {kind_ru} {_point_ru(returning)} — {_aspect_ru(a.aspect)} — "
+            f"натальный {_point_ru(to_natal)} "
+            f"(орбис {a.orbit:.1f}°, {_movement_ru(a.aspect_movement)})"
+        )
+        shown += 1
+    if not shown:
+        lines.append("  (нет аспектов в пределах орбиса)")
+    return "\n".join(lines)
+
+
+def run_lunar_return(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_lunar_return_chart"])."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields)
+    natal, return_subject, target_dt, current_return_dt, next_return_dt, error = _build_return_subjects(
+        fields, name=fields.get("name") or "Subject", return_type="Lunar"
+    )
+    if error:
+        return error
+    try:
+        return _format_return_text(natal, return_subject, "Lunar", target_dt, current_return_dt, next_return_dt)
+    except Exception as e:
+        return f"Ошибка при расчёте лунара: {e}"
+
+
+def run_solar_return(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_solar_return_chart"])."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields)
+    natal, return_subject, target_dt, current_return_dt, next_return_dt, error = _build_return_subjects(
+        fields, name=fields.get("name") or "Subject", return_type="Solar"
+    )
+    if error:
+        return error
+    try:
+        return _format_return_text(natal, return_subject, "Solar", target_dt, current_return_dt, next_return_dt)
+    except Exception as e:
+        return f"Ошибка при расчёте солара: {e}"
+
+
+def _get_return_profiles(spec: str, return_type: str, top_n: int) -> List[Dict]:
+    """Shared body of get_lunar_return_profiles/get_solar_return_profiles
+    (both just fix return_type/top_n and delegate here) — reuses
+    get_dual_chart_profiles directly (unlike directions), since a
+    kerykeion PlanetReturnModel is a real, AspectsFactory-compatible
+    subject just like a transit or progressed one.
+
+    include_angles=True (see get_dual_chart_profiles' own docstring for
+    why this parameter exists) and force_include_labels including
+    "Асцендент" together give the return chart's own Ascendant a real
+    profile entry — both lunar_return_methodology.txt and solar_return_
+    methodology.txt single out the return's own Ascendant as one of the
+    most important points to read, which the plain transit/progression
+    defaults would otherwise never surface at all."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return []
+    natal, return_subject, _target_dt, _current_return_dt, _next_return_dt, error = _build_return_subjects(
+        fields, name=fields.get("name") or "Subject", return_type=return_type
+    )
+    if error:
+        return []
+    kind_ru = _RETURN_KIND_RU[return_type]
+    try:
+        return get_dual_chart_profiles(
+            natal, return_subject,
+            other_active_points=_ACTIVE_POINTS_NATAL, top_n=top_n,
+            other_point_label=lambda lr, k=kind_ru: f"{k} {lr}",
+            reference_house_label=lambda h: f"натальный {h} дом",
+            own_house_label=lambda h, k=kind_ru: f"свой {h} дом ({k})",
+            query_prefix=kind_ru,
+            query_aspect_prefix=kind_ru,
+            force_include_labels=("Солнце", "Луна", "Асцендент"),
+            kind=f"{return_type.lower()}_return_planet",
+            include_angles=True,
+        )
+    except Exception:
+        return []
+
+
+def get_lunar_return_profiles(spec: str, top_n: int = 12) -> List[Dict]:
+    """Lunar-return counterpart to get_transit_profiles — see
+    _get_return_profiles for the shared mechanism. Force-includes the
+    return's own Ascendant alongside Sun/Moon (unlike transit/progression's
+    Sun/Moon-only default): lunar_return_methodology.txt calls the return's
+    own Moon placement the single most important point, and its own
+    Ascendant matters far more here than a moving transit moment's does."""
+    return _get_return_profiles(spec, "Lunar", top_n)
+
+
+def get_solar_return_profiles(spec: str, top_n: int = 12) -> List[Dict]:
+    """Solar-return counterpart — see solar_return_methodology.txt: the
+    return's own Ascendant/its ruler is the single most important point in
+    a solar return (more so than the Sun's own house there), which is why
+    Ascendant is force-included here exactly as it is for lunar returns."""
+    return _get_return_profiles(spec, "Solar", top_n)
+
+
+# --- profections (whole-sign, classical rulers) -----------------------------
+#
+# Pure calendar + rulership arithmetic over the ALREADY-COMPUTED natal
+# chart — unlike every other technique in this module, this builds no new
+# ephemeris chart at all. Deliberately uses WHOLE-SIGN houses counted from
+# the natal Ascendant's own sign — a real, explicit fork from the quadrant
+# house system every other technique here uses (kerykeion's natal cusps),
+# confirmed with the user as the intended, classical convention for this
+# one technique specifically ("целые знаки (классика)") rather than an
+# oversight or inconsistency. See profection_methodology.txt.
+_CLASSICAL_RULERS_RU = {
+    "Ari": "Марс", "Tau": "Венера", "Gem": "Меркурий", "Can": "Луна",
+    "Leo": "Солнце", "Vir": "Меркурий", "Lib": "Венера", "Sco": "Марс",
+    "Sag": "Юпитер", "Cap": "Сатурн", "Aqu": "Сатурн", "Pis": "Юпитер",
+}
+
+
+def _build_profection_context(
+    fields: Dict[str, str], name: str
+) -> Tuple[Optional[Any], Optional[datetime], Optional[int], Optional[str]]:
+    """Shared by run_profection/get_profection_profiles — builds only the
+    natal subject (no second chart at all, unlike every other technique
+    here) plus the target moment and the person's completed age in years
+    at that moment (the whole-sign profection count, see
+    _profection_house_and_ruler). Returns (natal, target_dt,
+    age_full_years, None) on success, or (None, None, None,
+    error_message) on failure — same never-raise convention as the rest of
+    this module."""
+    try:
+        natal = _build_subject(fields, name=name)
+    except Exception as e:
+        return None, None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
+
+    moment = (fields.get("moment") or "now").strip()
+    try:
+        if moment.lower() in ("", "now", "сейчас"):
+            target_dt = datetime.now()
+        else:
+            target_dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
+    except Exception as e:
+        return None, None, None, (
+            f"Не удалось разобрать момент времени '{moment}' ({e}); "
+            "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
+        )
+
+    try:
+        date_str = fields["date"]
+        time_str = fields.get("time", "12:00")
+        year, month, day = (int(x) for x in date_str.split("-"))
+        hour, minute = (int(x) for x in time_str.split(":"))
+        birth_dt = datetime(year, month, day, hour, minute)
+    except Exception as e:
+        return None, None, None, f"Не удалось разобрать дату рождения ({e})."
+
+    age_years = (target_dt - birth_dt).total_seconds() / 86400.0 / 365.25
+    if age_years < 0:
+        return None, None, None, "Профекция рассчитывается только для дат ПОСЛЕ рождения."
+    return natal, target_dt, int(age_years), None
+
+
+def _profection_house_and_ruler(natal, age_full_years: int) -> Tuple[int, str, str]:
+    """The whole-sign profection formula itself: the natal Ascendant's own
+    sign IS house 1 for "year 0" (birth to the first birthday); each
+    completed year of life profects the count by exactly one whole sign,
+    cycling every 12 years (age 12 lands back on the natal Ascendant's own
+    sign, age 13 on the same sign age 1 had, and so on). Returns
+    (profected_house_num, profected_sign_code, ruler_label_ru) — the
+    ruler is looked up via classical (7-planet, no outer-planet)
+    rulerships, per profection_methodology.txt: this is historically a
+    classical technique, and Uranus/Neptune/Pluto rulerships would be an
+    anachronism here even though the rest of this app doesn't otherwise
+    distinguish classical vs. modern rulership anywhere else."""
+    asc_sign_index = _ZODIAC_SIGN_CODES.index(natal.ascendant.sign)
+    profected_house_num = (age_full_years % 12) + 1
+    profected_sign_index = (asc_sign_index + age_full_years) % 12
+    profected_sign_code = _ZODIAC_SIGN_CODES[profected_sign_index]
+    ruler_label_ru = _CLASSICAL_RULERS_RU[profected_sign_code]
+    return profected_house_num, profected_sign_code, ruler_label_ru
+
+
+def _format_profection_text(
+    natal, target_dt: datetime, age_full_years: int,
+    profected_house_num: int, profected_sign_code: str, ruler_label_ru: str,
+) -> str:
+    from kerykeion import AspectsFactory
+
+    ruler_attr = next(attr for lbl, attr in _PLANET_ATTRS if lbl == ruler_label_ru)
+    ruler_kery_name = attr_to_kerykeion_name(ruler_attr)
+    ruler_point = getattr(natal, ruler_attr)
+
+    lines = [
+        f"Профекция для {natal.name} на "
+        f"{target_dt.year:04d}-{target_dt.month:02d}-{target_dt.day:02d} "
+        f"(возраст {age_full_years} полных лет, профекционный год №{age_full_years + 1}). "
+        "Техника ЦЕЛЫХ ЗНАКОВ (классическая) от натального Асцендента — "
+        "ОТЛИЧАЕТСЯ от квадрантной системы домов, используемой для "
+        "остальных техник в этом приложении.",
+        f"Натальный Асцендент: {_sign_ru(natal.ascendant.sign)} {natal.ascendant.position:.1f}°.",
+        f"Профецированный дом: {profected_house_num} (знак {_sign_ru(profected_sign_code)}).",
+        f"Управитель года (time lord): {_point_ru_from_label(ruler_label_ru)} — "
+        + _format_point_line(ruler_label_ru, ruler_point),
+    ]
+
+    aspects = AspectsFactory.natal_aspects(
+        natal, active_points=_ASPECT_ACTIVE_POINTS, active_aspects=_ALL_ASPECTS,
+    ).aspects
+    lines.append(f"Натальные аспекты управителя года ({_point_ru_from_label(ruler_label_ru)}):")
+    shown = 0
+    for a in aspects:
+        if a.p1_name == ruler_kery_name:
+            other = a.p2_name
+        elif a.p2_name == ruler_kery_name:
+            other = a.p1_name
+        else:
+            continue
+        lines.append(
+            f"  {_point_ru_from_label(ruler_label_ru)} — {_aspect_ru(a.aspect)} — {_point_ru(other)} "
+            f"(орбис {a.orbit:.1f}°, {_movement_ru(a.aspect_movement)})"
+        )
+        shown += 1
+    if not shown:
+        lines.append("  (нет аспектов в пределах орбиса)")
+    return "\n".join(lines)
+
+
+def run_profection(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_profection_chart"]).
+    Unlike every other run_* here, this builds NO new ephemeris chart at
+    all — profections are pure calendar+rulership arithmetic over the
+    already-computed natal chart (see _build_profection_context/
+    _profection_house_and_ruler)."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields)
+    natal, target_dt, age_full_years, error = _build_profection_context(
+        fields, name=fields.get("name") or "Subject"
+    )
+    if error:
+        return error
+    try:
+        house_num, sign_code, ruler_ru = _profection_house_and_ruler(natal, age_full_years)
+        return _format_profection_text(natal, target_dt, age_full_years, house_num, sign_code, ruler_ru)
+    except Exception as e:
+        return f"Ошибка при расчёте профекции: {e}"
+
+
+def get_profection_profiles(spec: str, top_n: int = 9) -> List[Dict]:
+    """Profection counterpart to get_planet_profiles — NOT a full per-point
+    ranking like that function (only one point, the year's ruler, actually
+    matters for this technique): returns exactly two profiles — a
+    synthetic "which house/sign/ruler" summary fact (kind=
+    "profection_house", no aspects of its own, since it's a calendar fact
+    about the YEAR, not a chart point) plus the ruler's own natal profile,
+    reused verbatim from get_planet_profiles (top_n=20 there to guarantee
+    it's never excluded by that function's own score-based cap — _PLANET_
+    ATTRS+_ANGLE_ATTRS together total 18 points, so 20 always returns
+    every one of them, forced or not).
+
+    top_n is accepted for interface consistency with every other
+    get_*_profiles function, but is otherwise unused — this technique's
+    output size isn't tunable, since more of a chart's own points simply
+    aren't relevant to a single year's profected ruler."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return []
+    natal, _target_dt, age_full_years, error = _build_profection_context(
+        fields, name=fields.get("name") or "Subject"
+    )
+    if error:
+        return []
+    try:
+        house_num, sign_code, ruler_ru = _profection_house_and_ruler(natal, age_full_years)
+        sign_ru = _sign_ru(sign_code)
+        summary_profile = {
+            "kind": "profection_house",
+            "label": "Профекция",
+            "text": (
+                f"Профецированный {house_num} дом ({sign_ru}), "
+                f"управитель года — {_point_ru_from_label(ruler_ru)}"
+            ),
+            "aspects": [],
+            "stars": [],
+            "queries": [
+                f"профекция {house_num} дом", f"профекция управитель {ruler_ru}", f"профекция {sign_ru}",
+            ],
+            "score": 0.0,
+            "force_include": True,
+        }
+        # get_planet_profiles' own "label" field already has the point's
+        # unicode symbol appended (_point_ru_from_label) — comparing
+        # against the bare ruler_ru name here was a real, caught-in-
+        # testing bug (silently matched nothing, e.g. "Меркурий" never
+        # equals "Меркурий ☿"), which is why this uses the same
+        # symbol-appending helper before comparing.
+        ruler_label_with_symbol = _point_ru_from_label(ruler_ru)
+        all_profiles = get_planet_profiles(spec, top_n=20)
+        ruler_profile = next((p for p in all_profiles if p["label"] == ruler_label_with_symbol), None)
+        return [summary_profile] + ([ruler_profile] if ruler_profile else [])
+    except Exception:
+        return []
+
+
 # Registry for future operations (composite, rectification, electional
-# search, progressions, solar/lunar returns, ...) — see module docstring.
-# Not yet consumed by anything (utils/tools.py wires run_natal/run_transit/
-# run_synastry directly), but kept as the intended extension point so
-# adding another operation doesn't require inventing a new pattern.
+# search, ...) — see module docstring. Not yet consumed by anything
+# (utils/tools.py wires each run_* function directly), but kept as the
+# intended extension point so adding another operation doesn't require
+# inventing a new pattern.
 ASTRO_OPERATIONS: Dict[str, Callable[[str], str]] = {
     "natal": run_natal,
     "transit": run_transit,
     "synastry": run_synastry,
     "progression": run_progression,
+    "direction": run_direction,
+    "lunar_return": run_lunar_return,
+    "solar_return": run_solar_return,
+    "profection": run_profection,
 }

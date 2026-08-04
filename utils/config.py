@@ -80,8 +80,39 @@ DB_PATH = _resolve_path("DB_PATH", "data/chat.sqlite3")
 
 # ---------- RAG (optional) ----------
 RAG_DATA_DIR = _resolve_path("RAG_DATA_DIR", "rag_data")     # source documents (*.txt, *.pdf) — may use topic subfolders, see build_index.py
-INDEX_PATH = _resolve_path("INDEX_PATH", "data/faiss_index.bin")  # built index (build_index.py)
-META_PATH = _resolve_path("META_PATH", "data/meta.pkl")      # chunk metadata (build_index.py)
+# Per-corpus index layout: build_index.py writes one faiss_index.bin+meta.pkl
+# pair per corpus (a rag_data/ topic subfolder, or the loose files directly
+# in rag_data/ itself) under INDEX_DIR/<topic>/ — rebuilding one corpus
+# never touches, re-reads, or re-OCRs any other corpus's documents. This
+# replaced an earlier single-combined-index design once a real corpus
+# (several rag_data/ subfolders, some containing OCR-heavy .djvu/.pdf
+# scans) made a single from-scratch rebuild take hours with no visibility
+# into progress or a way to redo just the one corpus that actually changed.
+# utils/rag.py loads every corpus found under INDEX_DIR and merges their
+# retrieval results at query time (see utils/rag.py's module docstring),
+# so this is transparent to anything reading RAG results — only
+# build_index.py's own invocation changed (see its module docstring for
+# the new `python build_index.py [topic_or_path]` usage).
+INDEX_DIR = _resolve_path("INDEX_DIR", "data/rag_index")
+# Legacy single-file index — still supported as a fallback by utils/rag.py
+# if INDEX_DIR doesn't exist (e.g. an index built before per-corpus
+# indexing existed), so an already-deployed server keeps working without
+# forcing an immediate rebuild. New indexes are written under INDEX_DIR,
+# not here — these two settings exist purely for that migration path.
+INDEX_PATH = _resolve_path("INDEX_PATH", "data/faiss_index.bin")  # legacy built index (pre-per-corpus)
+META_PATH = _resolve_path("META_PATH", "data/meta.pkl")      # legacy chunk metadata (pre-per-corpus)
+# How many external processes (antiword, djvutxt, ddjvu, pdftoppm,
+# tesseract, extract_chmLib, patool, ...) build_index.py runs at once while
+# reading a corpus's source documents. This is the setting that actually
+# turns "one slow external tool after another" into overlapping work —
+# reading/OCR'ing is dominated by these subprocess calls, not by Python or
+# by the (single, already-batched) embedding step, so this is where
+# concurrency actually pays off. Matches N_THREADS' reasoning: the
+# reference i7-5500U has 2 physical cores/4 threads, so 4 concurrent
+# external processes is a reasonable default; raise it on faster/more-core
+# hardware, lower it if the machine struggles to stay responsive while
+# indexing runs.
+INDEX_CONCURRENCY = int(os.environ.get("INDEX_CONCURRENCY", "4"))
 # Multilingual by default — RAG source documents are commonly in Russian,
 # and all-MiniLM-L6-v2 (the previous default) is English-only, giving poor
 # retrieval quality on non-English text. paraphrase-multilingual-MiniLM-L12-v2

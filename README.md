@@ -31,20 +31,22 @@ utils/
                                    (generation/edit results, and caption text answers)
   tools.py                      — registry of built-in tools (datetime, calculator, astro chart, ...)
   tool_router.py                 — LLM-based classifier: does this need a tool?
-  astro.py                       — natal/transit chart computation via kerykeion (optional)
+  astro.py                       — natal/transit/progression/direction/return/profection/
+                                   synastry chart computation via kerykeion (optional)
 templates/
   index.html                  — sidebar + chat UI markup (fetch to /chat and /api/*)
 static/
   js/app.js                    — browser-side JavaScript, served at /static/js/app.js
-build_index.py             — builds the FAISS index from RAG source documents
+build_index.py             — builds one FAISS index per corpus from RAG source documents
 install/
   requirements.txt            — Python dependencies
   .env.example                 — template for .env (copy and adjust)
   ycplt.service                — systemd unit file
 models/model.gguf          — the model file (you provide it, see below)
-rag_data/                  — RAG source documents (.txt/.html/.rtf/.pdf/.doc/.djvu/.chm/.zip/.rar/.arj/.7z/.ha) — you provide them
+rag_data/                  — RAG source documents (.txt/.html/.rtf/.pdf/.doc/.djvu/.chm/.zip/.rar/.arj/.7z/.ha),
+                             organized into topic subfolders — you provide them
 data/                      — generated data:
-  faiss_index.bin, meta.pkl  — RAG index (build_index.py)
+  rag_index/<topic>/          — one faiss_index.bin+meta.pkl pair per corpus (build_index.py)
   chat.sqlite3                — conversations/messages/files (created at startup)
 ```
 
@@ -125,8 +127,8 @@ All settings are read via `python-dotenv` in `utils/config.py`. Priority
 (highest first): a real process environment variable > a value from `.env` >
 the hardcoded default.
 
-Path-valued settings (`MODEL_PATH`, `DB_PATH`, `RAG_DATA_DIR`, `INDEX_PATH`,
-`META_PATH`) may be relative or absolute. A relative value is resolved
+Path-valued settings (`MODEL_PATH`, `DB_PATH`, `RAG_DATA_DIR`, `INDEX_DIR`,
+`INDEX_PATH`, `META_PATH`) may be relative or absolute. A relative value is resolved
 against the project root (the directory containing `app.py`), not against
 the current working directory the app happens to be launched from — so
 `data/chat.sqlite3` always means the same file whether you run
@@ -149,8 +151,10 @@ Key variables:
 | `REPEAT_PENALTY` | `1.15` | Generation repetition penalty — raise if the model glitches into repeated or foreign-script text on long answers, lower toward llama-cpp-python's own default (1.1) if answers start avoiding necessary repeated terms (planet/sign names) |
 | `DB_PATH` | `data/chat.sqlite3` | Chat history database |
 | `RAG_DATA_DIR` | `rag_data` | RAG source documents folder |
-| `INDEX_PATH` | `data/faiss_index.bin` | Built FAISS index |
-| `META_PATH` | `data/meta.pkl` | RAG chunk metadata |
+| `INDEX_DIR` | `data/rag_index` | One `faiss_index.bin`+`meta.pkl` pair per corpus lives under here (build_index.py) |
+| `INDEX_PATH` | `data/faiss_index.bin` | Legacy single-index fallback only (pre-per-corpus) — see utils/rag.py |
+| `META_PATH` | `data/meta.pkl` | Legacy single-index metadata fallback only — see utils/rag.py |
+| `INDEX_CONCURRENCY` | `4` | Concurrent external processes (tesseract, antiword, ddjvu, ...) while indexing one corpus |
 | `EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers embedding model |
 | `TOP_K` | `3` | Number of RAG chunks retrieved per query |
 | `RAG_ALWAYS_INCLUDE_MAX_CHARS` | `16000` | Cap on methodology-doc auto-inclusion size (see utils/rag.py) |
@@ -456,7 +460,8 @@ Built-in tools:
   access names, so a malformed or adversarial expression just returns an
   error string instead of executing.
 - **`astro_natal_chart`** / **`astro_transit_chart`** / **`astro_progression_chart`** /
-  **`astro_synastry_chart`**
+  **`astro_direction_chart`** / **`astro_lunar_return_chart`** /
+  **`astro_solar_return_chart`** / **`astro_profection_chart`** / **`astro_synastry_chart`**
   — computes an astrological chart (planet signs/houses, aspects) via
   [kerykeion](https://github.com/g-battaglia/kerykeion) (`utils/astro.py`),
   fully offline (Swiss Ephemeris, no API key). `astro_natal_chart` computes
@@ -468,14 +473,38 @@ Built-in tools:
   overlay via `_house_of_degree`), just for a computed "progressed" moment
   instead of the real current one (`_secondary_progressed_datetime`) — for
   "what stage of life/development" style questions, as opposed to
-  transit's short-term "what's happening now"; `astro_synastry_chart`
-  compares TWO people's natal charts — for compatibility/relationship
-  questions (see its own paragraph further down for the two-person-specific
-  parts). All four require birth date, time, and place (as coordinates) to
-  already be present in the conversation — the tool descriptions explicitly
-  tell the router never to invent placeholder birth data, so if it's
-  missing the model just asks the user for it in the follow-up answer
-  instead of guessing. The argument the router extracts is meant to be a
+  transit's short-term "what's happening now"; `astro_direction_chart`
+  computes solar arc directions — EVERY natal point shifted by the SAME
+  precise arc (the angular distance the progressed Sun has moved from its
+  own natal position, reusing the progression machinery above), unlike
+  progression's per-point speeds — a precise, calculable timing technique
+  (historically used for rectification); since there's no independent
+  kerykeion chart for a "directed" moment at all, its aspects are matched
+  directly against a table of standard aspect angles
+  (`astro._ASPECT_ANGLES`) rather than via kerykeion's own `AspectsFactory`;
+  `astro_lunar_return_chart` / `astro_solar_return_chart` compute the
+  person's lunar (~monthly) / solar (~annual) return — a REAL independent
+  chart cast for the moment the Moon/Sun returns to its exact natal degree,
+  via kerykeion's own `PlanetaryReturnFactory`, read both on its own terms
+  (its own house system) and via aspects back to the natal chart, the same
+  two-sided reading synastry uses for two people's charts; both use ONLY
+  the natal birth location for the return chart (no relocation support —
+  deliberately left out for now, a real more specialized technique);
+  `astro_profection_chart` computes the current year's profection — a
+  classical technique that builds NO new ephemeris chart at all, just
+  whole-sign-per-year arithmetic from the natal Ascendant plus a classical
+  (7-planet, no outer planets) rulership lookup for the resulting sign's
+  ruling "time lord" planet — deliberately using WHOLE-SIGN houses rather
+  than the quadrant house system every other technique here uses (kerykeion's
+  natal cusps), a real, explicit fork for this one technique specifically;
+  `astro_synastry_chart` compares TWO people's natal charts — for
+  compatibility/relationship questions (see its own paragraph further down
+  for the two-person-specific parts). All eight require birth date, time,
+  and place (as coordinates) to already be present in the conversation —
+  the tool descriptions explicitly tell the router never to invent
+  placeholder birth data, so if it's missing the model just asks the user
+  for it in the follow-up answer instead of guessing. The argument the
+  router extracts is meant to be a
   verbatim quote of the birth info from the user's own message, not a
   reformatted one — `utils/astro.py` parses
   common date formats (including "5 июля 1976"), times, and coordinates
@@ -707,31 +736,65 @@ Built-in tools:
   the generation-side mitigation for the same issue). This section list is
   a proposed breakdown, not a fixed schema — `interpret.ASTRO_ANSWER_SECTIONS`
   (transit's `interpret.TRANSIT_ANSWER_SECTIONS`, progression's
-  `interpret.PROGRESSION_ANSWER_SECTIONS`, and synastry's
-  `interpret.SYNASTRY_ANSWER_SECTIONS`) are plain lists, easy to add to,
-  rename, or drop sections from. Falls back to the generic reasoning-mode
-  template if the digest step produced nothing for any of the four chart
-  types.
+  `interpret.PROGRESSION_ANSWER_SECTIONS`, direction's `interpret.
+  DIRECTION_ANSWER_SECTIONS`, the returns' `interpret.LUNAR_RETURN_
+  ANSWER_SECTIONS`/`interpret.SOLAR_RETURN_ANSWER_SECTIONS`, profection's
+  deliberately short (4, not 6-7) `interpret.PROFECTION_ANSWER_SECTIONS`
+  — astro.get_profection_profiles only ever returns two profiles, so a
+  longer section list would just pressure the model into padding thin
+  material — and synastry's `interpret.SYNASTRY_ANSWER_SECTIONS`) are
+  plain lists, easy to add to, rename, or drop sections from. Falls back
+  to the generic reasoning-mode template if the digest step produced
+  nothing for any of the eight chart types.
 
-  This is meant to keep growing rather than stay fixed at four operations
-  — `utils/astro.py`'s `ASTRO_OPERATIONS` registry is the extension point
-  for future chart types (composite charts, solar/lunar returns via
-  kerykeion's own `PlanetaryReturnFactory`, profections, event-time/
-  electional search, birth-time rectification): write one function, add
-  one registry entry, wire a new `TOOL_REGISTRY` description when there's
-  a concrete need for it. If you add a technique that needs its own
-  reference corpus (solar/lunar returns, profections —
-  each is built and interpreted differently enough that mixing their
-  methodology documents in one place risks confusing the model and
-  bloating the always-include context for every dual-chart question), give
-  it its own topic subfolder under `rag_data/` (e.g. `rag_data/astro_
-  transit/`, `rag_data/astro_synastry/`, following on from the two that
-  already exist) rather than dropping it into the existing natal-chart
-  topic — see "RAG — search over your own documents" below for how topic
-  subfolders work; a document's `always_include` methodology chunks only
-  ever pull in other chunks from that *same* topic, so keeping each
-  dual-chart technique in its own subfolder is what keeps their
-  methodologies from all activating together on every question.
+  `utils/astro.py`'s `ASTRO_OPERATIONS` registry (`natal`/`transit`/
+  `synastry`/`progression`/`direction`/`lunar_return`/`solar_return`/
+  `profection`) is the extension point for further chart types (composite
+  charts, event-time/electional search, birth-time rectification): write
+  one function, add one registry entry, wire a new `TOOL_REGISTRY`
+  description when there's a concrete need for it. Directions have no
+  independent kerykeion chart to build at all (every natal point is just
+  shifted by the same solar arc — see `astro._build_direction_subjects`),
+  so their aspects are matched directly against `astro._ASPECT_ANGLES`
+  instead of kerykeion's `AspectsFactory`, and their profiles are built by
+  bespoke code (`astro.get_direction_profiles`) rather than a call to
+  `get_dual_chart_profiles`. Lunar/solar returns DO get a real independent
+  chart (kerykeion's `PlanetaryReturnFactory` — `astro._build_return_
+  subjects` walks forward from a safely-early probe date until it finds
+  the return period actually active right now, rather than trusting a
+  single fixed search margin, since the real return period isn't exactly
+  365.25/27.3 days), so they reuse `get_dual_chart_profiles` unchanged
+  aside from a new `include_angles=True` option (added specifically for
+  this — a return chart's own Ascendant is a real, independently
+  meaningful point, unlike a moving transit moment's) plus
+  `force_include_labels` including the Ascendant. Profections build no new
+  ephemeris chart at all — see `astro._profection_house_and_ruler` and
+  `astro._CLASSICAL_RULERS_RU` — and deliberately use WHOLE-SIGN houses
+  counted from the natal Ascendant's own sign, a real, explicit fork from
+  the quadrant house system (kerykeion's natal cusps) every other
+  technique here uses, confirmed as the intended classical convention for
+  this one technique specifically rather than an inconsistency.
+
+  If you add a technique that needs its own reference corpus (each
+  dual-chart-style technique is built and interpreted differently enough
+  that mixing their methodology documents in one place risks confusing
+  the model and bloating the always-include context for every question),
+  give it its own topic subfolder under `rag_data/` (e.g. `rag_data/
+  astro_transit/`, `rag_data/astro_synastry/`, `rag_data/astro_direction/`,
+  `rag_data/astro_lunar_return/`, `rag_data/astro_solar_return/`,
+  `rag_data/astro_profection/`) rather than dropping it into the existing
+  natal-chart topic — see "RAG — search over your own documents" below for
+  how topic subfolders work; a document's `always_include` methodology
+  chunks only ever pull in other chunks from that *same* topic, so keeping
+  each technique in its own subfolder is what keeps their methodologies
+  from all activating together on every question. The four new
+  techniques' own methodology write-ups (`direction_methodology.txt`,
+  `lunar_return_methodology.txt`, `solar_return_methodology.txt`,
+  `profection_methodology.txt`) already exist and only need to be placed
+  in their matching subfolder to take effect — the filename itself isn't
+  fixed or hardcoded (see "RAG — search over your own documents" below,
+  "The filename itself isn't fixed or hardcoded anywhere"), only the
+  `_methodology` suffix matters.
 
 Adding a new tool is meant to be a small, self-contained change:
 
@@ -817,29 +880,50 @@ is unnecessary complexity for now.
    the script if missing). Archives are extracted and their contents indexed the same way as
    loose files, recursively (including archives nested inside archives, up to a small depth
    limit). Group documents into topic subfolders if you have more than one subject —
-   `rag_data/astrology/planets.txt`, `rag_data/cooking/pasta.txt`, and so
-   on — `build_index.py` walks subfolders recursively. This is one combined
-   index either way (not one per topic — there's no per-request topic
-   selector in the app, so a single index is simpler and still correct),
-   but every chunk is tagged with its topic in the index metadata, which is
-   what the methodology mechanism below relies on. Files placed directly in
-   `rag_data/` (no subfolder) just have no topic.
+   `rag_data/astrology/planets.txt`, `rag_data/cooking/pasta.txt`, and so on. Each topic
+   subfolder (plus the loose files directly in `rag_data/`, if any) is its own **corpus**,
+   with its own index file (see step 3) — not one combined index for everything. Retrieval
+   at query time still searches across every corpus in one pass regardless of topic (there's
+   no per-request topic selector in the app), but every chunk is tagged with its topic in its
+   corpus's metadata, which is what the methodology mechanism below relies on. Files placed
+   directly in `rag_data/` (no subfolder) form their own "root" corpus with topic=None.
 
-3. Build the index:
+3. Build the index(es):
 
    ```bash
-   python build_index.py
+   python build_index.py                  # build every corpus found under rag_data/
+   python build_index.py <topic>           # build only rag_data/<topic>/
+   python build_index.py root              # build only the loose files directly in rag_data/
+   python build_index.py path/to/folder    # build only that folder, wherever it is
    ```
 
-   This splits documents into chunks, computes embeddings, and saves the
-   FAISS index and metadata to `data/faiss_index.bin` and `data/meta.pkl`
-   — the same paths `utils/rag.py` reads at app startup. Re-run this any
-   time source documents change, or after changing `EMBED_MODEL` (see
-   below — embeddings from a different model aren't compatible with an
-   existing index even if the vector dimension happens to match).
+   Each corpus gets its own `faiss_index.bin`+`meta.pkl` pair under `data/rag_index/<topic>/`
+   (`data/rag_index/_root/` for the no-topic case) — `utils/rag.py` loads every corpus found
+   there at app startup and merges their retrieval results, so this is transparent to
+   anything reading RAG results. The practical payoff: re-run this for a single topic any
+   time only that topic's documents changed, instead of re-reading (and re-OCR'ing) every
+   other topic's documents too just to pick up one new file. This matters in practice — a
+   real multi-topic corpus with several OCR-heavy `.djvu`/`.pdf` scans could previously take
+   hours to rebuild from scratch with no way to redo just the one corpus that changed, and no
+   visibility into which corpus indexing was even on.
 
-4. Restart the server so it picks up the index at startup (the log will show
-   `RAG index loaded: N chunks`).
+   Reading a corpus's documents (as opposed to embedding them) is dominated by external
+   processes — antiword, djvutxt, ddjvu, pdftoppm, tesseract, extract_chmLib, patool — one
+   per document, or one pair per OCR'd page. These run **concurrently**, not one at a time:
+   `INDEX_CONCURRENCY` (default 4, `utils/config.py`) caps how many run at once. Measured on
+   a genuinely 2-core sandbox, OCR'ing an 8-page scanned PDF took 8.4s at
+   `INDEX_CONCURRENCY=1` and 4.1s at `INDEX_CONCURRENCY=2` — a ~2x speedup matching the core
+   count exactly, with no further gain past it on that hardware. Raise `INDEX_CONCURRENCY` on
+   a faster/more-core machine; lower it if indexing makes the machine unresponsive for other
+   work while it runs. This splits documents into chunks, computes embeddings (one batched
+   call per corpus — concurrency doesn't apply here, it's not the bottleneck), and saves the
+   FAISS index and metadata. Re-run for a given corpus any time its source documents change,
+   or for everything after changing `EMBED_MODEL` (see below — embeddings from a different
+   model aren't compatible with an existing index even if the vector dimension happens to
+   match).
+
+4. Restart the server so it picks up the index(es) at startup (the log will show
+   `RAG index loaded: N corpus/corpora, M chunks total`).
 
 5. Add `"use_rag": true` to a `/chat` request (no toggle in the browser UI
    yet — API/curl only):

@@ -1,8 +1,26 @@
 """Optional RAG: relevant-context search via FAISS + sentence-transformers.
 
-If the libraries aren't installed or the index (data/faiss_index.bin,
-data/meta.pkl) hasn't been built, load_rag() simply returns False and the
-app keeps working as a plain chat, without RAG.
+If the libraries aren't installed or no index has been built, load_rag()
+simply returns False and the app keeps working as a plain chat, without RAG.
+
+Per-corpus index shards:
+  build_index.py writes one faiss_index.bin+meta.pkl pair per corpus (a
+  rag_data/ topic subfolder, or the loose files directly in rag_data/)
+  under config.INDEX_DIR/<topic>/ — not one single combined index. This
+  module loads EVERY corpus found there at startup and treats them as
+  shards of one logical index: _similarity_search queries each shard
+  separately and merges the results by score before taking the global
+  top-k, and retrieve_context's always-include expansion (below) scans
+  across every shard's metadata the same way it would scan one combined
+  list. This preserves the exact same retrieval behavior as a single
+  combined index (similarity search here never was topic-scoped — see
+  build_index.py's module docstring, "Organizing documents by topic") —
+  splitting the on-disk index by corpus only changed how build_index.py
+  builds and rebuilds things, not what a query sees at runtime. If
+  config.INDEX_DIR doesn't exist (e.g. an index built before per-corpus
+  indexing existed), this falls back to loading the single legacy
+  config.INDEX_PATH/config.META_PATH pair as one shard, so an
+  already-deployed server keeps working without an immediate rebuild.
 
 Two things beyond plain top-k similarity retrieval, both driven by
 metadata build_index.py attaches to each chunk (topic, always_include):
@@ -27,22 +45,45 @@ metadata build_index.py attaches to each chunk (topic, always_include):
    model; see the project README for the fuller design discussion and what
    a dedicated reasoning model would add on top of this.
 """
+import itertools
 import os
 import pickle
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from utils import config
 
 _embed_model = None
-_faiss_index = None
-_meta: list = []
+# One (faiss_index, meta_list) pair per corpus shard — see module docstring.
+_shards: List[Tuple[Any, list]] = []
+
+
+def _discover_index_shards() -> List[Tuple[str, str]]:
+    """Every (index_path, meta_path) pair to load. New layout:
+    config.INDEX_DIR/<topic-or-"_root">/faiss_index.bin + meta.pkl — one
+    pair per corpus, built independently by build_index.py. Falls back to
+    the single legacy config.INDEX_PATH/config.META_PATH pair if INDEX_DIR
+    doesn't exist yet."""
+    shards: List[Tuple[str, str]] = []
+    if os.path.isdir(config.INDEX_DIR):
+        for name in sorted(os.listdir(config.INDEX_DIR)):
+            corpus_dir = os.path.join(config.INDEX_DIR, name)
+            index_path = os.path.join(corpus_dir, "faiss_index.bin")
+            meta_path = os.path.join(corpus_dir, "meta.pkl")
+            if os.path.isfile(index_path) and os.path.isfile(meta_path):
+                shards.append((index_path, meta_path))
+    if shards:
+        return shards
+    if os.path.exists(config.INDEX_PATH) and os.path.exists(config.META_PATH):
+        return [(config.INDEX_PATH, config.META_PATH)]
+    return []
 
 
 def load_rag() -> bool:
-    """Tries to load the index. Never raises an exception."""
-    global _embed_model, _faiss_index, _meta
+    """Tries to load every corpus shard. Never raises an exception."""
+    global _embed_model, _shards
 
-    if not (os.path.exists(config.INDEX_PATH) and os.path.exists(config.META_PATH)):
+    shard_paths = _discover_index_shards()
+    if not shard_paths:
         print("No RAG index found — running without RAG (fine for plain chat).")
         return False
 
@@ -51,38 +92,52 @@ def load_rag() -> bool:
         from sentence_transformers import SentenceTransformer
 
         _embed_model = SentenceTransformer(config.EMBED_MODEL)
-        _faiss_index = faiss.read_index(config.INDEX_PATH)
-        with open(config.META_PATH, "rb") as f:
-            _meta = pickle.load(f)
-        print(f"RAG index loaded: {len(_meta)} chunks")
+        loaded: List[Tuple[Any, list]] = []
+        for index_path, meta_path in shard_paths:
+            idx = faiss.read_index(index_path)
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+            loaded.append((idx, meta))
+        _shards = loaded
+        total_chunks = sum(len(meta) for _, meta in _shards)
+        print(f"RAG index loaded: {len(_shards)} corpus/corpora, {total_chunks} chunks total")
         return True
     except Exception as e:
         _embed_model = None
-        _faiss_index = None
-        _meta = []
+        _shards = []
         print("RAG unavailable (not fatal):", e)
         return False
 
 
 def is_available() -> bool:
-    return _faiss_index is not None and _embed_model is not None
+    return bool(_shards) and _embed_model is not None
 
 
 def _similarity_search(query: str, top_k: int) -> List[Dict[str, Any]]:
     """The plain top-k similarity lookup shared by retrieve_context (below)
     and retrieve_similarity_only — no always-include expansion here, just
-    embed the query and return the nearest chunks."""
+    embed the query and return the nearest chunks. Queries every corpus
+    shard separately (each is its own FAISS index) and merges the results
+    by score before taking the global top-k, so this behaves exactly like
+    querying one combined index across every corpus, regardless of how
+    many separate index files build_index.py actually wrote."""
     import faiss
 
     q_emb = _embed_model.encode([query], convert_to_numpy=True)
     faiss.normalize_L2(q_emb)
-    D, I = _faiss_index.search(q_emb, top_k)
 
-    results: List[Dict[str, Any]] = []
-    for idx in I[0]:
-        if 0 <= idx < len(_meta):
-            results.append(_meta[idx])
-    return results
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+    for idx, meta in _shards:
+        if idx.ntotal == 0:
+            continue
+        k = min(top_k, idx.ntotal)
+        D, I = idx.search(q_emb, k)
+        for score, pos in zip(D[0], I[0]):
+            if 0 <= pos < len(meta):
+                candidates.append((float(score), meta[pos]))
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)  # inner product on normalized vectors = cosine — higher is more similar
+    return [chunk for _, chunk in candidates[:top_k]]
 
 
 def retrieve_similarity_only(query: str, top_k: int = 2) -> List[Dict[str, Any]]:
@@ -130,7 +185,11 @@ def retrieve_context(query: str, top_k: int = config.TOP_K) -> List[Dict[str, An
 
     if topics_hit:
         always_include_chars = 0
-        for chunk in _meta:
+        # Flattened across every corpus shard — a topic can in principle
+        # only live in one shard's metadata (each corpus has one topic),
+        # but chaining them keeps this loop identical to the pre-sharding
+        # single-list version rather than needing a nested break.
+        for chunk in itertools.chain.from_iterable(meta for _, meta in _shards):
             if (
                 chunk.get("always_include")
                 and chunk.get("topic") in topics_hit

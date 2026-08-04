@@ -162,4 +162,81 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         ),
         "run": astro.run_progression,
     },
+    "astro_direction_chart": {
+        "description": (
+            "Computes SOLAR ARC DIRECTIONS ('дирекция'/'directions') for "
+            "someone's chart — EVERY natal point shifted by the SAME "
+            "precise angular arc (unlike astro_progression_chart, where "
+            "different points move at their own different speeds), a "
+            "precise, calculable timing technique. Use ONLY when the user "
+            "explicitly asks about 'дирекция'/'дирекции'/'directions' — "
+            "NOT for general current-period questions (astro_transit_"
+            "chart) or slow decades-scale development questions "
+            "(astro_progression_chart); those are different techniques "
+            "with different tools. Requires the same birth data as "
+            "astro_natal_chart, in the same free-text form (never invent "
+            "it — skip this tool if it isn't in the conversation). Only "
+            "add ';moment=YYYY-MM-DDTHH:MM' if a specific non-current "
+            "target date/age was asked about (default: right now)."
+        ),
+        "run": astro.run_direction,
+    },
+    "astro_lunar_return_chart": {
+        "description": (
+            "Computes the LUNAR RETURN ('лунар'/'lunar return') for "
+            "someone's chart — an independent chart cast for the moment "
+            "the Moon returns to its exact natal degree (roughly every "
+            "27-29 days), plus how it aspects the natal chart; for "
+            "questions about the current ~month. Use ONLY when the user "
+            "explicitly asks about 'лунар'/'lunar return' — NOT for "
+            "current transits (astro_transit_chart) or the annual solar "
+            "return (astro_solar_return_chart). Uses ONLY the natal "
+            "birth location for the return chart (no relocation support). "
+            "Requires the same birth data as astro_natal_chart, in the "
+            "same free-text form (never invent it — skip this tool if "
+            "it isn't in the conversation). Only add "
+            "';moment=YYYY-MM-DDTHH:MM' if a specific non-current moment "
+            "was asked about (default: right now)."
+        ),
+        "run": astro.run_lunar_return,
+    },
+    "astro_solar_return_chart": {
+        "description": (
+            "Computes the SOLAR RETURN ('солар'/'solar return') for "
+            "someone's chart — an independent chart cast for the moment "
+            "the Sun returns to its exact natal degree (roughly annually, "
+            "on or near the birthday), plus how it aspects the natal "
+            "chart; for questions about the current year/'year ahead'. "
+            "Use ONLY when the user explicitly asks about 'солар'/'solar "
+            "return' — NOT for current transits (astro_transit_chart) or "
+            "the monthly lunar return (astro_lunar_return_chart). Uses "
+            "ONLY the natal birth location for the return chart (no "
+            "relocation support). Requires the same birth data as "
+            "astro_natal_chart, in the same free-text form (never invent "
+            "it — skip this tool if it isn't in the conversation). Only "
+            "add ';moment=YYYY-MM-DDTHH:MM' if a specific non-current "
+            "moment/year was asked about (default: right now)."
+        ),
+        "run": astro.run_solar_return,
+    },
+    "astro_profection_chart": {
+        "description": (
+            "Computes this year's PROFECTION ('профекция'/'profection') "
+            "for someone's chart — a classical whole-sign technique: which "
+            "house/sign of the natal chart is 'activated' this year "
+            "(counting one whole sign per year of life from the natal "
+            "Ascendant), and that sign's classical ruling planet (the "
+            "year's 'time lord'). Builds no new ephemeris chart — pure "
+            "calendar+rulership arithmetic over the existing natal chart. "
+            "Use ONLY when the user explicitly asks about 'профекция'/"
+            "'profection' — NOT for current transits, progressions, or "
+            "returns (different tools/techniques). Requires the same "
+            "birth data as astro_natal_chart, in the same free-text form "
+            "(never invent it — skip this tool if it isn't in the "
+            "conversation). Only add ';moment=YYYY-MM-DDTHH:MM' if a "
+            "specific non-current age/date was asked about (default: "
+            "right now)."
+        ),
+        "run": astro.run_profection,
+    },
 }

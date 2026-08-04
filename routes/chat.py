@@ -303,6 +303,7 @@ async def _handle_chat_request(conversation_id: int, req: ChatRequest, sent_at: 
 # is) — see the tool_arg handling below for why that matters.
 _INTERPRETED_TOOL_NAMES = {
     "astro_natal_chart", "astro_transit_chart", "astro_synastry_chart", "astro_progression_chart",
+    "astro_direction_chart", "astro_lunar_return_chart", "astro_solar_return_chart", "astro_profection_chart",
 }
 
 
@@ -449,6 +450,18 @@ async def _handle_tool_request(
         elif decision.tool_name == "astro_progression_chart":
             profiles = astro.get_progression_profiles(tool_arg)
             digested = await interpret.digest_facts_async(profiles, chart_kind="progression")
+        elif decision.tool_name == "astro_direction_chart":
+            profiles = astro.get_direction_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(profiles, chart_kind="direction")
+        elif decision.tool_name == "astro_lunar_return_chart":
+            profiles = astro.get_lunar_return_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(profiles, chart_kind="lunar_return")
+        elif decision.tool_name == "astro_solar_return_chart":
+            profiles = astro.get_solar_return_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(profiles, chart_kind="solar_return")
+        elif decision.tool_name == "astro_profection_chart":
+            profiles = astro.get_profection_profiles(tool_arg)
+            digested = await interpret.digest_facts_async(profiles, chart_kind="profection")
         elif decision.tool_name == "astro_synastry_chart":
             # Both people's profiles are digested together in one combined
             # list — each profile's own "text" already names which person
@@ -493,6 +506,36 @@ async def _handle_tool_request(
             # reframed around a slow, decades-long unfolding instead of
             # transit's short current-period timescale.
             followup_prompt = interpret.build_progression_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts
+            )
+        elif digested and decision.tool_name == "astro_direction_chart":
+            # Same mechanism again, direction-specific section list/
+            # framing (see interpret.build_direction_answer_prompt) —
+            # every point moves by the SAME solar arc, unlike
+            # progression's per-point speeds.
+            followup_prompt = interpret.build_direction_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts
+            )
+        elif digested and decision.tool_name == "astro_lunar_return_chart":
+            # Same mechanism again (see interpret.build_lunar_return_
+            # answer_prompt) — a real independent monthly return chart,
+            # read both on its own terms and via aspects to natal.
+            followup_prompt = interpret.build_lunar_return_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts
+            )
+        elif digested and decision.tool_name == "astro_solar_return_chart":
+            # Same mechanism again (see interpret.build_solar_return_
+            # answer_prompt) — annual counterpart to the lunar return.
+            followup_prompt = interpret.build_solar_return_answer_prompt(
+                req.query, str(tool_result), digested, rag_contexts
+            )
+        elif digested and decision.tool_name == "astro_profection_chart":
+            # Same mechanism again (see interpret.build_profection_
+            # answer_prompt) — deliberately short section list, since
+            # astro.get_profection_profiles only ever returns two profiles
+            # (the year/ruler summary fact plus the ruler's own natal
+            # profile), not a whole chart's worth of points.
+            followup_prompt = interpret.build_profection_answer_prompt(
                 req.query, str(tool_result), digested, rag_contexts
             )
         elif digested and decision.tool_name == "astro_synastry_chart":
