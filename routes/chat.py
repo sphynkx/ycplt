@@ -47,6 +47,8 @@ from utils import intent
 from utils import interpret
 from utils import llm as llm_utils
 from utils import rag as rag_utils
+from utils import rectification
+from utils import rectification_events
 from utils import tool_router
 from utils import tools
 from utils.codeblocks import extract_code_blocks
@@ -87,13 +89,35 @@ def _auto_title(text: str, limit: int = 40) -> str:
 
 
 def _prior_user_texts(conversation_id: int, exclude_message_id: int) -> List[str]:
-    """Every prior user message in this conversation, oldest first, as a
-    plain list — the shared source both context variants below are built
-    from."""
+    """Every prior USER message in this conversation, oldest first, as a
+    plain list — feeds _extraction_history_context (utils/astro.py's
+    regex-based field extraction) only. Deliberately user-only, unlike
+    _prior_messages below: an assistant's own generated reply can contain
+    plausible-looking dates/coordinates/degrees of its own (a chart's
+    computed placements, a rectification report's "conception moment"
+    line, ...) that a naive regex extractor could otherwise misparse as
+    the user's own birth data — a real risk, not a hypothetical one, given
+    how many dates a single astro answer can contain."""
     history = repository.list_messages(conversation_id)
     return [
         m["content"] for m in history if m["role"] == "user" and m["id"] != exclude_message_id
     ]
+
+
+def _prior_messages(conversation_id: int, exclude_message_id: int) -> List[Dict]:
+    """Every prior message (BOTH roles), oldest first — used only for
+    tool_router's own classification context (_classifier_history_context)
+    and _handle_chat_request's conversational-continuity context
+    (_chat_history_block). Keeping the assistant's own replies here (unlike
+    _prior_user_texts above) is the actual fix for a real, reported
+    failure: the router used to see only past USER messages, so it had no
+    way to notice that the ASSISTANT itself had just suggested something
+    ("try a wider search window") — a short user follow-up ("давай окно
+    пошире") referring back to that suggestion looked, to the router, like
+    an unrelated message about resizing an application window, and got
+    classified as needing no tool at all."""
+    history = repository.list_messages(conversation_id)
+    return [m for m in history if m["id"] != exclude_message_id]
 
 
 # Deliberately small, for tool_router's own classification prompt
@@ -109,13 +133,61 @@ def _prior_user_texts(conversation_id: int, exclude_message_id: int) -> List[str
 # deterministic regex extraction step; it does not reliably help an LLM's
 # yes/no classification decision, so the two uses are kept separate on
 # purpose rather than sharing one "give it everything" value.
+#
+# Counts BOTH roles now (previously 4 user messages only) — including the
+# assistant's own last reply is the actual fix described in _prior_
+# messages' docstring above, and keeping the total count the same (rather
+# than 4 of each role, 8 total) keeps this consistent with the
+# already-learned "don't dump too much into this specific small-model
+# classification call" lesson.
 _CLASSIFIER_HISTORY_MAX_MESSAGES = 4
 _CLASSIFIER_HISTORY_MAX_CHARS_EACH = 300
 
 
-def _classifier_history_context(prior_texts: List[str]) -> str:
-    recent = prior_texts[-_CLASSIFIER_HISTORY_MAX_MESSAGES:]
-    return "\n".join(t[:_CLASSIFIER_HISTORY_MAX_CHARS_EACH] for t in recent)
+def _label_role(role: str) -> str:
+    return "Пользователь" if role == "user" else "Ассистент"
+
+
+def _classifier_history_context(prior_messages: List[Dict]) -> str:
+    recent = prior_messages[-_CLASSIFIER_HISTORY_MAX_MESSAGES:]
+    return "\n".join(
+        f"{_label_role(m['role'])}: {m['content'][:_CLASSIFIER_HISTORY_MAX_CHARS_EACH]}" for m in recent
+    )
+
+
+# For _handle_chat_request's plain (non-tool) reply path — separate budget
+# from the classifier's own (above), since this feeds the actual answer
+# generation rather than a cheap yes/no routing decision: a normal chat
+# reply benefits from seeing more of the recent back-and-forth than a
+# routing classifier does (see _CLASSIFIER_HISTORY_MAX_MESSAGES's own
+# comment on why MORE history made THAT specific call worse, not better —
+# that finding was about the routing decision specifically, not about
+# conversational continuity in general).
+_CHAT_HISTORY_MAX_TURNS = 6  # up to 6 user+assistant exchanges (12 messages)
+_CHAT_HISTORY_MAX_CHARS_EACH = 800
+
+
+def _chat_history_block(prior_messages: List[Dict]) -> str:
+    """Plain-text "Пользователь: .../Ассистент: ..." transcript of the
+    last few turns, or "" if this is the first message in the
+    conversation — prepended to the generation prompt in
+    _handle_chat_request so a short follow-up ("а сделай его короче",
+    "давай другой вариант") isn't generated as if it were the very first
+    message of a brand new conversation, which is what happened before
+    this existed (every /chat call built its prompt from req.query alone,
+    with no conversation history in it at all — not a context-SIZE
+    problem, since N_CTX already comfortably fits far more than this;
+    history simply was never included in the prompt to begin with)."""
+    recent = prior_messages[-(_CHAT_HISTORY_MAX_TURNS * 2):]
+    if not recent:
+        return ""
+    lines = []
+    for m in recent:
+        content = m["content"]
+        if len(content) > _CHAT_HISTORY_MAX_CHARS_EACH:
+            content = content[:_CHAT_HISTORY_MAX_CHARS_EACH].rstrip() + "…"
+        lines.append(f"{_label_role(m['role'])}: {content}")
+    return "\n".join(lines)
 
 
 def _extraction_history_context(prior_texts: List[str]) -> str:
@@ -163,9 +235,9 @@ async def chat(req: ChatRequest):
     if await intent.is_image_request_async(req.query):
         return await _handle_image_request(conversation_id, req.query)
 
-    prior_user_texts = _prior_user_texts(conversation_id, exclude_message_id=user_msg_id)
+    prior_messages = _prior_messages(conversation_id, exclude_message_id=user_msg_id)
     tool_decision = await tool_router.classify_async(
-        req.query, _classifier_history_context(prior_user_texts)
+        req.query, _classifier_history_context(prior_messages)
     )
     # Deliberately unconditional (not just when a tool fires): "the router
     # decided no tool was needed" is exactly as important to see in the
@@ -176,6 +248,7 @@ async def chat(req: ChatRequest):
         f"arg={tool_decision.tool_arg!r} raw={tool_decision.raw_answer!r}"
     )
     if tool_decision.tool_name:
+        prior_user_texts = _prior_user_texts(conversation_id, exclude_message_id=user_msg_id)
         return await _handle_tool_request(
             conversation_id,
             req,
@@ -184,7 +257,7 @@ async def chat(req: ChatRequest):
             _extraction_history_context(prior_user_texts),
         )
 
-    return await _handle_chat_request(conversation_id, req, sent_at)
+    return await _handle_chat_request(conversation_id, req, sent_at, prior_messages)
 
 
 async def _handle_image_question(
@@ -239,11 +312,34 @@ async def _handle_image_question(
     }
 
 
-async def _handle_chat_request(conversation_id: int, req: ChatRequest, sent_at: float) -> dict:
+async def _handle_chat_request(
+    conversation_id: int, req: ChatRequest, sent_at: float, prior_messages: Optional[List[Dict]] = None
+) -> dict:
+    """prior_messages (both roles, oldest first — see chat()'s own
+    _prior_messages call) is folded into the prompt via
+    _chat_history_block below so a short follow-up in the SAME
+    conversation ("а покороче", "давай другой вариант") is generated with
+    actual awareness of what was just said, not as if it were the first
+    message of a brand new conversation — a real, reported gap: every
+    /chat call used to build this prompt from req.query alone, with no
+    conversation history in it at all (not an N_CTX/context-SIZE problem;
+    history simply was never included in the prompt to begin with).
+    Optional/defaults to None (-> no history block) so any other caller
+    of this function keeps working exactly as before."""
     contexts = []
     if req.use_rag and rag_utils.is_available():
         contexts = rag_utils.retrieve_context(req.query, config.TOP_K)
     prompt = rag_utils.build_prompt(req.query, contexts)
+
+    history_block = _chat_history_block(prior_messages or [])
+    if history_block:
+        prompt = (
+            "Недавняя часть этого же диалога (для контекста — текущий "
+            "вопрос может быть коротким продолжением, ссылающимся на "
+            "неё, например \"сделай короче\" или \"а другой вариант\"; "
+            "это только фон, не отвечай на неё саму по себе):\n"
+            f"{history_block}\n\n---\n\n{prompt}"
+        )
 
     gen_start = time.time()
     try:
@@ -304,6 +400,43 @@ async def _handle_chat_request(conversation_id: int, req: ChatRequest, sent_at: 
 _INTERPRETED_TOOL_NAMES = {
     "astro_natal_chart", "astro_transit_chart", "astro_synastry_chart", "astro_progression_chart",
     "astro_direction_chart", "astro_lunar_return_chart", "astro_solar_return_chart", "astro_profection_chart",
+    # astro_rectification_trutine and astro_rectification_events
+    # deliberately have no profiles/digest step of their own (see
+    # utils/rectification.py's run_rectification_trutine docstring and
+    # utils/rectification_events.py's module docstring — there's no single
+    # chart's "significant points" to rank for either, just a ranked list
+    # of candidate birth times/scores) — both are still listed here so
+    # they get the RAG-augmented computed_chunk + reasoning-mode prompt
+    # below (falls through every `if digested and tool_name==...` branch
+    # further down straight to the generic rag_utils.build_prompt
+    # fallback, since `digested` is never set for either tool name), and
+    # so their tool_arg gets the same query+router-quote+prior-user-text
+    # concatenation as every other astro_* tool below (harmless here too:
+    # utils/rectification_events.py's own event-line parser only treats a
+    # line as an event if it matches "description: date" AND isn't a
+    # birth-data label, so stray unrelated text from concatenated prior
+    # messages is simply left as birth-field free text, same tolerance the
+    # rest of this app's field extraction already relies on).
+    "astro_rectification_trutine",
+    "astro_rectification_events",
+}
+
+# Deterministic safety net for exactly these two tools: real testing showed
+# the follow-up LLM call below doesn't just occasionally omit the computed
+# best-candidate time, it can actively INVENT a different, physically
+# implausible one in its own prose (a real observed case: the tool computed
+# one candidate, well within its search window, and the model's final answer
+# stated a materially different time nowhere near that window at all — no
+# amount of prompt reinforcement in rectification_events_methodology.txt
+# fully prevented this). Rather than keep trying to make free-form
+# generation more reliable, this makes the correct number reach the user
+# unconditionally: each function pulls its own tool's "best candidate" line
+# back out of the raw report text verbatim (see each module's own
+# extract_best_recommendation docstring), and _handle_tool_request prepends
+# it to resp_text below, ahead of whatever the model itself wrote.
+_BEST_RECOMMENDATION_EXTRACTORS = {
+    "astro_rectification_trutine": rectification.extract_best_recommendation,
+    "astro_rectification_events": rectification_events.extract_best_recommendation,
 }
 
 
@@ -583,6 +716,18 @@ async def _handle_tool_request(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка генерации: {e}")
+
+    # See _BEST_RECOMMENDATION_EXTRACTORS' own comment: for the two
+    # rectification tools, always put the tool's own actually-computed best
+    # candidate first, verbatim, ahead of the model's free-form paraphrase —
+    # this can only ever ADD the correct number to the reply, never remove
+    # or contradict anything the model itself said afterward.
+    extractor = _BEST_RECOMMENDATION_EXTRACTORS.get(decision.tool_name)
+    if extractor:
+        best_line = extractor(str(tool_result))
+        if best_line:
+            resp_text = f"**{best_line}**\n\n{resp_text}"
+
     responded_at = time.time()
     thinking_ms = int((responded_at - gen_start) * 1000)
 

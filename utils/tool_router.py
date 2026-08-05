@@ -15,12 +15,22 @@ is built from utils.tools.TOOL_REGISTRY's names and descriptions, so a new
 entry there is picked up automatically.
 
 history_context (optional, passed by routes/chat.py from recent messages
-in the same conversation) exists for tools whose required argument data —
-e.g. astro_natal_chart's birth data — was stated in an earlier message, not
-necessarily the current one ("use the birth data I gave you before"). This
-classifier only ever sees a single message otherwise, so without this it
-has no way to notice that context is available. It's kept short and
-labelled clearly as background, not as part of the current request, so the
+in the same conversation — BOTH roles, user and assistant, as a small
+labelled transcript) exists for two related reasons: tools whose required
+argument data — e.g. astro_natal_chart's birth data — was stated in an
+earlier message, not necessarily the current one ("use the birth data I
+gave you before"); and, just as importantly, recognizing a short follow-up
+that continues something the ASSISTANT itself just said or suggested
+("try a wider search window" -> user replies "давай пошире"). A real,
+reported failure showed why the assistant's own side has to be included,
+not just the user's: with only past USER messages visible, the classifier
+had no way to know the assistant had just proposed widening a
+rectification search window, so "давай окно пошире" looked like an
+unrelated remark about resizing an application window and got classified
+as needing no tool at all. This classifier only ever sees the CURRENT
+message otherwise, so without this history block it has no way to notice
+that earlier context is available at all. It's kept short and labelled
+clearly as background, not as part of the current request, so the
 classifier doesn't confuse "an earlier topic was mentioned" with "the
 current message is asking about it."
 """
@@ -48,18 +58,49 @@ class ToolDecision:
     raw_answer: str = ""
 
 
+# How much of the CURRENT message the classifier itself gets to see —
+# separate from, and independent of, whatever routes/chat.py later builds
+# as the actual tool_arg (which always uses the full, untruncated
+# req.query — see _handle_tool_request). Added after a real, reported
+# failure: a rectification request with 42 free-text life events (each a
+# whole line of date/place/coordinates/comment) came back tool=None — the
+# classifier judged "NONE" even though the very first line plainly said
+# "ректификацию". This is the exact same failure class task #95's fix
+# already addressed for HISTORY length (a small zero-shot classifier's
+# judgment measurably degrades, not improves, with more raw text in its
+# prompt) — that fix bounded history_context; this bounds the CURRENT
+# query the same way, for the same reason. The intent-bearing part of a
+# message is almost always near its start, so truncating from the end
+# (keeping the head) preserves what the classifier actually needs.
+_MAX_QUERY_CHARS = 1500
+
+
 def _build_prompt(query: str, history_context: str = "") -> str:
     tool_lines = "\n".join(
         f'- {name}: {spec["description"]}' for name, spec in TOOL_REGISTRY.items()
     )
+    display_query = query
+    if len(query) > _MAX_QUERY_CHARS:
+        display_query = (
+            query[:_MAX_QUERY_CHARS]
+            + f"\n...(сообщение обрезано для классификации, ещё {len(query) - _MAX_QUERY_CHARS} симв.)"
+        )
     context_block = ""
     if history_context:
         context_block = (
-            "\nEarlier in this same conversation, the user also wrote:\n"
+            "\nEarlier in this same conversation (both the user's and your "
+            "own — the assistant's — messages):\n"
             f'"""{history_context}"""\n'
             "(background only — use it to fill in a tool argument if the "
             "current message refers back to it, e.g. \"use what I told you "
-            "before\"; don't treat it as the current request itself)\n"
+            "before\"; ALSO use it to recognize a short follow-up that "
+            "continues something the ASSISTANT itself just said or "
+            "suggested, e.g. the assistant proposed trying a wider search "
+            "window and the user now replies \"давай пошире\"/\"let's do "
+            "that\" — route to the same tool that suggestion belongs to, "
+            "don't treat an ambiguous short reply like that as a generic "
+            "question with no tool needed; don't treat this block as the "
+            "current request itself)\n"
         )
     return f"""You are a routing assistant for a chat application with access to these tools:
 {tool_lines}
@@ -71,7 +112,7 @@ Reply with exactly one line, no other text:
   TOOL:<name>|<argument>    — for a tool that needs an argument (e.g. the
                               expression to evaluate for "calculate")
 
-Current message: "{query}"
+Current message: "{display_query}"
 Answer:"""
 
 

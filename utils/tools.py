@@ -21,6 +21,8 @@ from datetime import datetime
 from typing import Callable, Dict, TypedDict
 
 from utils import astro
+from utils import rectification
+from utils import rectification_events
 
 
 def get_current_datetime(_arg: str = "") -> str:
@@ -238,5 +240,59 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "right now)."
         ),
         "run": astro.run_profection,
+    },
+    "astro_rectification_trutine": {
+        "description": (
+            "Attempts to RECTIFY (narrow down) an UNCERTAIN/APPROXIMATE "
+            "birth time using the classical 'Trutine of Hermes' method — "
+            "searches a window of candidate birth times for the one where "
+            "the birth Ascendant and Moon best mirror the Moon and "
+            "Ascendant at conception. Use ONLY when the user explicitly "
+            "asks to rectify/determine an uncertain birth time, or "
+            "mentions 'трутина'/'trutine of hermes'/'ректификация' — NOT "
+            "for any question where the birth time is already known "
+            "exactly (use astro_natal_chart or another specific tool "
+            "instead). Needs an approximate birth DATE, a place "
+            "(coordinates), and either an approximate time (a "
+            "+/-1-hour search window is used around it) or explicit "
+            "'time_min=HH:MM;time_max=HH:MM' bounds — never invent a "
+            "made-up exact time or window; skip this tool if none of "
+            "that is present in the conversation. Optional overrides: "
+            "'gestation_days=' (default 273), 'step_minutes=' (default 1, "
+            "coarser = faster on a very wide window)."
+        ),
+        "run": rectification.run_rectification_trutine,
+    },
+    "astro_rectification_events": {
+        "description": (
+            "Attempts to RECTIFY (narrow down) an UNCERTAIN/APPROXIMATE "
+            "birth time by testing candidate times against SEVERAL KNOWN "
+            "LIFE EVENT dates (marriage, birth of a child, death, career "
+            "change, illness/surgery, move, etc.) — for each candidate "
+            "time it builds profections/progressions/directions/transits "
+            "for every event and scores how well they confirm it; the "
+            "candidate with the most confirmations across ALL events wins. "
+            "Use this (not astro_rectification_trutine) when the user "
+            "gives concrete life-event dates to rectify by, or explicitly "
+            "asks for event-based/multi-technique rectification. Needs an "
+            "approximate birth DATE, a place (coordinates), either an "
+            "approximate time (+/-1-hour window) or explicit "
+            "'time_min=HH:MM;time_max=HH:MM' bounds, AND at least one life "
+            "event — never invent any of this, skip the tool if it's "
+            "missing. Argument format: first the birth data as free text "
+            "(same as astro_natal_chart, do NOT label it with a colon, "
+            "e.g. NOT 'Дата рождения: ...'), THEN each event on its own "
+            "line, in EITHER of two formats: the short 'description: date' "
+            "(e.g. 'брак: 21.01.1983'), OR the fuller semicolon-separated "
+            "'description; date; [time]; [place]; [lat]; [lon]; "
+            "[comment]' (extra fields after the date are optional and are "
+            "simply ignored, e.g. 'Первая любовь; 1.11.1986; 12:00; "
+            "Одесса; 46n28; 30e44; заметка'). Date as DD.MM.YYYY or "
+            "YYYY-MM-DD. Copy every event line VERBATIM, one per line, "
+            "however many there are (even dozens) — never merge, "
+            "summarize, drop, or invent one. Optional overrides: "
+            "'step_minutes=' (default 10), 'window_minutes=' (default 120)."
+        ),
+        "run": rectification_events.run_rectification_events,
     },
 }

@@ -33,6 +33,8 @@ utils/
   tool_router.py                 — LLM-based classifier: does this need a tool?
   astro.py                       — natal/transit/progression/direction/return/profection/
                                    synastry chart computation via kerykeion (optional)
+  rectification.py               — birth-time rectification (Trutine of Hermes search) via kerykeion (optional)
+  rectification_events.py        — multi-technique, multi-event birth-time rectification via kerykeion (optional)
 templates/
   index.html                  — sidebar + chat UI markup (fetch to /chat and /api/*)
 static/
@@ -451,6 +453,26 @@ generic tool layer:
    (`status: "complete"`) — no schema or frontend changes were needed for
    this.
 
+**Conversation memory for plain (non-tool) replies.** A real, reported gap:
+every `/chat` call used to build its generation prompt from the current
+message alone — no prior turns of the SAME conversation were ever included,
+so a short follow-up ("а покороче", "давай другой вариант") was generated
+as if it were the very first message of a brand new conversation. This was
+never a context-window SIZE problem (`N_CTX` is already generous, see
+below) — history simply wasn't being placed into the prompt at all.
+`routes/chat.py`'s `_handle_chat_request` now prepends a short transcript
+of the last few turns (`_CHAT_HISTORY_MAX_TURNS`, default 6 exchanges,
+`_CHAT_HISTORY_MAX_CHARS_EACH`, default 800 chars per message) labelled by
+role ("Пользователь"/"Ассистент") ahead of the normal prompt. This is
+deliberately separate from — and more generous than — the tool router's
+own history budget just above: an earlier, real finding was that dumping
+a lot of history into the ROUTER's cheap yes/no classification call made
+routing measurably *worse* (a small model's attention to the actual
+current message degrades once the prompt is dominated by history, "lost
+in the middle"), but that finding was specific to that one classification
+decision, not to conversational continuity in a normal generated reply —
+so the two budgets are kept independent rather than sharing one value.
+
 Built-in tools:
 
 - **`get_current_datetime`** — current date, time, and day of week.
@@ -461,7 +483,8 @@ Built-in tools:
   error string instead of executing.
 - **`astro_natal_chart`** / **`astro_transit_chart`** / **`astro_progression_chart`** /
   **`astro_direction_chart`** / **`astro_lunar_return_chart`** /
-  **`astro_solar_return_chart`** / **`astro_profection_chart`** / **`astro_synastry_chart`**
+  **`astro_solar_return_chart`** / **`astro_profection_chart`** / **`astro_synastry_chart`** /
+  **`astro_rectification_trutine`** / **`astro_rectification_events`**
   — computes an astrological chart (planet signs/houses, aspects) via
   [kerykeion](https://github.com/g-battaglia/kerykeion) (`utils/astro.py`),
   fully offline (Swiss Ephemeris, no API key). `astro_natal_chart` computes
@@ -503,8 +526,187 @@ Built-in tools:
   and place (as coordinates) to already be present in the conversation —
   the tool descriptions explicitly tell the router never to invent
   placeholder birth data, so if it's missing the model just asks the user
-  for it in the follow-up answer instead of guessing. The argument the
-  router extracts is meant to be a
+  for it in the follow-up answer instead of guessing.
+
+  **`astro_rectification_trutine`** (`utils/rectification.py`) is
+  different from the eight above in one fundamental way: it doesn't take
+  one exact birth time at all — it takes an UNCERTAIN one (a window) and
+  SEARCHES it for the candidate birth time that best satisfies the
+  classical "Trutine of Hermes" rectification rule (as the Moon at birth,
+  so the Ascendant at conception; as the Ascendant at birth, so the Moon
+  at conception — conception estimated as a fixed number of days before
+  each candidate birth time, `gestation_days=`, default 273). It builds
+  TWO charts (birth + estimated conception) per candidate time across the
+  whole window (`step_minutes=`, default 1) and reports the several most
+  distinctly-different (not just adjacent-minute) candidates ranked by how
+  closely each one satisfies the rule, plus an explicit warning if the
+  best candidate sits right at the edge of the search window (meaning the
+  true best result is likely OUTSIDE the window that was actually
+  checked). This tool deliberately skips the digest/profile machinery
+  every other technique above goes through (see its own module docstring
+  — there's no single chart's "significant points" to rank here, just a
+  ranked list of candidate times); it goes straight into the generic
+  RAG reasoning-mode prompt (`rag_utils.build_prompt`) alongside whatever
+  the user's own indexed rectification reference corpus retrieves, which
+  fits well since that prompt already asks the model to reason step by
+  step over given facts before answering. This is deliberately the
+  simplest, fastest, single-method first step of a much larger
+  rectification vision — the second, bigger step of that vision is now
+  implemented too, see `astro_rectification_events` right below. See
+  `rectification_trutine_methodology.txt` for how to interpret
+  this tool's numeric output (what the "total mismatch" figures mean,
+  why several candidates are a normal result rather than an error, and
+  what this specific implementation simplifies away) — the classical
+  theory/history of the method itself lives in the user's own indexed
+  corpus, not in that file.
+
+  **`astro_rectification_events`** (`utils/rectification_events.py`) is the
+  multi-technique, multi-event rectification search: instead of one
+  classical rule, it takes an uncertain birth-time WINDOW plus a list of
+  known LIFE EVENTS (marriage, birth of a child, death, career change,
+  illness/surgery, move, etc. — free text, one per line, either as
+  `description: date` or the richer real-world `description; date; [time];
+  [place]; [lat]; [lon]; [comment]` — see `_try_parse_semicolon_event`;
+  fields after the date are optional and simply ignored except an optional
+  time, which IS used if given) and, for EACH candidate birth time in the window,
+  builds a profection, secondary progression, solar-arc direction, and
+  transit chart for EACH event, scoring how well each technique's moving
+  points aspect the classical "elements" (occupant planets + ruler +
+  co-ruler, per REKTIF.TXT's worked example) of the houses that event type
+  belongs to (`_EVENT_HOUSE_KEYWORDS`, a small static Russian keyword
+  dictionary — marriage -> 7th/1st house, career -> 10th/6th house, etc.).
+  Transits are weighted most heavily, profections least, matching REKTIF.TXT's
+  own emphasis ("транзиты — более мощное указание"). The candidate with
+  the highest aggregate CONFIRMATION score wins — the opposite polarity
+  from Trutine's mismatch-error score (higher is better here, not lower) —
+  and, exactly like Trutine, several genuinely different candidates are
+  reported (`_diverse_top_candidates`), never just one answer, plus the
+  same edge-of-search-window warning. Each candidate's report is broken
+  down per event and per technique, so the model (and the user) can see
+  *which* events/techniques support *which* candidate, not just a single
+  opaque score. Event lines are parsed OUT of the free-text argument
+  before the usual birth-field regex extraction runs (any line matching
+  `description: date`, unless the description looks like a birth-data
+  label such as "Дата рождения: ..." — see `_BIRTH_LABEL_EXCLUSIONS`), so
+  birth data and events can be given in any order in the same message.
+  Runs the per-candidate evaluation concurrently via `asyncio.gather` +
+  a dedicated `ThreadPoolExecutor` (`run_rectification_events_async`,
+  wrapped in a plain sync `run_rectification_events` for
+  `TOOL_REGISTRY`'s string-in/string-out contract via `asyncio.run()`) —
+  worthwhile here since a real run builds roughly `1 + 2*n_events` charts
+  per candidate, unlike Trutine's fixed two — `_effective_max_candidates`
+  shrinks the candidate count (search resolution) as the event count
+  grows instead of capping the event list itself (raised to 80 after real
+  usage), keeping total runtime bounded either way. Same
+  deliberately-no-digest, straight-into-the-generic-RAG-prompt
+  architecture as Trutine, and same documented-simplifications convention
+  — see `rectification_events_methodology.txt` for what this tool's
+  numbers mean and what it simplifies away (quadrant houses instead of
+  Koch, event-time defaults to local noon unless a per-event time was
+  given, profection's proxy scoring; event-house classification is now
+  primarily model-based rather than keyword-only — see below).
+
+  Report verbosity is ALSO adaptive (`_adaptive_report_limits` +
+  `_MAX_REPORT_CHARS` hard safety net) — fixing a real, reported crash: at
+  a fixed verbosity, a 42-event request produced a raw report alone
+  equivalent to roughly 89000 tokens, blowing straight through the
+  model's 32768-token context (`Requested tokens (89155) exceed context
+  window of 32768`) once routes/chat.py injects it as an always-include
+  RAG chunk (which has no size cap of its own for a tool's raw result —
+  see `_handle_tool_request`'s `computed_chunk`). Fewer top candidates and
+  less per-event match detail are shown as the event count grows, so the
+  report stays a bounded few-thousand-tokens regardless of how many
+  events were given, while the single most important line — the best
+  candidate's actual recommended date/time — is always present and
+  phrased as prominently as possible (`rectification_events_methodology.
+  txt` explicitly requires the model to quote it as the first sentence of
+  its answer, after a separate real failure where the model discussed
+  which house/planet mattered at length without ever stating a concrete
+  rectified time at all).
+
+  A real 42-event life history surfaced two more gaps, both fixed:
+  `_EVENT_HOUSE_KEYWORDS` was missing groups for relationship-meeting
+  ("знаком"/"встрет"/"встреч"/"познаком" -> 7th/5th), romance ("любов"/
+  "влюб"/"роман" -> 5th/7th), and broader breakup phrasing ("ушел от"/
+  "ушла от"/"разошли"/"бросил", folded into the existing divorce group),
+  plus a genuine keyword-collision bug where "Ограбление квартиры" (an
+  apartment robbery) matched the move/housing group purely because it
+  contains "квартир" — fixed by adding a dedicated theft/robbery group
+  ("ограблен"/"кража"/"грабеж"/"обокра"/"украл" -> 2nd/8th/12th) and
+  placing it BEFORE the move group so it wins the first-match check.
+  Separately, real event lists often describe one multi-stage life event
+  as several lines sharing a colon-prefixed label (e.g. "5я работа
+  (судьбоносно важна): Request to vacancy" / "...: дал свое согласие" /
+  "...: Успешное завершение испытательного срока") where only some
+  phrasings hit a keyword. `_propagate_prefix_categories` (called at the
+  end of `_extract_events_and_birth_text`) groups events by the text
+  before their `:`, and if ANY sibling in a group matched confidently, its
+  houses are propagated to the group's unmatched siblings too (tagged
+  with a `category_note` so the report shows *why* a house was assigned —
+  "определён по аналогии..." — distinct from both a direct keyword match
+  and a genuine "[неопределённая категория событий]" fallback, in both
+  `_format_candidate_block` and the event echo list). Verified against
+  the real 42-event dataset: all 42 events now classify via keyword or
+  prefix-analogy, zero fall back to the generic 1st/10th-house default.
+
+  The "ИТОГОВЫЙ ЛУЧШИЙ ВАРИАНТ" line was also repositioned: it used to
+  sit AFTER the (potentially 40+ line) event echo list, which real
+  testing showed the small local model could lose track of; it's now the
+  first substantive line of the report (right after the title/window
+  lines, before the event list) and is repeated again, verbatim, at the
+  very end of the report — bookending both ends of a potentially long
+  report is more reliable against "lost in the middle" attention behavior
+  than either position alone.
+
+  Event-house classification then moved from keyword-only to model-based:
+  the user explicitly considered keyword/substring matching unreliable in
+  principle ("нельзя предусмотреть весь перечень событий, а модель
+  справится"), accepting the added runtime cost. `_classify_event_houses_
+  llm`/`_classify_event_houses_llm_async` now ask the already-loaded chat
+  model, ONE event description at a time, which house(s) (1-12) that event
+  semantically belongs to (the prompt spells out all 12 houses' classical
+  meanings so the model reasons from real domain knowledge, not pattern-
+  matching a handful of examples), and `_apply_llm_event_classification`
+  (called once, right after the `_MAX_EVENTS` truncation, before the
+  candidate search starts — so its cost is `O(n_events)`, independent of
+  how large the search window is) overrides the keyword-based result
+  whenever the model succeeds. Runs sequentially, not concurrently — the
+  process has exactly one loaded Llama instance, so parallel dispatch
+  would only contend for it, not add throughput. The keyword dictionary
+  and prefix-propagation are NOT removed — they're the automatic fallback
+  whenever the model is unavailable or its answer doesn't parse into a
+  valid house number, so this change can only ever improve classification
+  over the old keyword-only baseline, never regress it.
+
+  Separately, a real failure showed the follow-up model doesn't just
+  sometimes omit the "ИТОГОВЫЙ ЛУЧШИЙ ВАРИАНТ"/"Лучший найденный вариант"
+  line — it can actively INVENT a different, physically implausible
+  rectified time in its own prose (observed case: the tool's actual best
+  candidate was well inside its search window, but the model's final
+  answer stated a time several hours away, outside anything the tool even
+  searched). No amount of prompt reinforcement in either methodology
+  document fully prevented this. Rather than keep tuning prompts,
+  `rectification.extract_best_recommendation` and `rectification_events.
+  extract_best_recommendation` (simple regexes over each tool's own report
+  text) let `routes/chat.py`'s `_handle_tool_request` pull the actually-
+  computed best-candidate line back out verbatim and prepend it to
+  `resp_text`, ahead of whatever the model itself generated
+  (`_BEST_RECOMMENDATION_EXTRACTORS`) — this guarantees the correct number
+  always reaches the user, independent of the small model's own
+  reliability at transcribing or reasoning about it.
+
+  Separately, `utils/tool_router.py`'s classifier now also caps how much
+  of the CURRENT message it sees (`_MAX_QUERY_CHARS`, 1500 chars, keeping
+  the head where intent usually is) — the same "less raw text in the
+  classifier's own prompt measurably improves its judgment" finding
+  `_CLASSIFIER_HISTORY_MAX_MESSAGES` already established for history,
+  applied to the current message too, after a real 42-event rectification
+  request came back `tool=None` (the classifier judged "NONE" despite the
+  very first line plainly saying "ректификацию"). This only affects the
+  classifier's own prompt — the actual tool argument construction in
+  `_handle_tool_request` always uses the full, untruncated `req.query`.
+
+  The argument the router extracts for the other eight tools is meant to be a
   verbatim quote of the birth info from the user's own message, not a
   reformatted one — `utils/astro.py` parses
   common date formats (including "5 июля 1976"), times, and coordinates
@@ -552,10 +754,17 @@ Built-in tools:
 
   Birth data mentioned earlier in the conversation (not just the current
   message) is also picked up, within limits: `routes/chat.py` hands
-  `utils/tool_router.py` a short excerpt of the last few user messages as
-  background context, specifically so "use the birth data I gave you
-  before" can still route correctly instead of silently failing because
-  the classifier only ever saw the current message in isolation.
+  `utils/tool_router.py` a short excerpt of the last few messages — BOTH
+  roles, user and assistant — as background context, specifically so "use
+  the birth data I gave you before" can still route correctly instead of
+  silently failing because the classifier only ever saw the current
+  message in isolation. Including the assistant's own recent replies (not
+  just the user's) here matters for a second, related reason: a real,
+  reported failure showed a short user follow-up ("давай окно пошире")
+  continuing something the ASSISTANT itself had just suggested (widen a
+  rectification search window) getting misrouted as "no tool needed" —
+  with only past user messages visible, the classifier had no way to know
+  what its own previous reply had proposed at all.
 
   Multi-stage RAG for natal-chart answers (`utils/interpret.py`): plain RAG
   (retrieve chunks similar to the user's whole question, paste them into
@@ -782,7 +991,9 @@ Built-in tools:
   give it its own topic subfolder under `rag_data/` (e.g. `rag_data/
   astro_transit/`, `rag_data/astro_synastry/`, `rag_data/astro_direction/`,
   `rag_data/astro_lunar_return/`, `rag_data/astro_solar_return/`,
-  `rag_data/astro_profection/`) rather than dropping it into the existing
+  `rag_data/astro_profection/`, `rag_data/astro_rectification/` for the
+  Trutine-of-Hermes reference corpus and its methodology file together)
+  rather than dropping it into the existing
   natal-chart topic — see "RAG — search over your own documents" below for
   how topic subfolders work; a document's `always_include` methodology
   chunks only ever pull in other chunks from that *same* topic, so keeping
