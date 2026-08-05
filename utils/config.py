@@ -152,6 +152,32 @@ TOP_K = int(os.environ.get("TOP_K", "3"))
 # build_index.py now warns about automatically at build time.
 RAG_ALWAYS_INCLUDE_MAX_CHARS = int(os.environ.get("RAG_ALWAYS_INCLUDE_MAX_CHARS", "16000"))
 
+# ---------- Rectification tools: optional LLM follow-up ----------
+# Whether astro_rectification_trutine/astro_rectification_events get a
+# follow-up LLM call (RAG-augmented reasoning over the tool's own computed
+# report, same mechanism every other astro_* tool uses) on top of the
+# report itself. Defaults to OFF: real testing with this project's
+# reference small model (see routes/chat.py's _NO_FOLLOWUP_TOOL_NAMES
+# comment for the full history) showed the follow-up call reliably ending
+# up CONTRADICTING the tool's own computed best-candidate time somewhere
+# in its own prose — three separate real-world tests, four layers of
+# mitigation added one at a time (prepend the correct line, a disclaimer
+# sentence, an explicit "don't contradict this" instruction in both
+# methodology documents, bookending the line at both ends of the reply),
+# none of it held up. That's a genuine reliability limit of this specific
+# small model on this specific task (consistently transcribing one exact
+# number out of a large technical report), not a wording problem worth
+# continuing to chase — so the follow-up call was removed rather than
+# mitigated further. This toggle exists so the capability isn't lost
+# outright: swap in a more capable model later, set this to true in
+# .env, and the RAG-augmented reasoning step (plus the same prepend/
+# disclaimer/bookend safety net, kept in the code specifically for this
+# toggle) comes back with no code changes needed — just re-verify the new
+# model doesn't repeat the same contradiction before trusting it.
+RECTIFICATION_LLM_FOLLOWUP = os.environ.get(
+    "RECTIFICATION_LLM_FOLLOWUP", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # ---------- Image generation service (ycplt_img, on a separate machine) ----------
 # Passive queue — see utils/image_client.py and https://github.com/sphynkx/ycplt_img
 IMAGE_SERVICE_HOST = os.environ.get("IMAGE_SERVICE_HOST", "192.168.7.7")

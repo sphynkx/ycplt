@@ -171,6 +171,7 @@ Key variables:
 | `EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers embedding model |
 | `TOP_K` | `3` | Number of RAG chunks retrieved per query |
 | `RAG_ALWAYS_INCLUDE_MAX_CHARS` | `16000` | Cap on methodology-doc auto-inclusion size (see utils/rag.py) |
+| `RECTIFICATION_LLM_FOLLOWUP` | `false` | Re-enable the RAG-augmented follow-up LLM call for the two rectification tools (off by default — see "Rectification tools" above) |
 | `HF_TOKEN` | (unset) | Optional Hugging Face Hub token (rate limit / warning) |
 | `HF_HUB_OFFLINE` | (unset) | Set to `1` once models are cached, to skip Hub network checks entirely |
 | `IMAGE_SERVICE_HOST` | `192.168.7.7` | ycplt_img host |
@@ -704,7 +705,95 @@ Built-in tools:
   `resp_text`, ahead of whatever the model itself generated
   (`_BEST_RECOMMENDATION_EXTRACTORS`) — this guarantees the correct number
   always reaches the user, independent of the small model's own
-  reliability at transcribing or reasoning about it.
+  reliability at transcribing or reasoning about it. This guarantees the
+  number is PRESENT, but a further real test showed it doesn't by itself
+  guarantee the model won't CONTRADICT it further down — one reply
+  correctly showed the prepended line (08:52) but then concluded, in its
+  own "Ответ:", that a different time (07:52, the starting/medical time)
+  was actually best. Two more layers were added on top: a one-line Russian
+  disclaimer is appended right after the prepended best-candidate line
+  ("это точное вычисленное значение; если рассуждение ниже почему-то
+  называет другое время как лучшее — доверяй именно этой строке"), so the
+  user isn't left guessing which of two disagreeing numbers to trust; and
+  both methodology documents gained an explicit "never conclude with a
+  different time than this line" instruction, as defense in depth even
+  though the disclaimer doesn't depend on the model actually following it.
+
+  That methodology-doc reinforcement did NOT hold up under further
+  testing: a following real test showed the exact same contradiction again
+  (prepended line correctly showed 08:41, model's own "Ответ:" concluded
+  "8 часов 30 минут" instead) — two reinforcement rounds failing the same
+  way means this is genuinely a limit of this small model's own
+  reliability, not a wording problem left to keep tuning. `resp_text` now
+  also bookends the correct line at the very END of the reply (after a
+  `---` separator), not just the start — mirroring the same "don't trust
+  one position, repeat it" principle already used inside the tool's own
+  report (`rectification_events.run_rectification_events_async`'s
+  `summary_line` bookending). This doesn't depend on the model behaving
+  any better than it already does; it just guarantees the actual LAST
+  thing the user reads is the correct number again, directly countering
+  "it looked right at the top, then contradicted itself at the end"
+  instead of hoping further prompt wording fixes it.
+
+  A THIRD real test still contradicted the prepended/bookended line
+  (computed 08:41, model's "Ответ:" concluded "8 часов 30 минут" instead)
+  — three consecutive real-world tests, four separate mitigation layers
+  (prepend, disclaimer, methodology-doc reinforcement, bookend), all still
+  insufficient. At this point the conclusion changed from "keep
+  mitigating the follow-up call's unreliability" to "stop making the
+  follow-up call at all": `_NO_FOLLOWUP_TOOL_NAMES` (both rectification
+  tools) makes `_handle_tool_request` return the tool's own deterministic
+  report as `resp_text` directly, right after it's computed — no RAG
+  retrieval, no digest, no `llm_utils.generate_async` call, nothing left
+  to potentially contradict the computed number, since the reply no
+  longer contains any model-generated prose at all for these two tools.
+  Only touch: the best-candidate line(s) are bolded (string `.replace()`,
+  reusing the same `_BEST_RECOMMENDATION_EXTRACTORS` functions) so a human
+  reading the raw report can still spot them at a glance. This is also
+  meaningfully faster — no generation call over what can be a ~10000-
+  character report — and `thinking_ms` for these replies now reflects the
+  actual tool computation time, not a separate (removed) generation step.
+  One real side effect, discussed with the user before making this
+  change: `rectification_trutine_methodology.txt` and `rectification_
+  events_methodology.txt` are no longer read by the app at all for these
+  two tools while the follow-up stays off (no follow-up LLM call means no
+  RAG retrieval happens) — both files stay in `install/methodologies/` as
+  standalone reference documentation. Every OTHER astro tool (natal,
+  transit, synastry, ...) is unaffected — this contradiction failure mode
+  is specific to a task that demands transcribing one exact computed
+  number consistently out of a large report, not a general problem with
+  RAG-augmented interpretation.
+
+  This is a default, not a permanent removal: `config.RECTIFICATION_LLM_
+  FOLLOWUP` (env var `RECTIFICATION_LLM_FOLLOWUP`, off by default — see
+  `install/.env.example`) gates the early-return in `_NO_FOLLOWUP_TOOL_
+  NAMES`'s check — set it to `true` and both rectification tools fall
+  through to the exact same RAG-augmented follow-up path every other
+  astro_* tool already uses, methodology documents included, with no other
+  code changes needed. The prepend/disclaimer/bookend safety net from
+  tasks #189/#192/#193 wasn't deleted, only moved to run specifically on
+  this now-optional path (right after the follow-up `generate_async`
+  call) — even a future, more capable model is worth double-checking
+  against the exact same contradiction failure mode before trusting it
+  unconditionally, and the check costs nothing when the toggle is off.
+  Turn this on only after separately re-verifying a new/larger model
+  doesn't repeat the contradiction — nothing about this toggle guarantees
+  a different model will behave better, it just makes trying one, and
+  reverting instantly if it doesn't help, a one-line `.env` change instead
+  of a code change.
+
+  Separately, a real test also showed a SECOND rectification request in a
+  conversation that already had an earlier, unrelated rectification
+  exchange in it come back `tool=None` — the identical message routed
+  correctly in a brand-new conversation with no history. `routes/chat.py`'s
+  `chat()` handler now retries the classification ONCE with `history_
+  context=""` whenever the first attempt (with history) returns no tool
+  and there IS prior conversation history, using that retry's result only
+  if it actually found a tool. This can only ever recover a tool call the
+  history diluted away — a message that already routed correctly returns
+  before this retry runs, and a short follow-up that genuinely depends on
+  history to be recognized (e.g. "давай окно пошире") would just get
+  "no tool" again on the retry too, exactly as before this fix existed.
 
   Separately, `utils/tool_router.py`'s classifier now also caps how much
   of the CURRENT message it sees (`_MAX_QUERY_CHARS`, 1500 chars, keeping

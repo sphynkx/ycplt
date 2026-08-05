@@ -247,6 +247,38 @@ async def chat(req: ChatRequest):
         f"[tool_router] tool={tool_decision.tool_name!r} "
         f"arg={tool_decision.tool_arg!r} raw={tool_decision.raw_answer!r}"
     )
+
+    if not tool_decision.tool_name and prior_messages:
+        # Real, reported failure: a second, unrelated rectification request
+        # (a different person's birth data/events) came back tool=None when
+        # sent in a conversation that already had an earlier, unrelated
+        # rectification exchange in it — the exact same brand-new message
+        # routed correctly in a fresh conversation with no history at all.
+        # This is the same "more raw text in the classifier's own prompt
+        # measurably degrades its judgment" failure class already fixed
+        # twice for OTHER causes (_CLASSIFIER_HISTORY_MAX_MESSAGES for
+        # history length, tool_router._MAX_QUERY_CHARS for the current
+        # message) — here the trigger is specifically a PRIOR tool
+        # exchange's own substantial, data-heavy content sitting in
+        # history_context. Rather than tune the history budget again (and
+        # risk breaking the short-follow-up case _classifier_history_
+        # context exists for — see that function's own docstring), retry
+        # ONCE with no history at all before giving up: this can only ever
+        # RECOVER a tool call the history diluted away, never break a case
+        # that already worked (that returns above, before this block), and
+        # can only regress a message that genuinely needs history to be
+        # recognized as needing a tool at all (e.g. "давай окно пошире")
+        # back to the same "no tool" outcome it would already have gotten
+        # without this retry, since dropping history can't manufacture a
+        # signal for a tool that isn't in the message on its own.
+        retry_decision = await tool_router.classify_async(req.query, "")
+        print(
+            f"[tool_router] retry without history: tool={retry_decision.tool_name!r} "
+            f"arg={retry_decision.tool_arg!r} raw={retry_decision.raw_answer!r}"
+        )
+        if retry_decision.tool_name:
+            tool_decision = retry_decision
+
     if tool_decision.tool_name:
         prior_user_texts = _prior_user_texts(conversation_id, exclude_message_id=user_msg_id)
         return await _handle_tool_request(
@@ -400,40 +432,62 @@ async def _handle_chat_request(
 _INTERPRETED_TOOL_NAMES = {
     "astro_natal_chart", "astro_transit_chart", "astro_synastry_chart", "astro_progression_chart",
     "astro_direction_chart", "astro_lunar_return_chart", "astro_solar_return_chart", "astro_profection_chart",
-    # astro_rectification_trutine and astro_rectification_events
-    # deliberately have no profiles/digest step of their own (see
-    # utils/rectification.py's run_rectification_trutine docstring and
-    # utils/rectification_events.py's module docstring — there's no single
-    # chart's "significant points" to rank for either, just a ranked list
-    # of candidate birth times/scores) — both are still listed here so
-    # they get the RAG-augmented computed_chunk + reasoning-mode prompt
-    # below (falls through every `if digested and tool_name==...` branch
-    # further down straight to the generic rag_utils.build_prompt
-    # fallback, since `digested` is never set for either tool name), and
-    # so their tool_arg gets the same query+router-quote+prior-user-text
-    # concatenation as every other astro_* tool below (harmless here too:
-    # utils/rectification_events.py's own event-line parser only treats a
-    # line as an event if it matches "description: date" AND isn't a
-    # birth-data label, so stray unrelated text from concatenated prior
-    # messages is simply left as birth-field free text, same tolerance the
-    # rest of this app's field extraction already relies on).
+    # astro_rectification_trutine and astro_rectification_events are listed
+    # here ONLY so their tool_arg gets the same generous query+router-quote
+    # +prior-user-text concatenation as every other astro_* tool below
+    # (harmless here too: utils/rectification_events.py's own event-line
+    # parser only treats a line as an event if it matches "description:
+    # date" AND isn't a birth-data label, so stray unrelated text from
+    # concatenated prior messages is simply left as birth-field free
+    # text). They do NOT go through the RAG-augmented reasoning-mode
+    # follow-up below at all anymore — see _NO_FOLLOWUP_TOOL_NAMES and
+    # _handle_tool_request's early-return branch for why (repeated real
+    # testing showed the follow-up LLM call reliably contradicted the
+    # tool's own computed best-candidate time somewhere in its own prose,
+    # even after four separate layers of mitigation — a genuine small-
+    # model reliability limit, not a wording problem worth continuing to
+    # chase).
     "astro_rectification_trutine",
     "astro_rectification_events",
 }
 
-# Deterministic safety net for exactly these two tools: real testing showed
-# the follow-up LLM call below doesn't just occasionally omit the computed
-# best-candidate time, it can actively INVENT a different, physically
-# implausible one in its own prose (a real observed case: the tool computed
-# one candidate, well within its search window, and the model's final answer
-# stated a materially different time nowhere near that window at all — no
-# amount of prompt reinforcement in rectification_events_methodology.txt
-# fully prevented this). Rather than keep trying to make free-form
-# generation more reliable, this makes the correct number reach the user
-# unconditionally: each function pulls its own tool's "best candidate" line
-# back out of the raw report text verbatim (see each module's own
-# extract_best_recommendation docstring), and _handle_tool_request prepends
-# it to resp_text below, ahead of whatever the model itself wrote.
+# These two tools' raw report IS the final answer by default — no
+# follow-up LLM call, unless config.RECTIFICATION_LLM_FOLLOWUP is turned
+# on in .env. Real testing across several rounds established this isn't
+# fixable by better prompting: the follow-up call would correctly quote
+# the tool's computed best-candidate time (after task #189's deterministic
+# prepend), then go on to contradict it anyway somewhere in its own
+# "Ответ" section (task #192's fix, then task #193's bookend fix, both
+# still insufficient) — three consecutive real-world tests all showed the
+# same contradiction pattern despite every mitigation tried. Skipping the
+# follow-up call by default is strictly more reliable (nothing left to
+# contradict — the reply IS the deterministic computation) and much
+# faster (no generation call over a ~10000-character report). A side
+# effect while the toggle is off: rectification_trutine_methodology.txt
+# and rectification_events_methodology.txt aren't read by the app for
+# these replies (no RAG retrieval happens without a follow-up LLM call) —
+# both files are kept as standalone reference documentation under
+# install/methodologies/, ready for when config.RECTIFICATION_LLM_FOLLOWUP
+# is turned on for a more capable model (see utils/config.py's own comment
+# on that setting) — at that point this set is simply not checked and
+# every one of these two tools' requests falls through to the same
+# RAG-augmented follow-up path every other astro_* tool already uses.
+_NO_FOLLOWUP_TOOL_NAMES = {
+    "astro_rectification_trutine",
+    "astro_rectification_events",
+}
+
+# Used to visually bold the computed best-candidate line, in two different
+# situations depending on config.RECTIFICATION_LLM_FOLLOWUP: with the
+# follow-up call off (default), it's applied directly to the raw report so
+# a human skimming it can spot the line at a glance; with the follow-up
+# call turned back on, it's the same prepend/disclaimer/bookend safety net
+# from tasks #189/#192/#193 (kept specifically for that case — see the
+# tail of _handle_tool_request), since a more capable model is still worth
+# double-checking against the same contradiction failure mode before
+# trusting it unconditionally. Kept as a small dict of per-tool extractor
+# functions since each tool's report has its own exact wording for this
+# line (see each module's own extract_best_recommendation docstring).
 _BEST_RECOMMENDATION_EXTRACTORS = {
     "astro_rectification_trutine": rectification.extract_best_recommendation,
     "astro_rectification_events": rectification_events.extract_best_recommendation,
@@ -521,6 +575,44 @@ async def _handle_tool_request(
     # what the tool actually computed — printing the raw result here is
     # what makes "why did it say X" diagnosable at all.
     print(f"[tool_request] {decision.tool_name} raw result: {tool_result!r}")
+
+    if decision.tool_name in _NO_FOLLOWUP_TOOL_NAMES and not config.RECTIFICATION_LLM_FOLLOWUP:
+        # See _NO_FOLLOWUP_TOOL_NAMES's own comment for the full rationale
+        # (three consecutive real tests, four mitigation layers, still
+        # contradicted) and utils/config.py's RECTIFICATION_LLM_FOLLOWUP
+        # comment for how to turn this back on for a more capable model.
+        # tool_result already IS the deterministic report,
+        # written for a human reader by rectification.py/rectification_
+        # events.py (Russian prose, headers, per-candidate breakdowns) —
+        # no further LLM call, no RAG retrieval, nothing left to
+        # potentially disagree with it. The only touch here is bolding the
+        # best-candidate line(s) so a human skimming a long report can
+        # still find them at a glance.
+        resp_text = str(tool_result)
+        extractor = _BEST_RECOMMENDATION_EXTRACTORS.get(decision.tool_name)
+        if extractor:
+            best_line = extractor(resp_text)
+            if best_line:
+                resp_text = resp_text.replace(best_line, f"**{best_line}**")
+
+        responded_at = time.time()
+        thinking_ms = int((responded_at - sent_at) * 1000)
+        assistant_msg_id = repository.add_message(
+            conversation_id, "assistant", resp_text, responded_at, thinking_ms
+        )
+        repository.touch_conversation(conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "query": req.query,
+            "sent_at": int(sent_at * 1000),
+            "response": resp_text,
+            "responded_at": int(responded_at * 1000),
+            "thinking_ms": thinking_ms,
+            "status": "complete",
+            "contexts_used": 0,
+            "files": [],
+            "tool_used": decision.tool_name,
+        }
 
     if (
         decision.tool_name in _INTERPRETED_TOOL_NAMES
@@ -717,16 +809,29 @@ async def _handle_tool_request(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка генерации: {e}")
 
-    # See _BEST_RECOMMENDATION_EXTRACTORS' own comment: for the two
-    # rectification tools, always put the tool's own actually-computed best
-    # candidate first, verbatim, ahead of the model's free-form paraphrase —
-    # this can only ever ADD the correct number to the reply, never remove
-    # or contradict anything the model itself said afterward.
+    # Only reachable for the two rectification tools when
+    # config.RECTIFICATION_LLM_FOLLOWUP is turned on (see
+    # _NO_FOLLOWUP_TOOL_NAMES's own comment) — restores the exact
+    # prepend/disclaimer/bookend safety net from tasks #189/#192/#193.
+    # Kept specifically for this re-enabled path: even a more capable
+    # model is worth double-checking against the same contradiction
+    # failure mode before trusting it unconditionally, and this costs
+    # nothing when it isn't needed.
     extractor = _BEST_RECOMMENDATION_EXTRACTORS.get(decision.tool_name)
     if extractor:
         best_line = extractor(str(tool_result))
         if best_line:
-            resp_text = f"**{best_line}**\n\n{resp_text}"
+            resp_text = (
+                f"**{best_line}**\n"
+                "_(это точное вычисленное значение; если рассуждение ниже "
+                "почему-то называет другое время как лучшее — доверяй "
+                "именно этой строке, а не рассуждению под ней)_\n\n"
+                f"{resp_text}\n\n"
+                "---\n"
+                "**Напоминание** (если рассуждение выше в итоге назвало "
+                "другое время — это ошибка модели, а не пересчёт; верен "
+                f"именно вычисленный результат):\n**{best_line}**"
+            )
 
     responded_at = time.time()
     thinking_ms = int((responded_at - gen_start) * 1000)
