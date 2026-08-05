@@ -44,9 +44,20 @@ install/
   requirements.txt            — Python dependencies
   .env.example                 — template for .env (copy and adjust)
   ycplt.service                — systemd unit file
+  methodologies/                — master copies of every project-authored `*_methodology.txt`
+                                  reasoning doc (interpretation, transit, synastry, progression,
+                                  direction, lunar/solar return, profection, both rectification
+                                  techniques). Not read directly by the app — copy the file(s)
+                                  relevant to a topic into that topic's `rag_data/<topic>/`
+                                  subfolder to actually activate it (see "Recommended rag_data/
+                                  layout" below); kept centrally here so there's one canonical
+                                  copy per technique instead of duplicates drifting across
+                                  several rag_data/ subfolders.
 models/model.gguf          — the model file (you provide it, see below)
 rag_data/                  — RAG source documents (.txt/.html/.rtf/.pdf/.doc/.djvu/.chm/.zip/.rar/.arj/.7z/.ha),
-                             organized into topic subfolders — you provide them
+                             organized into topic subfolders (methodology files copied in from
+                             install/methodologies/, plus your own selected reference corpus per
+                             topic — see "Recommended rag_data/ layout" below) — you provide them
 data/                      — generated data:
   rag_index/<topic>/          — one faiss_index.bin+meta.pkl pair per corpus (build_index.py)
   chat.sqlite3                — conversations/messages/files (created at startup)
@@ -890,9 +901,10 @@ Built-in tools:
   project-authored reasoning-methodology document for this technique
   (mirroring `interpretation_methodology.txt`'s own role — HOW to weigh
   house overlays/aspects/angularity into a synthesized reading, not a
-  factual planet-meaning corpus) was written separately; put it in its
-  own `rag_data/astro_synastry/` topic subfolder as a `*_methodology.txt`
-  file (see "RAG — search over your own documents" below) alongside
+  factual planet-meaning corpus) was written separately (master copy under
+  `install/methodologies/synastry_methodology.txt`); copy it into the
+  `rag_data/astro_synastry/` topic subfolder (see "Recommended `rag_data/`
+  layout" below and "RAG — search over your own documents") alongside
   whatever factual reference material you assemble for this topic.
 
   Chart coverage beyond the classical 10 planets + Ascendant/MC: houses
@@ -984,28 +996,44 @@ Built-in tools:
   technique here uses, confirmed as the intended classical convention for
   this one technique specifically rather than an inconsistency.
 
-  If you add a technique that needs its own reference corpus (each
-  dual-chart-style technique is built and interpreted differently enough
-  that mixing their methodology documents in one place risks confusing
-  the model and bloating the always-include context for every question),
-  give it its own topic subfolder under `rag_data/` (e.g. `rag_data/
-  astro_transit/`, `rag_data/astro_synastry/`, `rag_data/astro_direction/`,
-  `rag_data/astro_lunar_return/`, `rag_data/astro_solar_return/`,
-  `rag_data/astro_profection/`, `rag_data/astro_rectification/` for the
-  Trutine-of-Hermes reference corpus and its methodology file together)
-  rather than dropping it into the existing
-  natal-chart topic — see "RAG — search over your own documents" below for
-  how topic subfolders work; a document's `always_include` methodology
-  chunks only ever pull in other chunks from that *same* topic, so keeping
-  each technique in its own subfolder is what keeps their methodologies
-  from all activating together on every question. The four new
-  techniques' own methodology write-ups (`direction_methodology.txt`,
-  `lunar_return_methodology.txt`, `solar_return_methodology.txt`,
-  `profection_methodology.txt`) already exist and only need to be placed
-  in their matching subfolder to take effect — the filename itself isn't
-  fixed or hardcoded (see "RAG — search over your own documents" below,
-  "The filename itself isn't fixed or hardcoded anywhere"), only the
-  `_methodology` suffix matters.
+  **Recommended `rag_data/` layout.** Each technique's own methodology
+  write-up is maintained centrally under `install/methodologies/` (see the
+  project layout tree above) and only takes effect once copied into the
+  matching `rag_data/<topic>/` subfolder — the filename itself isn't fixed
+  or hardcoded (see "RAG — search over your own documents" below, "The
+  filename itself isn't fixed or hardcoded anywhere"), only the
+  `_methodology` suffix matters. The current recommended subfolder set —
+  fewer, broader folders than a strict one-subfolder-per-technique split —
+  is:
+
+  | `rag_data/` subfolder | methodology file(s) from `install/methodologies/` | covers |
+  |---|---|---|
+  | `astro_basics` | `interpretation_methodology.txt` | natal chart reading |
+  | `astro_transit` | `transit_methodology.txt` | transits |
+  | `astro_synastry` | `synastry_methodology.txt` | two-person compatibility |
+  | `astro_progressions` | `progression_methodology.txt`, `direction_methodology.txt`, `lunar_return_methodology.txt`, `solar_return_methodology.txt`, `profection_methodology.txt` | every timing/prognostic technique except transits |
+  | `astro_rectif` | `rectification_trutine_methodology.txt`, `rectification_events_methodology.txt` | both rectification tools |
+  | `astro_horar` | *(none yet)* | reserved for horary astrology, not implemented in this app yet — create the folder now, fill it in whenever that technique gets built |
+
+  In each subfolder, put the methodology file(s) first, then whatever
+  factual reference corpus you've selected for that topic (planet/house/
+  aspect meaning texts, classical sources, etc.) — same "methodology +
+  factual corpus, one topic subfolder" structure the rest of this section
+  describes.
+
+  One real trade-off worth knowing before adopting this layout:
+  `always_include` expansion (see "RAG — search over your own documents"
+  below) pulls in *every* methodology chunk from a topic the instant *any*
+  chunk from that topic is retrieved — so `astro_progressions` bundling
+  five techniques together means a question that only concerns, say,
+  solar returns will also inject profection's, progression's, direction's,
+  and lunar return's full methodology text alongside it (bounded by
+  `RAG_ALWAYS_INCLUDE_MAX_CHARS`, so this can't overflow the context, just
+  dilutes it with less relevant material). This was an explicit,
+  deliberate simplification over the earlier one-subfolder-per-technique
+  recommendation — split `astro_progressions` back into per-technique
+  subfolders instead if that cross-activation ever proves confusing to the
+  model in practice.
 
 Adding a new tool is meant to be a small, self-contained change:
 
@@ -1091,7 +1119,10 @@ is unnecessary complexity for now.
    the script if missing). Archives are extracted and their contents indexed the same way as
    loose files, recursively (including archives nested inside archives, up to a small depth
    limit). Group documents into topic subfolders if you have more than one subject —
-   `rag_data/astrology/planets.txt`, `rag_data/cooking/pasta.txt`, and so on. Each topic
+   `rag_data/astrology/planets.txt`, `rag_data/cooking/pasta.txt`, and so on (for this
+   project's astro subject specifically, see "Recommended `rag_data/` layout" above for the
+   current 6-subfolder scheme and which `install/methodologies/*_methodology.txt` master copy
+   goes in each). Each topic
    subfolder (plus the loose files directly in `rag_data/`, if any) is its own **corpus**,
    with its own index file (see step 3) — not one combined index for everything. Retrieval
    at query time still searches across every corpus in one pass regardless of topic (there's
