@@ -47,7 +47,7 @@ install/
   methodologies/                — master copies of every project-authored `*_methodology.txt`
                                   reasoning doc (interpretation, transit, synastry, progression,
                                   direction, lunar/solar return, profection, both rectification
-                                  techniques). Not read directly by the app — copy the file(s)
+                                  techniques, horary). Not read directly by the app — copy the file(s)
                                   relevant to a topic into that topic's `rag_data/<topic>/`
                                   subfolder to actually activate it (see "Recommended rag_data/
                                   layout" below); kept centrally here so there's one canonical
@@ -1085,6 +1085,57 @@ Built-in tools:
   technique here uses, confirmed as the intended classical convention for
   this one technique specifically rather than an inconsistency.
 
+  **`astro_horary_question`** (`utils/horary.py`) implements HORARY
+  astrology — a classical yes/no judgment cast for the exact moment and
+  place a QUESTION is asked, not a birth chart at all (radicality/validity
+  check, significators via ruler-of-house-I/quesited-house, essential
+  dignity, aspects, Moon void-of-course, translation/collection of light —
+  per Masenkov's "Построение хорарной карты" plus the general-technique
+  chapters of Lavoie's "Lose This Book..." reviewed for this feature,
+  excluding that book's lost-object-specific chapters and any Vedic
+  material). Computes the full chart deterministically, then that report
+  becomes the computed-facts context for the same RAG-augmented follow-up
+  every other astro_* tool already uses, reasoning against
+  `horary_methodology.txt` (master copy under `install/methodologies/`;
+  copy it into `rag_data/astro_horar/` — see "Recommended `rag_data/`
+  layout" below — alongside whatever horary reference material you
+  assemble for that topic) — the same one-tool-always-interpreted pattern
+  as natal/transit/synastry, no special-casing.
+
+  This replaced an earlier two-tier design (a separate always-instant,
+  never-interpreted "short verdict" tool, plus a second "give details" tool
+  the router had to be talked into picking for a follow-up) — reverted
+  after real testing (a real "who took my things" horary question) showed
+  the short-verdict-only reply left a genuinely rich, radical chart
+  completely uninterpreted unless the user knew to explicitly ask for
+  more. Real testing also showed the hard radicality veto was too blunt:
+  per Lavoie, even a non-radical chart still carries situational detail
+  worth explaining (why the matter can't/won't proceed), so a failed
+  radicality check no longer skips computation — it's carried alongside
+  the verdict as an explicit caveat for the model to present cautiously,
+  not a blank refusal to interpret the chart at all.
+
+  The rectification tools' own "small local model contradicts its own
+  tool's computed result if asked to reason freely" lesson still applies
+  here — `horary_methodology.txt`'s "authority of the computed verdict"
+  section is the prompt-side mitigation, and `utils/horary.py`'s own
+  `ИТОГОВЫЙ ВЕРДИКТ` bookend (`extract_best_recommendation`, registered in
+  `_BEST_RECOMMENDATION_EXTRACTORS`) is the matching code-side prepend/
+  disclaimer/bookend safety net — always active here (unlike
+  rectification's equivalent, which is gated behind
+  `RECTIFICATION_LLM_FOLLOWUP`), since the user explicitly wants this
+  follow-up call on for horary regardless of model capability.
+
+  Known v1 scope limits (see `utils/horary.py`'s own module docstring for
+  the full list): the "quesited house" is resolved by a single-hop
+  keyword classification (`_TOPIC_HOUSE_KEYWORDS`, same
+  accepted-approximation spirit as `astro_rectification_events`'
+  `_EVENT_HOUSE_KEYWORDS`) or an explicit `house=N` override — Masenkov's
+  full multi-hop "derived house" chain method (e.g. "my cousin's dog") is
+  not implemented; essential dignity only covers the 7 classical planets
+    (Uranus/Neptune/Pluto predate the system and have none, by design, not
+    a gap).
+
   **Recommended `rag_data/` layout.** Each technique's own methodology
   write-up is maintained centrally under `install/methodologies/` (see the
   project layout tree above) and only takes effect once copied into the
@@ -1102,7 +1153,7 @@ Built-in tools:
   | `astro_synastry` | `synastry_methodology.txt` | two-person compatibility |
   | `astro_progressions` | `progression_methodology.txt`, `direction_methodology.txt`, `lunar_return_methodology.txt`, `solar_return_methodology.txt`, `profection_methodology.txt` | every timing/prognostic technique except transits |
   | `astro_rectif` | `rectification_trutine_methodology.txt`, `rectification_events_methodology.txt` | both rectification tools |
-  | `astro_horar` | *(none yet)* | reserved for horary astrology, not implemented in this app yet — create the folder now, fill it in whenever that technique gets built |
+  | `astro_horar` | `horary_methodology.txt` | horary questions (`astro_horary_question`'s reasoning step) |
 
   In each subfolder, put the methodology file(s) first, then whatever
   factual reference corpus you've selected for that topic (planet/house/

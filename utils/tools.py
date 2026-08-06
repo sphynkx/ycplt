@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Callable, Dict, TypedDict
 
 from utils import astro
+from utils import horary
 from utils import rectification
 from utils import rectification_events
 
@@ -294,5 +295,30 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "'step_minutes=' (default 10), 'window_minutes=' (default 120)."
         ),
         "run": rectification_events.run_rectification_events,
+    },
+    "astro_horary_question": {
+        "description": (
+            "Answers a HORARY question (хорар/хорарный вопрос) — a classical "
+            "yes/or/no astrological judgment cast for the exact moment and "
+            "place the question itself was asked (NOT a birth chart). Use "
+            "this for any horary question — e.g. 'will she call me back', "
+            "'should I take this job', 'will we sell the house this year', "
+            "'who took my things' — including a follow-up asking to explain "
+            "a verdict already given earlier in this conversation (this "
+            "tool always gives a full reasoned explanation, not just a bare "
+            "Да/Нет, so re-running it also works for 'почему'/'объясни'-"
+            "style follow-ups). Never invent the moment/place; if the exact "
+            "date, time, and place the question is being asked (or was "
+            "asked) aren't given, ask for them instead of using this tool "
+            "with guessed data. Argument: the question's date, time, and "
+            "place/coordinates in free text (same tolerant parsing as "
+            "astro_natal_chart — copy as written, don't reformat), plus the "
+            "question itself in the same text (used only to guess which "
+            "house the question is about — love/marriage, career, money, "
+            "health, a lost/stolen object, etc.). Optional 'house=N' (1-12) "
+            "to state the relevant house explicitly instead of relying on "
+            "that guess. If no explicit moment is given, assume right now."
+        ),
+        "run": horary.run_horary_question,
     },
 }

@@ -42,6 +42,7 @@ from pydantic import BaseModel
 from db import repository
 from utils import astro
 from utils import config
+from utils import horary
 from utils import image_client
 from utils import intent
 from utils import interpret
@@ -276,7 +277,32 @@ async def chat(req: ChatRequest):
             f"[tool_router] retry without history: tool={retry_decision.tool_name!r} "
             f"arg={retry_decision.tool_arg!r} raw={retry_decision.raw_answer!r}"
         )
-        if retry_decision.tool_name:
+        # Only trust the retry if it ALSO found real argument content in the
+        # bare message itself (or the tool genuinely takes none, e.g.
+        # get_current_datetime) — real, reported failure: a horary
+        # follow-up message with no new moment/place in it at all ("Вердикт
+        # Нет значит вещи не найдутся?") still matched astro_horary_question
+        # on intent alone once history was dropped (that tool's own
+        # description deliberately tells the classifier a "why"/"explain"-
+        # style follow-up belongs to it too, so the SAME re-explanation
+        # request routes back to it — see utils/horary.py), but came back
+        # with an EMPTY tool_arg, and _handle_tool_request's concatenation
+        # then silently pulled in whatever chart data happened to be
+        # sitting in the surrounding conversation history instead — a
+        # DIFFERENT, unrelated horary question from earlier in the same
+        # chat, producing a confidently-worded but completely wrong reply.
+        # The original rectification bug this retry exists for isn't broken
+        # by this extra check: that failure was always a genuinely
+        # self-contained new request (full birth data + event list quoted
+        # in the message itself), so the retry's own tool_arg was already
+        # non-empty in that case — this only rejects the specific pattern
+        # where the retry re-derived a tool from bare intent with nothing
+        # concrete behind it, which dropping history can never fix (see the
+        # comment above this block for why retrying can only recover a
+        # signal, never manufacture missing data).
+        if retry_decision.tool_name and (
+            retry_decision.tool_arg.strip() or retry_decision.tool_name == "get_current_datetime"
+        ):
             tool_decision = retry_decision
 
     if tool_decision.tool_name:
@@ -449,6 +475,16 @@ _INTERPRETED_TOOL_NAMES = {
     # chase).
     "astro_rectification_trutine",
     "astro_rectification_events",
+    # astro_horary_question — same tool_arg-concatenation reason, and it
+    # DOES reach the RAG-augmented follow-up below every time (no
+    # no-followup bypass, unlike the two rectification tools above): an
+    # earlier two-tier design (an always-instant, never-interpreted "short
+    # verdict" tool, with a second "give details" tool for follow-ups) was
+    # reverted after real testing showed the short-verdict-only reply left
+    # a genuinely rich, radical chart completely uninterpreted unless the
+    # user knew to explicitly ask for more — see utils/horary.py's module
+    # docstring for the full story.
+    "astro_horary_question",
 }
 
 # These two tools' raw report IS the final answer by default — no
@@ -491,6 +527,7 @@ _NO_FOLLOWUP_TOOL_NAMES = {
 _BEST_RECOMMENDATION_EXTRACTORS = {
     "astro_rectification_trutine": rectification.extract_best_recommendation,
     "astro_rectification_events": rectification_events.extract_best_recommendation,
+    "astro_horary_question": horary.extract_best_recommendation,
 }
 
 
@@ -581,6 +618,9 @@ async def _handle_tool_request(
         # (three consecutive real tests, four mitigation layers, still
         # contradicted) and utils/config.py's RECTIFICATION_LLM_FOLLOWUP
         # comment for how to turn this back on for a more capable model.
+        # astro_horary_question is NOT gated by this branch at all (see
+        # _INTERPRETED_TOOL_NAMES' own comment on it) — it always reaches
+        # the RAG-augmented follow-up below instead.
         # tool_result already IS the deterministic report,
         # written for a human reader by rectification.py/rectification_
         # events.py (Russian prose, headers, per-candidate breakdowns) —
@@ -809,27 +849,29 @@ async def _handle_tool_request(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка генерации: {e}")
 
-    # Only reachable for the two rectification tools when
+    # Reachable for the two rectification tools only when
     # config.RECTIFICATION_LLM_FOLLOWUP is turned on (see
-    # _NO_FOLLOWUP_TOOL_NAMES's own comment) — restores the exact
-    # prepend/disclaimer/bookend safety net from tasks #189/#192/#193.
-    # Kept specifically for this re-enabled path: even a more capable
-    # model is worth double-checking against the same contradiction
-    # failure mode before trusting it unconditionally, and this costs
-    # nothing when it isn't needed.
+    # _NO_FOLLOWUP_TOOL_NAMES's own comment), and unconditionally for
+    # astro_horary_question (which has no no-followup bypass at all — see
+    # _INTERPRETED_TOOL_NAMES' own comment on it). Restores the exact
+    # prepend/disclaimer/bookend safety net from tasks #189/#192/#193 for
+    # whichever tool this ends up being: even a more capable model is
+    # worth double-checking against the same "small model contradicts its
+    # own tool's computed result" failure mode before trusting it
+    # unconditionally, and this costs nothing when it isn't needed.
     extractor = _BEST_RECOMMENDATION_EXTRACTORS.get(decision.tool_name)
     if extractor:
         best_line = extractor(str(tool_result))
         if best_line:
             resp_text = (
                 f"**{best_line}**\n"
-                "_(это точное вычисленное значение; если рассуждение ниже "
-                "почему-то называет другое время как лучшее — доверяй "
+                "_(это точный вычисленный результат; если рассуждение ниже "
+                "почему-то называет другой ответ как верный — доверяй "
                 "именно этой строке, а не рассуждению под ней)_\n\n"
                 f"{resp_text}\n\n"
                 "---\n"
                 "**Напоминание** (если рассуждение выше в итоге назвало "
-                "другое время — это ошибка модели, а не пересчёт; верен "
+                "другой ответ — это ошибка модели, а не пересчёт; верен "
                 f"именно вычисленный результат):\n**{best_line}**"
             )
 
