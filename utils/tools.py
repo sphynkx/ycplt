@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Callable, Dict, TypedDict
 
 from utils import astro
+from utils import electional
 from utils import horary
 from utils import rectification
 from utils import rectification_events
@@ -320,5 +321,38 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "that guess. If no explicit moment is given, assume right now."
         ),
         "run": horary.run_horary_question,
+    },
+    "astro_electional_chart": {
+        "description": (
+            "Электива/элективная астрология — TWO modes, auto-detected "
+            "from the wording (never decide this yourself, the tool's own "
+            "model does): (1) EVALUATE a single PROPOSED moment already "
+            "chosen by the user for a stated PURPOSE — e.g. 'подходит ли "
+            "6 августа в 15:00 для подписания договора' (structurally the "
+            "reverse of astro_horary_question: that reads an already-"
+            "fixed moment against a QUESTION, this reads a user-PROPOSED "
+            "moment against a stated ACTIVITY — do NOT use this for a "
+            "horary yes/no question about something that will happen on "
+            "its own); (2) SEARCH for the best moment when no specific "
+            "candidate is named — e.g. 'когда лучше подписывать договор', "
+            "'на какой день лучше запланировать переезд' — this tool "
+            "scans forward from the nearest named date (or right now) "
+            "and returns the single best moment it found, not a bare "
+            "yes/no on one guess. Never invent the moment/place; if no "
+            "place is given at all, ask for it instead of using this tool "
+            "with guessed data (a specific moment IS optional for the "
+            "search mode — only place and purpose are required there). "
+            "Argument: whatever date/time/place was named, as written "
+            "(same tolerant parsing as astro_natal_chart — copy as "
+            "written, don't reformat; may be absent for a pure search "
+            "request), plus the stated purpose/activity (used to classify "
+            "which classical category — marriage, contract, travel, "
+            "surgery, household chores, etc. — applies), plus, for a "
+            "search, any explicitly named search window/end date if one "
+            "was given (e.g. 'в течение месяца', 'до конца сентября', 'в "
+            "диапазоне года') — copy that phrasing as written too, don't "
+            "convert it yourself."
+        ),
+        "run": electional.run_electional_chart,
     },
 }

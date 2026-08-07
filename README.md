@@ -1186,6 +1186,148 @@ Built-in tools:
   "significant" aspect and force a negative verdict by default (neither
   favorable nor hard in this module's own classification).
 
+  **`astro_electional_chart`** (`utils/electional.py`) implements ELECTIONAL
+  astrology — the inverse of horary: instead of reading a fixed moment
+  against a QUESTION, it reads a user-PROPOSED moment against a stated
+  PURPOSE (sign a contract, marry, travel, undergo surgery, launch a
+  business, ...), judging whether that moment is a good time to start the
+  thing. Per Andreeva's "Элективная астрология" (planetary-hour doctrine,
+  per-hour recommend/avoid lists per activity, Moon-by-sign/-house transit
+  meanings) and Scofield's "Being On Time" (lunar-phase rules, Mercury
+  retrograde doctrine, diurnal-cycle concept) — deliberately excludes the
+  Vedic muhurta (panchanga: tithi/nakshatra/yoga/karana) system and Pavel
+  Globa's lecture material entirely, per explicit instruction, not merely
+  out of scope; don't reintroduce either even as supplementary reference
+  material.
+
+  It reuses horary's proven apparatus — querent/quesited significators,
+  essential dignity, the classical-aspects-only restriction, Via Combusta/
+  combustion/besiegement — duplicated rather than imported from
+  `utils/horary.py` (same "avoid coupling two independently-evolving,
+  separately-tested modules" reasoning already applied to `astro.py`'s own
+  copy of the LLM-first field-extraction pattern), and adds electional-
+  specific computation: real planetary-hour calculation (Chaldean order,
+  via `swe.rise_trans` sunrise/sunset, correctly spanning the sunset/
+  sunrise boundary and anchored to the correct local weekday), Moon-phase
+  scoring, and a purpose category classified by the model (LLM-first,
+  keyword fallback) into a fixed enum — the category-to-house/planet
+  mapping itself is a plain Python dict lookup (`_CATEGORY_TABLE`), never
+  left to the model to compute. Unlike horary's binary radical/non-radical
+  cascade, the verdict is a signed point-tally across all these factors,
+  with Moon void-of-course as a hard override to "неблагоприятно"
+  regardless of score — same unconditional-negative precedent as horary's
+  own Moon-void handling.
+
+  Two request modes, classified by `_classify_request_mode` (LLM-first,
+  no regex fallback of its own — see below): a "single" request
+  ("подходит ли момент X для дела Y") judges exactly the named moment
+  directly; a "range" request ("на какой день лучше...") scans forward
+  hour-by-hour from the nearest named moment (or right now, if none was
+  given) across a window — 30 days by default, or an explicit length/end
+  date the user names ("в течение 60 дней", "до конца сентября" —
+  `_extract_window_days_llm` has the model extract only a plain unit
+  count or a literal calendar date and does the actual date-difference
+  ARITHMETIC in Python, never trusting the model with it, same
+  never-let-the-LLM-compute-a-fact-it-could-get-wrong rule as everywhere
+  else in this app) — evaluating every candidate hour and keeping the
+  single best one. Ranking is three-tiered, not flat score: never a
+  Moon-void candidate over a non-void one (hard override, same as the
+  single-moment path); then by VERDICT CATEGORY first (благоприятно beats
+  смешанно beats неблагоприятно — `_VERDICT_RANK`); only within the same
+  verdict does the raw point score break a tie, with earliest-of-equal
+  winning after that. This was a real correction: ranking by flat score
+  alone let a "смешанно" moment with an unusually high score outrank a
+  genuinely "благоприятно" one — the qualitative presence of favorable
+  indicators has to decide first, exactly because (per real corpus
+  research — see below) the point-tally itself has no classical citation
+  for comparing calendar dates against each other; it's this module's own
+  engineering device for ranking candidates, and the report/methodology
+  text says so explicitly rather than letting the model attribute it to
+  a source.
+
+  The range-mode report headlines a deterministic `ИТОГОВЫЙ ЛУЧШИЙ
+  МОМЕНТ: <date> <time>` bookend line (top AND bottom of the report,
+  extracted by `extract_best_recommendation`) — mirroring
+  `rectification_events.py`'s own "ИТОГОВЫЙ ЛУЧШИЙ ВАРИАНТ ВРЕМЕНИ
+  РОЖДЕНИЯ" bookend exactly, same reasoning: the headline fact a search
+  produces is a concrete DATE, not a favorable/unfavorable label, and a
+  small local model can otherwise omit or invent a different one in its
+  own free prose. Real testing caught the underlying bug this whole
+  design replaced: a "на какой день лучше" question used to have whatever
+  date/time was in the message (typically just the moment the question
+  was asked) silently evaluated as if it were the user's own proposed
+  moment, producing a confident-looking but meaningless single-moment
+  verdict instead of a real search.
+
+  A real corpus-research pass (OCR'ing three previously-unread scanned
+  PDFs — Li Liman, Robson, Tsypin's "Основы элективной астрологии") also
+  corrected the category→house table: household/domestic chores
+  (cleaning, laundry, small repairs) now map to house IV, not house I —
+  Tsypin names IV explicitly "Дом результатов" for household-type
+  elections, and Robson's general principle is "house = ruled by the
+  election's subject matter", not "house I for any beginning". House I
+  remains the true fallback for a genuinely uncategorizable "начинание",
+  and is separately noted (per Li Liman) as a universal supporting
+  significator alongside whichever topical house applies, not a
+  replacement for one.
+
+  Every `astro_*` tool's RAG-augmented follow-up now also passes a
+  `topic_hint` into `rag_utils.retrieve_context` (see `_TOOL_TOPIC` in
+  `routes/chat.py`) naming its own `rag_data/` subfolder, guaranteeing
+  that tool's own methodology is included even when the user's free-text
+  wording doesn't happen to score a similarity hit against it — plain
+  top-k similarity search alone isn't topic-scoped (by design — see
+  `utils/rag.py`'s own docstring) and a mundane electional query like "на
+  какой день лучше убираться в комнате" was found in practice to lose
+  the similarity race entirely to an unrelated topic's methodology
+  (surfacing as a spurious "natal chart" mention in an electional
+  answer), even with `rag_data/astro_elect/` fully indexed.
+
+  Two later, explicitly user-requested additions on top of the above,
+  both purely additive:
+
+  - **Day-of-week ruler checklist.** `compute_planetary_hour` already
+    computed BOTH the day ruler and the hour ruler, but only the hour
+    ruler was scored against each category's sympathetic/avoid sets — the
+    day ruler was displayed and otherwise ignored. It now gets the exact
+    same +/-1 check the hour ruler already got (Andreeva's own per-planet
+    recommendations cover both the day and the hour, not two separate
+    schemes), applied independently, not as a fallback for a missing hour
+    ruler.
+  - **Querent's own natal chart, when one exists earlier in the SAME
+    conversation.** If the querent already had an `astro_natal_chart`
+    request answered earlier in this conversation, `run_electional_chart`
+    now also checks real transits from EVERY candidate moment to that
+    specific person's own natal Sun/Moon/Ascendant (favorable Jupiter/
+    Venus aspects score +1, hard Mars/Saturn squares/oppositions score
+    -1) — on top of, never instead of, the generic house-I/house-of-the-
+    matter significators every election already checks. This needed the
+    FULL prior conversation, not just the current election's own
+    round-scoped text (an earlier natal-chart request is its own separate
+    round by `_classify_new_electional_round`'s own design, so it's
+    normally invisible to this tool) — `routes/chat.py` appends it after
+    a dedicated `electional.HISTORY_MARKER` delimiter, past whatever
+    round-scoped `tool_arg` it already built, rather than widening the
+    round-scoped extraction prompts themselves (same "single string,
+    clearly-delimited sections" convention `rectification_events.py`
+    already uses for birth data + event lines). A dedicated LLM lookup
+    (`_extract_querent_natal_fields_llm`) over that history section looks
+    specifically for the QUERENT's own birth data — not the election's
+    own moment/place, and not another person's data — and silently does
+    nothing when none is found, which is the common case. Doubles the
+    per-candidate ephemeris cost for a range search when it does apply
+    (an extra `AspectsFactory.dual_chart_aspects` call per hour), accepted
+    as a real but bounded cost the same way the window-size ceiling
+    already accepts an up-to-370-day hourly scan as worthwhile.
+
+  Known v1 scope limits (see `utils/electional.py`'s own module docstring):
+  one house per activity category; no Vronsky-style marriage degree-
+  tables, no lunar-day (тити) system, no body-part-specific Moon-sign
+  check for medical elections, no muhurta, no religious/church calendar.
+  Master methodology copy under `install/methodologies/`; copy it into
+  `rag_data/astro_elect/` — again, without the muhurta or Globa source
+  files, even as reference material for the corpus.
+
   **Recommended `rag_data/` layout.** Each technique's own methodology
   write-up is maintained centrally under `install/methodologies/` (see the
   project layout tree above) and only takes effect once copied into the
@@ -1204,6 +1346,7 @@ Built-in tools:
   | `astro_progressions` | `progression_methodology.txt`, `direction_methodology.txt`, `lunar_return_methodology.txt`, `solar_return_methodology.txt`, `profection_methodology.txt` | every timing/prognostic technique except transits |
   | `astro_rectif` | `rectification_trutine_methodology.txt`, `rectification_events_methodology.txt` | both rectification tools |
   | `astro_horar` | `horary_methodology.txt` | horary questions (`astro_horary_question`'s reasoning step) |
+  | `astro_elect` | `electional_methodology.txt` | electional astrology (`astro_electional_chart`'s reasoning step) — deliberately excludes Vedic muhurta and Globa's lecture material from the source corpus, per explicit design decision; don't add those files to this subfolder even as reference texts |
 
   In each subfolder, put the methodology file(s) first, then whatever
   factual reference corpus you've selected for that topic (planet/house/

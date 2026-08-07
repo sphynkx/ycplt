@@ -42,6 +42,7 @@ from pydantic import BaseModel
 from db import repository
 from utils import astro
 from utils import config
+from utils import electional
 from utils import horary
 from utils import image_client
 from utils import intent
@@ -486,6 +487,42 @@ _INTERPRETED_TOOL_NAMES = {
     # user knew to explicitly ask for more — see utils/horary.py's module
     # docstring for the full story.
     "astro_horary_question",
+    # astro_electional_chart — same tool_arg-concatenation reason and the
+    # same per-round place/purpose isolation as astro_horary_question just
+    # below (two different elections asked back to back must not silently
+    # share a place or purpose any more than two different horary
+    # questions should) — DOES reach the RAG-augmented follow-up below
+    # every time, same as horary, for the same reason: a bare "answer
+    # naturally" prompt over the raw computed report alone would never see
+    # electional_methodology.txt at all.
+    "astro_electional_chart",
+}
+
+# tool_name -> rag_data/ subfolder name, per README's "Recommended
+# rag_data/ layout" table. Passed as retrieve_context's topic_hint so the
+# right technique's methodology is guaranteed present in the RAG-augmented
+# follow-up regardless of whether the user's free-text query happened to
+# score a similarity hit against it — see retrieve_context's own docstring
+# for why plain similarity search alone isn't enough here (the electional
+# tool's "natal chart" mention bug: a mundane query shares no vocabulary
+# with electional_methodology.txt's astrological terms, so it lost the
+# similarity race to a different topic entirely, and that unrelated
+# topic's own methodology got pulled in instead with no warning). Every
+# _INTERPRETED_TOOL_NAMES entry that actually reaches the RAG follow-up
+# below should have an entry here — the two rectification tools are
+# deliberately omitted since they never reach it (see
+# _NO_FOLLOWUP_TOOL_NAMES).
+_TOOL_TOPIC: Dict[str, str] = {
+    "astro_natal_chart": "astro_basics",
+    "astro_transit_chart": "astro_transit",
+    "astro_synastry_chart": "astro_synastry",
+    "astro_progression_chart": "astro_progressions",
+    "astro_direction_chart": "astro_progressions",
+    "astro_lunar_return_chart": "astro_progressions",
+    "astro_solar_return_chart": "astro_progressions",
+    "astro_profection_chart": "astro_progressions",
+    "astro_horary_question": "astro_horar",
+    "astro_electional_chart": "astro_elect",
 }
 
 # These two tools' raw report IS the final answer by default — no
@@ -529,6 +566,7 @@ _BEST_RECOMMENDATION_EXTRACTORS = {
     "astro_rectification_trutine": rectification.extract_best_recommendation,
     "astro_rectification_events": rectification_events.extract_best_recommendation,
     "astro_horary_question": horary.extract_best_recommendation,
+    "astro_electional_chart": electional.extract_best_recommendation,
 }
 
 
@@ -644,6 +682,52 @@ async def _handle_tool_request(
                     tool_arg = narrow_arg
                 # else: keep the full union already built above as a last resort.
 
+    if decision.tool_name == "astro_electional_chart":
+        # Same round-isolation mechanism as astro_horary_question just
+        # above, for the same reason: each election has its OWN moment and
+        # purpose, and reusing horary's proven _classify_new_horary_round-
+        # style approach here (utils/electional.py's own
+        # _classify_new_electional_round/_collect_current_round_texts)
+        # avoids repeating that class of bug rather than waiting to
+        # rediscover it independently for this tool too.
+        current_turn = "\n".join(filter(None, [req.query, decision.tool_arg]))
+        prior_texts = prior_user_texts or []
+        is_new = await loop.run_in_executor(None, electional._classify_new_electional_round, req.query)
+        if is_new is True:
+            tool_arg = current_turn
+        elif is_new is False:
+            round_texts = await loop.run_in_executor(
+                None, electional._collect_current_round_texts, prior_texts
+            )
+            tool_arg = "\n".join(filter(None, round_texts + [current_turn]))
+        else:
+            _, missing_current = await loop.run_in_executor(None, astro._extract_fields, current_turn)
+            if not missing_current:
+                tool_arg = current_turn
+            else:
+                immediate_prior = prior_texts[-1] if prior_texts else ""
+                narrow_arg = "\n".join(filter(None, [current_turn, immediate_prior]))
+                _, missing_narrow = await loop.run_in_executor(None, astro._extract_fields, narrow_arg)
+                if not missing_narrow:
+                    tool_arg = narrow_arg
+                # else: keep the full union already built above as a last resort.
+
+        # User-requested improvement: if the querent's OWN natal chart was
+        # built earlier in this same conversation (e.g. an astro_natal_chart
+        # request before this election), utils/electional.py can also check
+        # real transits from each candidate moment to that person's own
+        # natal Sun/Moon/Ascendant, on top of the generic significators
+        # every election already checks. That lookup needs the FULL prior
+        # conversation (an earlier natal-chart round is a round boundary
+        # for _collect_current_round_texts above, so it's excluded from
+        # tool_arg by design) — appended here, past a clearly-delimited
+        # marker, rather than widening the round-scoped tool_arg itself
+        # (see utils/electional.py's HISTORY_MARKER for why). A no-op when
+        # there's no prior conversation at all (the common case for a
+        # first-message election).
+        if prior_texts:
+            tool_arg = tool_arg + electional.HISTORY_MARKER + "\n".join(prior_texts)
+
     # Synastry-only hybrid extraction: try the plain deterministic
     # heuristic first (astro.run_synastry's own default), and only fall
     # back to a narrow, single-purpose LLM call when that heuristic left
@@ -732,7 +816,16 @@ async def _handle_tool_request(
         # wasted (and, on a small context window, potentially
         # budget-breaking) work for a question that isn't ready to be
         # answered yet anyway.
-        rag_contexts = rag_utils.retrieve_context(req.query)
+        #
+        # topic_hint=_TOOL_TOPIC.get(...) guarantees THIS tool's own
+        # methodology is included regardless of whether req.query (the
+        # user's free-text wording) happened to score a similarity hit
+        # against it — see retrieve_context's own docstring and
+        # _TOOL_TOPIC's comment above for why that guarantee is needed,
+        # not just nice-to-have.
+        rag_contexts = rag_utils.retrieve_context(
+            req.query, topic_hint=_TOOL_TOPIC.get(decision.tool_name)
+        )
         computed_chunk = {
             "text": (
                 "ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА (уже вычислены и предоставлены — "

@@ -48,7 +48,7 @@ metadata build_index.py attaches to each chunk (topic, always_include):
 import itertools
 import os
 import pickle
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils import config
 
@@ -154,18 +154,42 @@ def retrieve_similarity_only(query: str, top_k: int = 2) -> List[Dict[str, Any]]
     return _similarity_search(query, top_k)
 
 
-def retrieve_context(query: str, top_k: int = config.TOP_K) -> List[Dict[str, Any]]:
+def retrieve_context(
+    query: str, top_k: int = config.TOP_K, topic_hint: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Returns a list of chunk dicts (text/topic/always_include), not just
     plain strings — build_prompt needs always_include to decide whether to
     switch into reasoning mode, and topic is what drives the expansion
     below.
 
     Two passes: first ordinary top-k similarity search, then — for every
-    topic represented among those hits — pull in any "always_include"
-    (methodology) chunks for that topic that didn't already make the
-    top-k cut, so they aren't at the mercy of similarity ranking. Chunks
-    with no topic (files directly in rag_data/, not in a subfolder) never
-    trigger this expansion, since there's no topic to match against.
+    topic represented among those hits (plus topic_hint, if given — see
+    below) — pull in any "always_include" (methodology) chunks for that
+    topic that didn't already make the top-k cut, so they aren't at the
+    mercy of similarity ranking. Chunks with no topic (files directly in
+    rag_data/, not in a subfolder) never trigger this expansion, since
+    there's no topic to match against.
+
+    topic_hint: when the caller already KNOWS which technique's answer
+    this is for (every astro_* tool does — decision.tool_name is exact,
+    not a guess), pass its rag_data/ subfolder name here to guarantee that
+    topic's methodology gets included even if plain similarity search
+    against the free-text query didn't happen to surface any chunk from
+    it. Found necessary in practice: a query like "на какой день лучше
+    планировать уборку в комнате" shares essentially no vocabulary with
+    electional_methodology.txt's astrological terms (кверент,
+    сигнификатор, планетарный час...), so it can lose the similarity race
+    entirely to some other, unrelated topic's chunks — and that unrelated
+    topic's own always_include methodology would get pulled in instead,
+    with no warning (this is how a "natal chart" reference ended up in an
+    electional answer even with rag_data/astro_elect fully indexed: the
+    similarity search's top-k simply never touched that topic at all, so
+    the old topics_hit-only expansion had nothing to include from it).
+    This does NOT topic-scope the similarity search itself — that still
+    searches the whole index, which is correct and intentional (see
+    build_index.py's module docstring, "Organizing documents by topic");
+    it only guarantees the ONE topic the caller already knows is relevant
+    is never silently skipped.
 
     The always_include expansion stops once it's added
     config.RAG_ALWAYS_INCLUDE_MAX_CHARS worth of text, in whatever order
@@ -182,6 +206,8 @@ def retrieve_context(query: str, top_k: int = config.TOP_K) -> List[Dict[str, An
     results = _similarity_search(query, top_k)
     seen_ids = {chunk.get("id") for chunk in results}
     topics_hit = {chunk["topic"] for chunk in results if chunk.get("topic")}
+    if topic_hint:
+        topics_hit.add(topic_hint)
 
     if topics_hit:
         always_include_chars = 0

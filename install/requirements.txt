@@ -37,7 +37,11 @@ patool
 
 # Optional, only needed for the astrology chart tool (utils/astro.py):
 # fully local/offline (Swiss Ephemeris via pyswisseph), no API key needed.
-# AGPL-3.0 licensed — see utils/astro.py's module docstring.
+# AGPL-3.0 licensed — see utils/astro.py's module docstring. Also brings in
+# pyswisseph itself as a dependency, which utils/electional.py imports
+# directly too (as `swisseph`) for planetary-hour sunrise/sunset
+# calculations (swe.rise_trans) — no separate pip entry needed for that,
+# it's the same package kerykeion already requires.
 kerykeion
 # Resolves an IANA timezone name from lat/lon, fully offline (bundled
 # timezone-boundary data) — lets the astro tool work without the user or
