@@ -92,6 +92,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from utils import llm as llm_utils  # LLM-first field extraction, see _extract_fields_llm below
+
 # Chart text (below) is rendered directly in Russian, not left for the
 # follow-up LLM call to translate — an earlier version kept this in
 # English and asked the interpreting model to translate sign/aspect names
@@ -414,6 +416,22 @@ _DATE_ISO_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 _DATE_DMY_NUM_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b")
 _DATE_RU_RE = re.compile(r"\b(\d{1,2})\s+([А-Яа-яЁё]+)\s+(\d{4})\b")
 _TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+# Dash-separated time ("19-28-30", "19-28") — a real, reported gap: a
+# real user writes time this way (their own long-standing habit across
+# several test messages), and the colon-only regex above silently treats
+# that as "no time given at all", which then falls through to the
+# free-text fallback and can pick up a time from somewhere else entirely —
+# a real, reported bug where a much OLDER time from earlier in the same
+# conversation silently won instead of the one actually typed. Kept as a
+# SEPARATE regex rather than broadening _TIME_RE's own character class to
+# accept "-" as well as ":" — that was tried first and rejected after
+# testing: it also matches the tail of an ISO date ("2026-08-06" contains
+# "08-06", misread as 08:06), a real, confirmed false positive. This
+# regex requires a plausible clock hour (00-23) and minute/second (00-59),
+# and is NOT preceded by a 4-digit year and dash — blocking exactly that
+# ISO-date collision — without touching _TIME_RE's own already-safe
+# colon-based matching at all.
+_TIME_DASH_RE = re.compile(r"(?<!\d{4}-)\b([01]?\d|2[0-3])-([0-5]\d)(?:-[0-5]\d)?\b")
 _DMS_RE = re.compile(
     r"(\d{1,3})\s*°\s*(\d{1,2})\s*[′']\s*(\d{1,2}(?:\.\d+)?)?\s*[″\"]?\s*([NSEWnsew])"
 )
@@ -507,9 +525,9 @@ def _find_date(text: str) -> Optional[str]:
 
 
 def _find_time(text: str) -> Optional[str]:
-    m = _TIME_RE.search(text)
+    m = _TIME_RE.search(text) or _TIME_DASH_RE.search(text)
     if m:
-        hour, minute = m.groups()
+        hour, minute = m.group(1), m.group(2)
         return f"{int(hour):02d}:{int(minute):02d}"
     return None
 
@@ -615,6 +633,11 @@ def _build_city_index() -> None:
     _city_index, _city_stem_index = index, stems
 
 
+_LOCATIVE_PREPOSITIONS = {
+    "в", "во", "из", "к", "ко", "у", "под", "около", "близ", "г",
+}
+
+
 def _lookup_city(text: str) -> Optional[dict]:
     """Best-effort offline city lookup, used as a fallback only when no
     explicit coordinates were found anywhere in the spec text. Tries an
@@ -632,59 +655,241 @@ def _lookup_city(text: str) -> Optional[dict]:
     accepted limitation rather than something worth a disambiguation
     prompt for this use case. This also matters within one sentence: an
     ordinary word occasionally coincides with an obscure place's alternate
-    name somewhere in the world (Russian "года", "of the year", turned out
-    to also be a transliterated alternate name for a small Japanese town —
-    found by testing this before shipping it) — so every word/word-pair is
-    checked and the most populous match across ALL of them wins, not just
-    whichever is found first in text order, since a small town matching a
-    filler word essentially never beats the sentence's actual, real,
-    usually far more populous, named city.
+    name somewhere in the world — two real, reproducible cases found by
+    testing: Russian "года" ("of the year") is also a transliterated
+    alternate name for Gōdo, a small Japanese town, and — found via a real
+    horary test — "французский" ("French", the adjective/language) shares
+    its first five letters with "Францистаун", the Cyrillic name for
+    Francistown, Botswana, and is close enough in overall length that even
+    a strict stem check doesn't tell them apart. Two independent
+    mitigations, in order: (1) candidates immediately preceded by a
+    locative preposition (в/из/к/у/под/...) are preferred outright over
+    plain, preposition-less candidates — a real place mention in a
+    birth-info sentence is overwhelmingly phrased "в Одессе", while a
+    coincidental match on an ordinary word essentially never has a
+    preposition directly in front of it, so this filters both known
+    collision cases above without needing real morphological analysis; (2)
+    if no candidate has a preposition (still common — a structured
+    "Name, DD.MM.YYYY, HH:MM, City" listing has no prepositions at all),
+    every word/word-pair is still checked and the most populous match
+    across ALL of them wins, same fallback this function always had, since
+    a small town matching a filler word essentially never beats the
+    sentence's actual, real, usually far more populous, named city on
+    population alone either.
     """
     _build_city_index()
     if not _city_index:
         return None
 
     words = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
-    candidates = words + [f"{a} {b}" for a, b in zip(words, words[1:])]
-
-    # Exact and stem matches are pooled into ONE list and resolved by a
-    # single population comparison across all of them — NOT "exact always
-    # wins, stem is only a fallback if there's no exact match at all", an
-    # earlier version of this function's actual (if unintended) behavior.
-    # That tiering broke the "most populous match across ALL candidates
-    # wins" promise this docstring already made: a real, reproducible case
-    # found by testing — "года" ("of the year") happens to be listed as an
-    # alternate name for Gōdo, a ~19k-population Japanese town, which is
-    # an EXACT match, so it used to short-circuit and win outright even
-    # when the very same sentence also stem-matched Kyiv (pop. ~2.95M) —
-    # the two were never actually compared against each other at all.
-    # Pooling them together and comparing every candidate's population in
-    # one pass is what makes the "most populous wins" design actually hold.
-    matches: List[dict] = [
-        record for record in (_city_index.get(c.lower()) for c in candidates) if record
+    lowered = [w.lower() for w in words]
+    has_preposition = [
+        i > 0 and lowered[i - 1] in _LOCATIVE_PREPOSITIONS for i in range(len(words))
     ]
-    for candidate in candidates:
-        key = candidate.lower()
-        max_len = min(len(key), _CITY_STEM_LEN)
-        if max_len < 3:
-            continue
-        # Check a few prefix lengths, not just _CITY_STEM_LEN — a second,
-        # independent bug found alongside the one above: a base city name
-        # SHORTER than _CITY_STEM_LEN (e.g. "Киев", 4 letters) is only
-        # ever indexed under its own full-length bucket ("киев"), but a
-        # declined form in the text ("Киеве", 5 letters, "в Киеве") only
-        # ever checked its OWN 5-character bucket ("киеве") — which never
-        # matches "киев" — so a short city name's declined form could
-        # never even become a candidate at all before this fix, regardless
-        # of the tiering issue above. Checking a couple of shorter
-        # prefixes too (down to 3 characters) covers the common case of a
-        # Russian declension only adding/changing the last 1-2 letters.
-        floor = max(3, max_len - 2)
-        for length in range(max_len, floor - 1, -1):
-            matches.extend(_city_stem_index.get(key[:length], []))
+    # (candidate_text, preposition_flag) — word-pairs inherit the FIRST
+    # word's flag, since that's the word a preposition would sit in front of.
+    candidates: List[Tuple[str, bool]] = [
+        (w, has_preposition[i]) for i, w in enumerate(words)
+    ] + [
+        (f"{words[i]} {words[i + 1]}", has_preposition[i]) for i in range(len(words) - 1)
+    ]
+
+    def _find_matches(pool: List[Tuple[str, bool]]) -> List[dict]:
+        # Exact and stem matches are pooled into ONE list and resolved by a
+        # single population comparison across all of them — NOT "exact
+        # always wins, stem is only a fallback if there's no exact match at
+        # all", an earlier version of this function's actual (if
+        # unintended) behavior. That tiering broke the "most populous match
+        # across ALL candidates wins" promise this docstring already
+        # makes: a real, reproducible case found by testing — "года" being
+        # an EXACT match for Gōdo used to short-circuit and win outright
+        # even when the same sentence also stem-matched Kyiv (pop. ~2.95M)
+        # — the two were never actually compared against each other at
+        # all. Pooling them together and comparing every candidate's
+        # population in one pass is what makes "most populous wins" hold.
+        found: List[dict] = [
+            record for record in (_city_index.get(c.lower()) for c, _ in pool) if record
+        ]
+        for candidate, _ in pool:
+            key = candidate.lower()
+            max_len = min(len(key), _CITY_STEM_LEN)
+            if max_len < 3:
+                continue
+            # Check a few prefix lengths, not just _CITY_STEM_LEN — a
+            # second, independent bug found alongside the one above: a
+            # base city name SHORTER than _CITY_STEM_LEN (e.g. "Киев", 4
+            # letters) is only ever indexed under its own full-length
+            # bucket ("киев"), but a declined form in the text ("Киеве", 5
+            # letters, "в Киеве") only ever checked its OWN 5-character
+            # bucket ("киеве") — which never matches "киев" — so a short
+            # city name's declined form could never even become a
+            # candidate at all before this fix, regardless of the tiering
+            # issue above. Checking a couple of shorter prefixes too (down
+            # to 3 characters) covers the common case of a Russian
+            # declension only adding/changing the last 1-2 letters.
+            floor = max(3, max_len - 2)
+            for length in range(max_len, floor - 1, -1):
+                found.extend(_city_stem_index.get(key[:length], []))
+        return found
+
+    preferred = [c for c in candidates if c[1]]
+    if preferred:
+        matches = _find_matches(preferred)
+        if matches:
+            return max(matches, key=lambda r: r["population"])
+        # A preposition was found but matched nothing real (e.g. "в этом
+        # году") — fall through to the full pool below rather than
+        # reporting no city at all just because the higher-confidence tier
+        # came up empty.
+
+    matches = _find_matches(candidates)
     if matches:
         return max(matches, key=lambda r: r["population"])
     return None
+
+
+def _lookup_city_exact(text: str) -> Optional[dict]:
+    """Stricter sibling of _lookup_city — EXACT (non-fuzzy) name/alternate-
+    name matches only, never the stem-bucket tier. Exists for callers where
+    a wrong location is a much more serious error than for most of this
+    app's techniques (currently: utils/horary.py, whose entire radicality/
+    validity check hinges on getting the exact Ascendant right, so a
+    silent, low-confidence geocode is a real correctness risk rather than a
+    minor accuracy nit). Skips the exact match itself if the candidate word
+    is too short to be a real place name (matches _lookup_city's own >=3
+    character floor for its stem tier, for the same reason: very short
+    words collide with real gazetteer entries far too often to trust)."""
+    _build_city_index()
+    if not _city_index:
+        return None
+    words = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
+    candidates = [w for w in words if len(w) >= 3] + [
+        f"{a} {b}" for a, b in zip(words, words[1:])
+    ]
+    matches = [
+        record for record in (_city_index.get(c.lower()) for c in candidates) if record
+    ]
+    if matches:
+        return max(matches, key=lambda r: r["population"])
+    return None
+
+
+_FIELD_EXTRACTION_PROMPT = """Тебе показан текст запроса на построение астрологической карты (натальной,
+транзитной, для ректификации, дирекций, прогрессий, возвращений,
+профекций и т.п.).
+
+Извлеки из этого текста:
+1. Дату — в формате ГГГГ-ММ-ДД.
+2. Время — в 24-часовом формате ЧЧ:ММ, независимо от того, как оно записано
+   в тексте (через двоеточие, дефис, словами и т.п.).
+3. Место — город и страна; если в тексте прямо даны координаты, верни их
+   как "широта, долгота" (например "46.48, 30.72").
+
+Текст:
+\"\"\"{text}\"\"\"
+
+Если какого-то из этих пунктов в тексте ДЕЙСТВИТЕЛЬНО нет — напиши "нет" в
+соответствующей строке, не выдумывай и не угадывай. Если в тексте описаны
+ДВА разных человека (например запрос на синастрию) — извлеки данные только
+для ПЕРВОГО упомянутого.
+
+Ответь СТРОГО в этом формате, каждый пункт на отдельной строке, без
+пояснений до или после:
+ДАТА: <ГГГГ-ММ-ДД или нет>
+ВРЕМЯ: <ЧЧ:ММ или нет>
+МЕСТО: <город, страна ИЛИ широта, долгота ИЛИ нет>"""
+
+
+def _parse_labeled_field(label: str, answer: str) -> Optional[str]:
+    """Pulls one "LABEL: value" line out of a model's own strict-format
+    answer. This is parsing the MODEL's controlled output, not scanning
+    raw free-form user text — a categorically safer use of regex than the
+    free-text pattern-matching this whole extraction path exists to
+    replace (see _extract_fields_llm below)."""
+    m = re.search(rf"{label}\s*:\s*(.+)", answer, re.IGNORECASE)
+    if not m:
+        return None
+    value = m.group(1).strip().strip('"').strip()
+    if not value or value.lower() in ("нет", "нету", "n/a", "-", "—", "unknown"):
+        return None
+    return value
+
+
+def _resolve_place_string(place_text: str) -> Optional[Tuple[float, float, str]]:
+    """Resolves an already-isolated place string the model itself named
+    (not a whole free-text blob) to (lat, lon, tz). Tries an explicit
+    "lat, lon" pair first (a plain split+float, not a regex — safe here
+    because it's the model's own clean, single-purpose answer, not raw
+    user text), then falls back to an EXACT city-name match
+    (_lookup_city_exact) — deliberately never the fuzzier stem-matching
+    tier _lookup_city itself still uses elsewhere, since by this point
+    there's no large blob of unrelated surrounding text left for a fuzzy
+    match to go wrong in the way it did in horary's Francistown bug."""
+    parts = [p.strip() for p in place_text.split(",")]
+    if len(parts) == 2:
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+            if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                return lat, lon, (_resolve_timezone(lat, lon) or "")
+        except ValueError:
+            pass
+    city = _lookup_city_exact(place_text)
+    if city:
+        return city["latitude"], city["longitude"], city["timezone"]
+    return None
+
+
+def _extract_fields_llm(text: str) -> Optional[Dict[str, str]]:
+    """LLM-first date/time/place extraction — the PRIMARY path inside
+    _extract_fields below, with the existing regex-based
+    _fill_fields_from_text only running afterwards as a mop-up for
+    whatever this doesn't resolve (or entirely, if no model is loaded).
+
+    Generalizes to every technique built on _extract_fields (natal,
+    transit, directions, returns, profections, rectification) the same
+    mechanism utils/horary.py pioneered for horary specifically
+    (_extract_horary_fields_llm), after two concrete, reported regex
+    failures there: a dash-separated time ("19-28-30") wasn't recognized
+    by the colon-only time regex at all, and free-text city search
+    accidentally stem-matched an ordinary word against an unrelated,
+    obscure place name anywhere in the world (a real test found
+    "французский" matching "Францистаун"/Francistown, Botswana). Both are
+    failures of pattern-matching text rather than reading it — a model
+    that actually understands the sentence doesn't have this failure
+    mode, and a capable model is now the app's default (see
+    install/.env.example).
+
+    Never invents a field it isn't confident about (the prompt allows
+    answering "нет"); returns only whichever of date/time/lat/lon/tz it
+    could resolve, or None if no model is loaded, the call errored, or
+    nothing useful came back at all. Deliberately NOT shared/imported
+    from horary.py's own near-identical helpers, to avoid coupling this
+    change to that already-stable, separately-tested module — the minor
+    duplication is worth the isolation."""
+    if llm_utils.get_llm() is None:
+        return None
+    try:
+        answer = llm_utils.generate_sync(
+            _FIELD_EXTRACTION_PROMPT.format(text=text), max_tokens=120, temperature=0.0,
+        )
+    except Exception:
+        return None
+    date = _parse_labeled_field("ДАТА", answer)
+    time_ = _parse_labeled_field("ВРЕМЯ", answer)
+    place = _parse_labeled_field("МЕСТО", answer)
+    result: Dict[str, str] = {}
+    if date:
+        result["date"] = date
+    if time_:
+        result["time"] = time_
+    if place:
+        resolved = _resolve_place_string(place)
+        if resolved:
+            lat, lon, tz = resolved
+            result["lat"], result["lon"] = str(lat), str(lon)
+            if tz:
+                result["tz"] = tz
+    return result or None
 
 
 def _fill_fields_from_text(fields: Dict[str, str], text: str) -> None:
@@ -729,10 +934,35 @@ def _fill_fields_from_text(fields: Dict[str, str], text: str) -> None:
 
 
 def _extract_fields(spec: str) -> Tuple[Dict[str, str], List[str]]:
-    """Combines the strict key=value fast path with free-text extraction
-    for anything still missing, then auto-resolves tz from lat/lon if it
-    wasn't given explicitly. Returns (fields, missing_field_names)."""
+    """Combines the strict key=value fast path with LLM-first free-text
+    extraction (_extract_fields_llm), then falls back to the original
+    regex-based extraction (_fill_fields_from_text) for anything still
+    missing — which is everything, unchanged, if no model is loaded, so
+    this is a pure addition with no regression risk when the LLM path is
+    unavailable. Explicit key=value input always wins over both, exactly
+    as before (both helpers only ever fill keys not already present).
+    Finally auto-resolves tz from lat/lon if it still wasn't given
+    explicitly. Returns (fields, missing_field_names).
+
+    lat/lon/tz are merged from the LLM result as one atomic group, not
+    field-by-field: if lat/lon are already present (from the explicit
+    key=value fast path or anywhere else upstream), the LLM's own tz guess
+    — which corresponds to ITS place reading, not necessarily the same
+    place — must not be allowed to attach itself to those already-settled
+    coordinates. Caught by a real test: explicit lat/lon for Moscow paired
+    with a stubbed LLM answer naming Paris otherwise left the fields with
+    Moscow's coordinates but Paris's timezone."""
     fields = _parse_spec(spec)
+    llm_result = _extract_fields_llm(spec)
+    if llm_result:
+        for key in ("date", "time"):
+            if llm_result.get(key):
+                fields.setdefault(key, llm_result[key])
+        if not fields.get("lat") and not fields.get("lon") and llm_result.get("lat") and llm_result.get("lon"):
+            fields["lat"] = llm_result["lat"]
+            fields["lon"] = llm_result["lon"]
+            if llm_result.get("tz"):
+                fields["tz"] = llm_result["tz"]
     _fill_fields_from_text(fields, spec)
     missing = [k for k in _REQUIRED_FIELDS if not fields.get(k)]
     return fields, missing

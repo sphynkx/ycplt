@@ -141,16 +141,33 @@ TOP_K = int(os.environ.get("TOP_K", "3"))
 # sections), a simulation of build_index.py's own chunking showed the cap
 # silently dropping the symbol-legend table, the whole "how to format the
 # answer" section, and the worked example — the model was never even
-# seeing that content, no matter how the wording was tuned. 16000 chars
-# (~4000-6000 tokens depending on tokenizer efficiency on Cyrillic)
-# comfortably covers the current methodology doc (~10000 chars) plus real
-# headroom for it to grow, alongside retrieved facts, the astro tool's
-# chart data, and the model's own answer, within the current N_CTX default
-# (32768). Raise it further (and N_CTX and available RAM alongside it) if
-# your methodology corpus grows past that — or check for silent truncation
+# seeing that content, no matter how the wording was tuned. 16000 chars was
+# raised to fix that at the time, but the SAME failure mode recurred later,
+# twice at once: horary_methodology.txt grew to ~20400 chars (radicality
+# nuance, derived-house notes, the verdict-to-practical-meaning section,
+# then the multi-school comparison section) and astro_progressions'
+# bundled methodology docs (progression+direction+lunar_return+
+# solar_return+profection, all sharing one topic and therefore one shared
+# budget — see README's RAG topic-layout table) summed to ~18300 chars —
+# both silently over the old 16000 cap, confirmed by rerunning the exact
+# same chunking simulation described above. In horary's case this dropped
+# the entire "Обозначения"/"Порядок изложения ответа"/"Пример" sections and
+# most of the new comparison section, which is exactly why the model
+# stopped mentioning any methodology comparison at all despite the section
+# being added to the source document — the document was edited correctly,
+# it just never reached the model. 28000 chars (~7000-10000 tokens
+# depending on tokenizer efficiency on Cyrillic) comfortably covers both of
+# today's largest methodology payloads with real headroom (~35-55%) for
+# further growth, alongside retrieved facts, the astro tool's chart data,
+# and the model's own answer, within the current N_CTX default (32768) —
+# raise it further (and N_CTX and available RAM alongside it) if any
+# methodology corpus grows past that, or check for silent truncation
 # yourself with a quick chunking simulation, which is also exactly what
-# build_index.py now warns about automatically at build time.
-RAG_ALWAYS_INCLUDE_MAX_CHARS = int(os.environ.get("RAG_ALWAYS_INCLUDE_MAX_CHARS", "16000"))
+# build_index.py now warns about automatically at build time. Don't treat
+# "the model isn't using content that's clearly in the source document" as
+# a prompt-wording problem before ruling this out first — it looks
+# identical from the outside and wastes time chasing the wrong fix.
+RAG_ALWAYS_INCLUDE_MAX_CHARS = int(os.environ.get("RAG_ALWAYS_INCLUDE_MAX_CHARS", "28000"))
 
 # ---------- Rectification tools: optional LLM follow-up ----------
 # Whether astro_rectification_trutine/astro_rectification_events get a

@@ -159,7 +159,7 @@ Key variables:
 | `PORT` | `4010` | App port |
 | `MODEL_PATH` | `models/model.gguf` | Path to the GGUF chat model |
 | `N_THREADS` | `4` | Inference threads |
-| `N_CTX` | `32768` | Context window (Qwen2.5's native length — lower it if RAM is tight) |
+| `N_CTX` | `32768` | Context window (comfortably below the current default model's own native window — lower it if RAM is tight) |
 | `N_GPU_LAYERS` | `0` | Layers offloaded to GPU (0 = CPU only) |
 | `REPEAT_PENALTY` | `1.15` | Generation repetition penalty — raise if the model glitches into repeated or foreign-script text on long answers, lower toward llama-cpp-python's own default (1.1) if answers start avoiding necessary repeated terms (planet/sign names) |
 | `DB_PATH` | `data/chat.sqlite3` | Chat history database |
@@ -170,7 +170,7 @@ Key variables:
 | `INDEX_CONCURRENCY` | `4` | Concurrent external processes (tesseract, antiword, ddjvu, ...) while indexing one corpus |
 | `EMBED_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers embedding model |
 | `TOP_K` | `3` | Number of RAG chunks retrieved per query |
-| `RAG_ALWAYS_INCLUDE_MAX_CHARS` | `16000` | Cap on methodology-doc auto-inclusion size (see utils/rag.py) |
+| `RAG_ALWAYS_INCLUDE_MAX_CHARS` | `28000` | Cap on methodology-doc auto-inclusion size (see utils/rag.py) — raised from 16000 after horary's and astro_progressions' methodology payloads grew past it, silently losing their tail sections; re-check with a chunking simulation (build_index.py warns automatically) if you grow a methodology doc further |
 | `RECTIFICATION_LLM_FOLLOWUP` | `false` | Re-enable the RAG-augmented follow-up LLM call for the two rectification tools (off by default — see "Rectification tools" above) |
 | `HF_TOKEN` | (unset) | Optional Hugging Face Hub token (rate limit / warning) |
 | `HF_HUB_OFFLINE` | (unset) | Set to `1` once models are cached, to skip Hub network checks entirely |
@@ -184,37 +184,65 @@ Key variables:
 Download a GGUF model and place it at `models/` (or point `MODEL_PATH` at it):
 
 ```bash
-wget https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf -O models/qwen2.5-3b-instruct-q4_k_m.gguf
+wget https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf -O models/Qwen3.5-9B-UD-Q4_K_XL.gguf
 ```
 
-Recommendation for the original reference hardware (i7-5500U, 2c/4t, 12 GB
-RAM, no usable GPU):
+**Current default: Qwen3.5-9B, `UD-Q4_K_XL` quant (~6 GB)** —
+https://huggingface.co/unsloth/Qwen3.5-9B-GGUF (Unsloth's own GGUF build of
+the official Alibaba Qwen3.5-9B release — "UD" is Unsloth's own "Dynamic"
+quantization scheme, their own recommended default across that repo's
+tooling examples; a plain K-quant like `Qwen3.5-9B-Q4_K_M.gguf` from the
+same repo is a safer fallback if `UD-Q4_K_XL` ever fails to load on an
+older llama-cpp-python build — swap the filename, nothing else changes).
+Ignore the `mmproj-*.gguf` files in that repo — those are for the model's
+image-understanding half, unused here (this app only calls
+`create_chat_completion` for text).
+
+Replaced the earlier Qwen2.5-3B-instruct default after real testing on the
+same reference hardware below (i7-5500U, 2c/4t, 12 GB RAM, no usable GPU):
+noticeably fewer of the small model's characteristic failures
+(contradicting a tool's own computed verdict, inventing facts not present
+in the supplied data, garbling non-Russian text mid-answer) at a real but
+tolerable latency cost — a full RAG-interpreted horary answer (the
+heaviest single-request workload in this app) ran roughly 400-550s on
+this hardware, versus ~250s for the old 3B default. Note this model is a
+"-Thinking-"-heritage model — it reasons via an internal `<think>...</think>`
+scratchpad before its real answer, by design (see `utils/llm.py`'s
+`generate_sync`, which strips that block automatically before returning
+any answer to a caller — this matters for ANY thinking-style model you
+might swap in later, not just this one). Its own native context window is
+262,144 tokens (extensible further) — this app's own `N_CTX=32768` default
+is unrelated to that ceiling and doesn't need raising just because of it.
+
+Earlier, lighter alternatives (still supported, just no longer the
+shipped default — useful on genuinely constrained hardware, or if 9B's
+latency doesn't fit your use case):
 
 - **Qwen2.5-3B-Instruct-GGUF** (file `qwen2.5-3b-instruct-q4_k_m.gguf`, ~2 GB) —
-  https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF — good speed/quality
-  balance, handles Russian well.
-- If too slow — **Qwen2.5-1.5B-Instruct-GGUF** (faster, lower quality).
-
-On more capable CPU-only hardware (tested on an i7-8700, 6c/12t, 16 GB
-RAM, no discrete GPU) a bigger quant is comfortably usable and noticeably
-better at Russian instruction-following and long structured answers (the
-astro interpretation feature in particular benefits — see below):
-
-- **Qwen2.5-7B-Instruct, Q4_K_M** (~4.7 GB) — meaningful step up from 3B
-  while still comfortably fast on a modern 6+ core CPU:
+  https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF — the original
+  default on this same reference hardware, ~250s for a full horary answer
+  vs 9B's 400-550s, at the cost of the small-model failure modes above.
+- If too slow even at 3B — **Qwen2.5-1.5B-Instruct-GGUF** (faster, lower quality).
+- **Qwen2.5-7B-Instruct, Q4_K_M** (~4.7 GB):
   https://huggingface.co/paultimothymooney/Qwen2.5-7B-Instruct-Q4_K_M-GGUF
   (direct file: https://huggingface.co/paultimothymooney/Qwen2.5-7B-Instruct-Q4_K_M-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf)
-- **Qwen2.5-14B-Instruct, Q4_K_M** (~9 GB) — noticeably slower per token but
-  fits in 16 GB RAM alongside the default `N_CTX=32768`; the strongest
-  option confirmed to work well for this project's astro-interpretation
-  path (correct grammar, good adherence to the sectioned-answer format,
-  minimal hallucination) on this hardware tier so far:
+- **Qwen2.5-14B-Instruct, Q4_K_M** (~9 GB) — comparable size/latency
+  ballpark to the current Qwen3.5-9B default, from an older model
+  generation:
   https://huggingface.co/TheRains/Qwen2.5-14B-Instruct-Q4_K_M-GGUF
   (direct file: https://huggingface.co/TheRains/Qwen2.5-14B-Instruct-Q4_K_M-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf)
-- If 14B feels tight on RAM together with the full 32768-token context,
-  lower `N_CTX` (e.g. to 8192-16384) rather than dropping back to a
-  smaller model — a single astro answer's actual prompt rarely needs the
-  full window.
+- If a bigger model feels tight on RAM together with the full
+  32768-token context, lower `N_CTX` (e.g. to 8192-16384) rather than
+  dropping back to a smaller model — a single astro answer's actual
+  prompt rarely needs the full window.
+
+A word of caution on model-hunting on Hugging Face generally: community
+repos with nonstandard version numbers, mixed-vendor names (e.g. a model
+claiming lineage from two unrelated labs at once), or self-reported
+benchmarks against models that don't otherwise show up anywhere are common
+enough to be worth real scrutiny — verify a repo's base model against the
+publisher's own official org page before trusting its README's claims at
+face value.
 
 ## Running
 
@@ -1126,15 +1154,37 @@ Built-in tools:
   `RECTIFICATION_LLM_FOLLOWUP`), since the user explicitly wants this
   follow-up call on for horary regardless of model capability.
 
+  The "quesited house" is resolved either by an explicit `house=N`
+  override, or by keyword classification: `_TOPIC_HOUSE_KEYWORDS` (what
+  the question is about, same accepted-approximation spirit as
+  `astro_rectification_events`' `_EVENT_HOUSE_KEYWORDS`), combined —
+  when a named third party is detected via `_PERSON_HOUSE_KEYWORDS`
+  (daughter/son, spouse, sibling, parent, friend, cousin, boss...) — with
+  Masenkov's classical chart-turning arithmetic (`_derived_house`): the
+  third party's own house becomes house I for them, and the topic house is
+  then counted from there. Added after real testing (a "will my daughter
+  choose French at university" question) showed the single-hop version
+  silently answering as if it were the QUERENT's own house 9, and worse,
+  the model started inventing its own uncomputed derived-house arithmetic
+  in prose — a real fabrication-rule violation, caused by the real
+  computation not being surfaced to it at all. The chain (who + their
+  topic house + the resulting derived house) is now spelled out explicitly
+  in the computed-facts block whenever a third party is detected, so the
+  model narrates a real number instead of guessing one.
+
   Known v1 scope limits (see `utils/horary.py`'s own module docstring for
-  the full list): the "quesited house" is resolved by a single-hop
-  keyword classification (`_TOPIC_HOUSE_KEYWORDS`, same
-  accepted-approximation spirit as `astro_rectification_events`'
-  `_EVENT_HOUSE_KEYWORDS`) or an explicit `house=N` override — Masenkov's
-  full multi-hop "derived house" chain method (e.g. "my cousin's dog") is
-  not implemented; essential dignity only covers the 7 classical planets
-    (Uranus/Neptune/Pluto predate the system and have none, by design, not
-    a gap).
+  the full list): only a fixed set of common 2-hop relations is covered —
+  an arbitrarily deep chain ("my cousin's dog's health") still falls back
+  to plain single-hop topic classification; essential dignity only covers
+  the 7 classical planets (Uranus/Neptune/Pluto predate the system and
+  have none, by design, not a gap); the direct-aspect/translation/
+  collection search is restricted to the six classical aspects
+  (conjunction/sextile/square/trine/quincunx/opposition) rather than the
+  wider minor-aspect set `astro.py` uses for natal/transit/synastry
+  reading — quintile, biquintile, etc. have no place in classical horary
+  doctrine and, found via real testing, could otherwise get picked as the
+  "significant" aspect and force a negative verdict by default (neither
+  favorable nor hard in this module's own classification).
 
   **Recommended `rag_data/` layout.** Each technique's own methodology
   write-up is maintained centrally under `install/methodologies/` (see the

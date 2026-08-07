@@ -39,16 +39,40 @@ follow-up call on for horary regardless of model capability.
 Known, accepted v1 scope limits (documented here rather than in the
 methodology file, since these are engine limitations, not interpretation
 guidance):
-  - "derived house" resolution (Masenkov's multi-hop chain method for
-    questions like "my cousin's dog") is NOT implemented — only a single-hop
-    topic->house classification (_TOPIC_HOUSE_KEYWORDS, deterministic
-    keyword match, same accepted-approximation spirit as
-    rectification_events.py's _EVENT_HOUSE_KEYWORDS) or an explicit
-    'house=N' override. Multi-hop questions get whatever single house the
-    keywords land on, which may be wrong for a genuinely nested relationship
-    question — acceptable for v1's common case (the querent's own direct
-    topics: love, career, health, money, a lost object, etc.), a real gap
-    for anything further removed.
+  - "Derived house" (chart-turning) resolution: the PRIMARY path is now the
+    local LLM itself (_classify_derived_chain_llm), asked only to name the
+    chain's individual link-houses (a classification task, same shape as
+    rectification_events._classify_event_houses_llm) — _derived_house()
+    (pure Python) always does the actual turning arithmetic (sum of the
+    chain minus (length-1), reduced into 1-12), never the model. This
+    covers arbitrarily deep chains in principle ("wife's ring, gifted by
+    her mother" — item/gift/wife/her-mother), not just one extra hop. If
+    the model call fails, is unavailable, or returns something unparsable,
+    falls back to a deterministic 2-hop-only heuristic
+    (_PERSON_HOUSE_KEYWORDS + _TOPIC_HOUSE_KEYWORDS) that only recognizes a
+    small fixed list of common relations (child, spouse, sibling, parent,
+    friend, cousin, boss) and can't express anything deeper.
+    Added after two rounds of real testing: first, a "will my daughter
+    choose French" case showed the original single-hop-only version
+    silently answering as if the QUERENT's own house 9 (education/
+    languages) were the question, a different chart position than the
+    daughter's own house 9 — and, worse, the model started inventing its
+    own (wrong, undocumented) derived-house arithmetic in prose to
+    compensate, a real "never invent facts not in the data block"
+    violation, precisely because the real computation wasn't being
+    surfaced to it. Second, the user pointed out a genuinely multi-link
+    real-world example ("where is my wife's ring, a gift from her mother
+    at the wedding") that a fixed 2-hop keyword table structurally cannot
+    express no matter how large it grows — hence the LLM-classification
+    primary path, rather than continuing to hand-enumerate relation
+    combinations.
+    Still an approximation, same honest caveat as
+    _classify_event_houses_llm's own: a genuinely ambiguous question (which
+    link is "the item" vs "the gift" vs "the giver" is a real judgment call
+    even for a human astrologer, per the user's own "могу что-то попутать"
+    when proposing this exact example) can still get a wrong or incomplete
+    chain from the model — this is best-effort semantic classification, not
+    a guaranteed-correct parse.
   - Essential dignity (_EXALTATION table below) covers only the 7 classical
     planets, per traditional horary practice — Uranus/Neptune/Pluto have no
     classical rulership/exaltation at all (they didn't exist as visible
@@ -71,6 +95,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import astro
+from utils import llm as llm_utils
 
 # --- essential dignity (7 classical planets only — see module docstring) ---
 
@@ -279,6 +304,356 @@ def _classify_topic_house(question_text: str) -> int:
     return _DEFAULT_QUESITED_HOUSE
 
 
+# --- who the question is about -> derived-house chain (see module docstring) -
+
+# House-from-querent for a NAMED third party the question concerns — checked
+# separately from _TOPIC_HOUSE_KEYWORDS above, which answers "what topic",
+# not "whose". "Двоюродн(ый/ая)" (cousin) is listed first and deliberately
+# encoded as a single fixed house (5) rather than re-derived from a chain at
+# lookup time — it's already the classical 2-hop result (3rd-from-3rd, i.e.
+# "sibling of my sibling") folded into one constant, so it must be checked
+# before the plainer "брат"/"сестр" entry (which would otherwise match the
+# same substring first and misclassify a cousin as a plain sibling).
+_PERSON_HOUSE_KEYWORDS: List[Tuple[List[str], int]] = [
+    (["двоюродн"], 5),
+    (["дочь", "дочер", "сын", "сыновь"], 5),
+    (["муж", "жену", "жены", "жена", "супруг"], 7),
+    (["брат", "сестр"], 3),
+    (["мать", "мама", "мамин"], 10),
+    (["отец", "отц", "пап"], 4),
+    (["друг", "подруг", "приятел"], 11),
+    (["начальник", "начальниц", "работодател", "босс"], 10),
+    (["сосед"], 3),
+]
+
+
+def _classify_person_house(question_text: str) -> Optional[Tuple[int, str]]:
+    """Returns (house_from_querent, matched_keyword) for the third party the
+    question is actually about, or None if the question reads as being about
+    the querent themselves (the ordinary, single-hop case, left unchanged)."""
+    lowered = question_text.lower()
+    for keywords, house in _PERSON_HOUSE_KEYWORDS:
+        for kw in keywords:
+            if kw in lowered:
+                return house, kw
+    return None
+
+
+def _derived_house(chain: List[int]) -> int:
+    """Classical chart-turning arithmetic for a chain of house numbers (each
+    element = "count this many houses from the previous position, which
+    becomes the new house I"): total = sum(chain) - (len(chain) - 1), then
+    reduced into 1-12. A chain of length 1 returns its own single element
+    unchanged, so this is a safe drop-in replacement for a bare topic house
+    when no third party is involved. The sum is order-independent (moving
+    the "-1 per extra link" adjustment aside, it's a plain sum), so the
+    caller never needs to worry about which order the links were found in —
+    only which links belong in the chain at all, which is the actual hard
+    part (see _classify_derived_chain_llm below)."""
+    total = sum(chain) - (len(chain) - 1)
+    return ((total - 1) % 12) + 1
+
+
+# --- derived-house chain classification via the local LLM (primary path) ----
+#
+# _PERSON_HOUSE_KEYWORDS/_classify_person_house above only handles a single
+# extra hop (one named third party). Real questions can nest arbitrarily
+# deep ("где кольцо жены, подаренное ей матерью на свадьбу" — item -> gift
+# -> wife -> her mother -> the wedding), and no fixed keyword table can
+# enumerate every such combination. Rather than growing that table forever,
+# this reuses the exact same architecture rectification_events.py already
+# established for its own "event -> house" problem (see that module's
+# _classify_event_houses_llm): ask the already-loaded local model to name
+# the chain's individual link-houses as a plain classification task, and do
+# every bit of arithmetic in code afterward via _derived_house() — the
+# model is never asked to compute the final turned house itself. This
+# matters here specifically because letting the model do that arithmetic
+# freely is exactly what went wrong before this feature existed at all: a
+# real test ("who took my things") had the model invent its own made-up
+# derived-house numbers in prose once it knew the technique existed, a
+# fabrication-rule violation traced directly to the real computation not
+# being surfaced to it. Keeping the model's job to bare classification (the
+# same kind of task _classify_event_houses_llm already does reliably) and
+# the arithmetic in Python avoids repeating that failure.
+_DERIVED_HOUSE_PROMPT = """В хорарной астрологии дома гороскопа (I-XII) обозначают разные сферы, вещи и людей:
+I — сам кверент (тот, кто задаёт вопрос), его тело, начинания
+II — движимое имущество, деньги, личные ценности
+III — братья/сёстры, соседи, короткие поездки
+IV — дом, семья, отец, недвижимость, конец дела
+V — дети, романтика, творчество
+VI — здоровье, повседневная работа (найм), мелкие животные, подчинённые
+VII — партнёр, супруг(а), другая сторона в любом взаимодействии, открытый враг
+VIII — чужие деньги, долги, наследство, подарки от других людей, смерть
+IX — дальние поездки, высшее образование (институт/университет/языки), право, иностранное
+X — карьера, статус, репутация, мать, начальник/власть
+XI — друзья, надежды
+XII — тайные враги, изоляция, крупные животные, скрытое
+
+Классическая техника ПРОИЗВОДНОГО ДОМА (поворот карты): если вопрос касается
+не самого кверента напрямую, а цепочки связанных лиц или вещей (например
+"кольцо жены, подаренное ей матерью на свадьбу" — это цепочка звеньев:
+жена, её мать, подарок/наследство, сама вещь), нужно перечислить ВСЕ звенья
+этой цепочки — каждое как отдельный номер дома (1-12), тот, каким домом это
+звено обозначалось бы, если бы отсчёт шёл прямо от кверента. Порядок
+перечисления не важен. Если вопрос касается самого кверента без посредников
+— верни всего один дом, тему самого вопроса.
+
+НЕ считай итоговый производный дом и не складывай числа сам — это отдельно
+сделает программа. Твоя единственная задача — перечислить исходные номера
+домов-звеньев.
+
+Вопрос: "{question}"
+
+Ответь СТРОГО в этом формате, без пояснений до или после:
+ДОМА: <числа через запятую, например: 7, 4, 8, 2>"""
+
+_DERIVED_HOUSE_ANSWER_RE = re.compile(r"ДОМА\s*:\s*(.+)")
+
+
+def _parse_derived_house_answer(answer: str) -> Optional[List[int]]:
+    """Parses "ДОМА: 7, 4, 8, 2" into [7, 4, 8, 2]. Deliberately keeps
+    duplicates and order as given (unlike rectification_events' own event-
+    house parser) — a repeated house number in the chain is meaningful here
+    (e.g. a cousin is classically 3-from-3, i.e. the chain [3, 3]), not
+    noise to be deduplicated. Capped at 6 links as a sanity bound against a
+    degenerate answer, not because a real question can't nest that deep."""
+    m = _DERIVED_HOUSE_ANSWER_RE.search(answer)
+    if not m:
+        return None
+    houses = [int(tok) for tok in re.findall(r"\d+", m.group(1))]
+    houses = [h for h in houses if 1 <= h <= 12][:6]
+    return houses or None
+
+
+_NEW_ROUND_PROMPT = """Тебе показано ПОСЛЕДНЕЕ сообщение пользователя в диалоге о хорарной
+астрологии — БЕЗ предыдущей истории переписки. Определи: это НОВЫЙ,
+самостоятельный хорарный вопрос (даже если в нём не хватает каких-то
+деталей — даты, времени или места, это всё равно НОВЫЙ вопрос, если он
+поднимает новую тему) — или это ПРОДОЛЖЕНИЕ/уточнение уже заданного ранее
+вопроса (просьба объяснить, уточнить смысл вердикта, "почему так", "что
+это значит", "уверен ли ты" и т.п., без новой темы вопроса)?
+
+Сообщение: "{message}"
+
+Ответь СТРОГО одним словом, без пояснений: НОВЫЙ или ПРОДОЛЖЕНИЕ"""
+
+
+def _classify_new_horary_round(message: str) -> Optional[bool]:
+    """Returns True if `message` ALONE (no history at all in the prompt —
+    deliberately, so the model can't just default to "continuation" out of
+    inertia) reads as a fresh, self-contained horary question — even if it
+    happens to be missing a required field, still a NEW question, just an
+    incomplete one — False if it reads as a follow-up/clarification about
+    an answer already given, or None if the model is unavailable or its
+    answer is unparsable (caller falls back to a deterministic heuristic in
+    that case, never treats None as a hard failure).
+
+    Added after a real, reported bug: a genuinely new horary question that
+    happened to omit its casting location (relying on the same "just search
+    everywhere, including history" union routes/chat.py otherwise builds
+    for _INTERPRETED_TOOL_NAMES) got its place silently resolved from an
+    unrelated EARLIER question's city in the same conversation — this
+    answers "is this actually a new question at all" up front, so
+    routes/chat.py can deliberately drop history_context for a genuinely
+    new round rather than ever quietly blending it with an older,
+    unrelated question's data. A real classification task (same shape as
+    _classify_derived_chain_llm/rectification_events' own event classifier
+    above), not something to approximate with more keyword rules."""
+    if llm_utils.get_llm() is None:
+        return None
+    try:
+        answer = llm_utils.generate_sync(
+            _NEW_ROUND_PROMPT.format(message=message), max_tokens=10, temperature=0.0,
+        )
+    except Exception:
+        return None
+    upper = answer.strip().upper()
+    if "НОВ" in upper:
+        return True
+    if "ПРОДОЛЖ" in upper:
+        return False
+    return None
+
+
+_ROUND_LOOKBACK_CAP = 8
+
+
+def _collect_current_round_texts(prior_user_texts: List[str]) -> List[str]:
+    """Walks BACKWARD through prior_user_texts (oldest-first, NOT including
+    the current message — routes/chat.py appends that separately) to find
+    where the CURRENT horary round actually began: classifies each
+    historical message in isolation with _classify_new_horary_round (same
+    call the current message itself already went through), collecting them
+    as it goes, and stopping at — and including — the most recent one
+    judged to be a fresh, self-contained NEW question.
+
+    This is what makes trusting a "CONTINUATION" verdict safe at all: since
+    every round boundary is itself detected this same way, everything at
+    or after the last NEW verdict genuinely belongs to the current round,
+    and nothing further back ever needs to be considered — no matter how
+    long the whole conversation has grown, or how many unrelated horary
+    questions (Moscow, Chelyabinsk, ...) happen to sit earlier in it. A
+    real, reported bug motivated this: even after narrowing a continuation
+    to "the union of current message + full history", a stray time and an
+    unrelated city from a MUCH earlier, different horary question still
+    won out over what the user had actually just supplied — because
+    "history" had no notion of where the current round even started.
+
+    Capped at _ROUND_LOOKBACK_CAP messages back purely as a safety bound —
+    a real horary round (question, then a couple of clarifying follow-ups)
+    essentially never runs longer than this. If the cap is hit, or the
+    classifier itself returns None (unavailable/unparsable) partway
+    through the walk, the walk stops there rather than guessing further
+    back — a bounded, honest "this far and no further", never an unbounded
+    re-scan of the entire conversation one classification call at a time."""
+    collected: List[str] = []
+    for text in reversed(prior_user_texts[-_ROUND_LOOKBACK_CAP:]):
+        collected.append(text)
+        verdict = _classify_new_horary_round(text)
+        if verdict is not False:
+            # True (a genuine round boundary) or None (classifier hiccup on
+            # this one message) — stop here either way, conservatively.
+            break
+    return list(reversed(collected))
+
+
+# --- LLM-first field extraction (date/time/place/question) ------------------
+#
+# Replaces regex-based free-text scanning (astro._find_date/_find_time/
+# _lookup_city) as horary's PRIMARY path — kept only as a fallback in
+# _compute_horary_chart for when no model is loaded at all. Two concrete,
+# reported failures motivated this: a user-typed dash-separated time
+# ("19-28-30") wasn't recognized by the colon-only regex at all, silently
+# falling through to search the rest of the (possibly much older) request
+# text instead; and free-text city search occasionally stem-matches an
+# ordinary word against an unrelated, obscure place name anywhere in the
+# world (a real test found "французский" matching Francistown, Botswana).
+# Both are failures of PATTERN-MATCHING text rather than READING it — a
+# model that actually understands the sentence doesn't have this failure
+# mode, it answers "what date/time/place does this describe" directly.
+_FIELD_EXTRACTION_PROMPT = """Тебе показан текст одного "раунда" хорарного запроса — исходный вопрос и,
+возможно, последующие уточнения пользователя в рамках ОДНОГО И ТОГО ЖЕ
+вопроса (без более ранних, не относящихся к делу сообщений).
+
+Извлеки из этого текста:
+1. Дату, когда был задан вопрос (НЕ дату рождения!) — в формате ГГГГ-ММ-ДД.
+2. Время, когда был задан вопрос — в 24-часовом формате ЧЧ:ММ, независимо
+   от того, как оно записано в тексте (через двоеточие, дефис, словами
+   и т.п.) — переведи его именно в этот формат.
+3. Место, где был задан вопрос — город и страна; если в тексте прямо даны
+   координаты, верни их как "широта, долгота" (например "46.48, 30.72").
+4. Саму формулировку вопроса — дословно, как её сформулировал пользователь,
+   не пересказывай своими словами.
+
+Текст:
+\"\"\"{text}\"\"\"
+
+Если какого-то из этих пунктов в тексте ДЕЙСТВИТЕЛЬНО нет — напиши "нет" в
+соответствующей строке, не выдумывай и не угадывай.
+
+Ответь СТРОГО в этом формате, каждый пункт на отдельной строке, без
+пояснений до или после:
+ДАТА: <ГГГГ-ММ-ДД или нет>
+ВРЕМЯ: <ЧЧ:ММ или нет>
+МЕСТО: <город, страна ИЛИ широта, долгота ИЛИ нет>
+ВОПРОС: <дословная формулировка или нет>"""
+
+
+def _parse_extraction_field(label: str, answer: str) -> Optional[str]:
+    """Pulls one "LABEL: value" line out of the model's own strict-format
+    answer above — this is parsing the MODEL's controlled output, not
+    scanning raw user text, the same safe, established pattern as
+    _parse_derived_house_answer/rectification_events' event-house parser,
+    not the kind of free-text pattern-matching this whole mechanism exists
+    to replace. Returns None for a missing line, an empty value, or an
+    explicit "нет" (the model's own "not present" answer)."""
+    m = re.search(rf"{label}\s*:\s*(.+)", answer, re.IGNORECASE)
+    if not m:
+        return None
+    value = m.group(1).strip().strip('"').strip()
+    if not value or value.lower() in ("нет", "нету", "n/a", "-", "—"):
+        return None
+    return value
+
+
+def _extract_horary_fields_llm(round_text: str) -> Optional[Dict[str, str]]:
+    """Returns {"date": ..., "time": ..., "question": ...} (always both
+    present if this returns non-None — date/time are the two hard
+    requirements, everything else this module needs) plus an optional
+    "place" key, or None if the model is unavailable, errored, or didn't
+    return a usable date+time. Callers treat None as "fall back to the
+    regex-based path", never as a hard failure — see _compute_horary_
+    chart's own docstring for why that fallback still exists at all."""
+    if llm_utils.get_llm() is None:
+        return None
+    try:
+        answer = llm_utils.generate_sync(
+            _FIELD_EXTRACTION_PROMPT.format(text=round_text), max_tokens=200, temperature=0.0,
+        )
+    except Exception:
+        return None
+
+    date = _parse_extraction_field("ДАТА", answer)
+    time_ = _parse_extraction_field("ВРЕМЯ", answer)
+    if not (date and time_):
+        return None
+    result = {"date": date, "time": time_}
+    place = _parse_extraction_field("МЕСТО", answer)
+    if place:
+        result["place"] = place
+    question = _parse_extraction_field("ВОПРОС", answer)
+    if question:
+        result["question"] = question
+    return result
+
+
+def _resolve_place(place_text: str) -> Optional[Tuple[float, float, str]]:
+    """Returns (lat, lon, tz) for an LLM-identified place string (already
+    isolated to just the place itself, not a whole message), or None if it
+    can't be resolved. Tries an explicit "lat, lon" pair first — plain
+    split+float parsing, not a regex, since this is the model's own clean,
+    single-purpose output, not raw free text — then an EXACT city-name
+    lookup (astro._lookup_city_exact), never the fuzzy substring-based
+    tier astro._lookup_city itself still uses for other techniques: by
+    this point there's no wider blob of unrelated conversation text left
+    for a fuzzy match to go wrong in, but an exact match is still the more
+    honest guarantee for a technique this location-sensitive."""
+    parts = [p.strip() for p in place_text.split(",")]
+    if len(parts) == 2:
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+            if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                return lat, lon, (astro._resolve_timezone(lat, lon) or "")
+        except ValueError:
+            pass
+    city = astro._lookup_city_exact(place_text)
+    if city:
+        return city["latitude"], city["longitude"], city["timezone"]
+    return None
+
+
+def _classify_derived_chain_llm(question_text: str) -> Optional[List[int]]:
+    """Best-effort semantic decomposition of the question into its full
+    derived-house chain, using the already-loaded chat model — mirrors
+    rectification_events._classify_event_houses_llm exactly (same
+    prompt/parse/fallback shape). Returns None on any error, an unparsable
+    answer, or if no model is loaded; every caller treats None as "fall back
+    to the keyword-based heuristic", never as a hard failure — this keeps
+    the deterministic 2-hop path (_classify_person_house +
+    _classify_topic_house) as a real safety net, not just a decoration."""
+    if llm_utils.get_llm() is None:
+        return None
+    try:
+        answer = llm_utils.generate_sync(
+            _DERIVED_HOUSE_PROMPT.format(question=question_text),
+            max_tokens=40,
+            temperature=0.0,
+        )
+    except Exception:
+        return None
+    return _parse_derived_house_answer(answer)
+
+
 _QUESTION_SENTENCE_RE = re.compile(r"[^.!?]*\?")
 
 
@@ -367,19 +742,104 @@ def _third_point_aspects(aspects, target_kery_name: str) -> Dict[str, Tuple[str,
 _FAVORABLE_ASPECTS = {"trine", "sextile", "conjunction"}
 _HARD_ASPECTS = {"square", "opposition", "quincunx"}
 
+# Classical horary aspect set ONLY — deliberately narrower than astro._ALL_ASPECTS
+# (which also includes semi-sextile/semi-square/quintile/sesquiquadrate/
+# biquintile, correct for natal/transit/synastry reading elsewhere in this
+# app, but not part of classical horary doctrine at all — see
+# horary_methodology.txt section 4, which lists exactly these six and no
+# others). Found via real testing: a "квинтиль" (72°) between the two
+# significators was picked as the chart's *direct_aspect* below, and because
+# quintile is in neither _FAVORABLE_ASPECTS nor _HARD_ASPECTS above, the
+# verdict cascade could only ever read it as a negative outcome — a minor,
+# non-classical modern aspect was silently overriding whatever real Ptolemaic
+# aspect (or lack of one) the significators actually had. Restricting the
+# AspectsFactory call itself to this list (rather than filtering afterward)
+# is both the correct methodological scope and prevents this class of bug
+# outright, including for the third-point translation/collection-of-light
+# search below, which reuses the same `aspects` list.
+_HORARY_ASPECTS = [a for a in astro._MAJOR_ASPECTS] + [
+    a for a in astro._MINOR_ASPECTS if a["name"] == "quincunx"
+]
+
 
 def _compute_horary_chart(spec: str) -> Dict[str, Any]:
     """Returns a dict of every computed fact plus the final verdict, or
     {"error": "..."} if the moment/place couldn't be resolved. Never skips
     computation on a failed radicality check anymore (see module
     docstring) — is_radical/radicality_notes are carried in the result
-    alongside a real verdict either way."""
-    fields, missing = astro._extract_fields(spec)
-    if missing:
-        return {"error": _missing_fields_message(missing)}
+    alongside a real verdict either way.
 
-    raw = astro._parse_spec(spec)
-    question_text = _extract_question_text(spec)
+    Field resolution (date/time/place/question) is now LLM-first (see
+    _extract_horary_fields_llm) — the regex-based astro._extract_fields
+    path below only ever runs as a fallback when the model is unavailable
+    or its answer didn't parse. This replaced a purely regex-based
+    pipeline after two concrete, reported failures: a user-typed dash-
+    separated time ("19-28-30") wasn't recognized by the colon-only time
+    regex at all (silently treated as "no time given"), and the free-text
+    city search could accidentally stem-match an ordinary word against an
+    unrelated, obscure place name anywhere in the world (a real test found
+    "французский" matching Francistown, Botswana). Both are exactly the
+    class of failure a model that actually reads and understands the
+    sentence doesn't have — it isn't pattern-matching substrings, it's
+    answering "what date/time/place does this text actually describe."
+    The regex fallback is kept, not deleted, purely as a safety net for
+    when no model is loaded at all — never as the normal path once one is."""
+    llm_fields = _extract_horary_fields_llm(spec)
+    raw = astro._parse_spec(spec)  # cheap, unambiguous "key=value" parse — kept for the optional house=N override
+
+    if llm_fields:
+        place_resolved = _resolve_place(llm_fields["place"]) if llm_fields.get("place") else None
+        if place_resolved is None:
+            return {"error": _missing_fields_message(["place"]) + (
+                " Модель распознала дату и время вопроса, но не смогла уверенно "
+                "определить место, где он был задан — уточните его явно (город "
+                "или координаты)."
+            )}
+        lat, lon, tz = place_resolved
+        fields = {
+            "date": llm_fields["date"], "time": llm_fields["time"],
+            "lat": str(lat), "lon": str(lon), "tz": tz,
+        }
+        question_text = llm_fields.get("question") or _extract_question_text(spec)
+    else:
+        # --- fallback: regex-based extraction, only reached with no model loaded ---
+        fields, missing = astro._extract_fields(spec)
+        if missing:
+            return {"error": _missing_fields_message(missing)}
+
+        # Horary-specific location-confidence gate (only relevant on this
+        # fallback path — the LLM path above already resolves place from a
+        # single, clean, model-identified string, so this class of
+        # collision can't happen there at all). astro._extract_fields is
+        # happy to accept whatever astro._lookup_city's LOOSE, fuzzy stem-
+        # matching tier finds as "the place" — fine for most techniques,
+        # not safe enough for horary specifically (see module docstring
+        # above for the Francistown case). Unless explicit coordinates
+        # were given, require an EXACT (non-fuzzy) city match — if
+        # neither holds, report the place as missing rather than silently
+        # computing a chart for the wrong city.
+        if not raw.get("lat") or not raw.get("lon"):
+            coord_lat, coord_lon = astro._find_coordinates(spec)
+            if coord_lat is not None:
+                fields["lat"], fields["lon"] = str(coord_lat), str(coord_lon)
+            else:
+                exact_city = astro._lookup_city_exact(spec)
+                if exact_city is None:
+                    return {"error": _missing_fields_message(["lat", "lon"]) + (
+                        " В тексте не нашлось ни точных координат, ни однозначного "
+                        "названия города для МОМЕНТА ЭТОГО ВОПРОСА — уточните "
+                        "место явно (город или координаты), чтобы избежать "
+                        "случайной геопривязки по совпадению слов."
+                    )}
+                fields["lat"] = str(exact_city["latitude"])
+                fields["lon"] = str(exact_city["longitude"])
+                fields["tz"] = exact_city["timezone"]
+            if not fields.get("tz") and fields.get("lat") and fields.get("lon"):
+                tz = astro._resolve_timezone(float(fields["lat"]), float(fields["lon"]))
+                if tz:
+                    fields["tz"] = tz
+
+        question_text = _extract_question_text(spec)
 
     subject = astro._build_subject(fields, name="horary", active_points=_CHART_ACTIVE_POINTS)
     cusps = astro._house_cusp_degrees(subject)
@@ -423,15 +883,49 @@ def _compute_horary_chart(spec: str) -> Dict[str, Any]:
         "radicality_notes": radicality_notes,
     }
 
+    topic_house = _classify_topic_house(question_text)
+    person_match = _classify_person_house(question_text)
+    derived_chain: Optional[List[int]] = None
+    chain_source: Optional[str] = None  # "llm" or "keyword" — for display only
+    person_house: Optional[int] = None
+    person_keyword: Optional[str] = None
+
     quesited_house = _DEFAULT_QUESITED_HOUSE
     if raw.get("house"):
         try:
             quesited_house = max(1, min(12, int(raw["house"])))
         except ValueError:
-            pass
+            quesited_house = topic_house
     else:
-        quesited_house = _classify_topic_house(question_text)
+        # Primary path: ask the local model to decompose the question into
+        # its full derived-house chain (arbitrary depth, e.g. "wife's
+        # ring, gifted by her mother" — item/gift/wife/her-mother, not just
+        # the one extra hop the keyword heuristic below can express). Same
+        # architecture as rectification_events._classify_event_houses_llm:
+        # the model only ever names raw house numbers, _derived_house (pure
+        # Python) does the actual turning arithmetic — see that function's
+        # docstring for exactly why the arithmetic itself must never be
+        # left to the model. Falls back to the deterministic 2-hop keyword
+        # heuristic (person + topic) on any failure, and to the plain
+        # single-hop topic house if even that finds no third party.
+        llm_chain = _classify_derived_chain_llm(question_text)
+        if llm_chain:
+            derived_chain = llm_chain
+            chain_source = "llm"
+            quesited_house = _derived_house(llm_chain) if len(llm_chain) > 1 else llm_chain[0]
+        elif person_match:
+            person_house, person_keyword = person_match
+            derived_chain = [person_house, topic_house]
+            chain_source = "keyword"
+            quesited_house = _derived_house(derived_chain)
+        else:
+            quesited_house = topic_house
     result["quesited_house"] = quesited_house
+    result["topic_house"] = topic_house
+    result["derived_chain"] = derived_chain
+    result["chain_source"] = chain_source
+    result["person_house"] = person_house
+    result["person_keyword"] = person_keyword
 
     querent_sign, _ = astro._sign_from_abs_pos(cusps[0])
     quesited_sign, _ = astro._sign_from_abs_pos(cusps[quesited_house - 1])
@@ -615,6 +1109,29 @@ def run_horary_question(spec: str) -> str:
             "(" + (data["radicality_notes"][0] if data["radicality_notes"] else "Асцендент слишком близко к границе знака") + "). "
             "Вердикт ниже основан на реальном чтении карты, но его надёжность снижена — "
             "изложи это как предварительное, повышенно осторожное суждение, а не как обычный уверенный ответ."
+        )
+    if data["derived_chain"] and data["chain_source"] == "llm":
+        chain = data["derived_chain"]
+        if len(chain) > 1:
+            lines.append(
+                f"Вопрос касается не самого кверента напрямую, а цепочки связанных лиц/вещей — "
+                f"звенья цепочки (дома от кверента, каждое следующее считается от предыдущего как от его "
+                f"собственного дома I): {', '.join(str(h) for h in chain)}. Перенос дома (классическая "
+                f"техника разворота карты, сумма звеньев минус число лишних переносов, приведено к 1-12) "
+                f"→ итоговый производный дом {data['quesited_house']} — его управитель и есть значимая "
+                "планета (квесит) для конца этой цепочки, а не для кверента напрямую."
+            )
+        # A single-element LLM chain means "no third party" — same as the
+        # plain topic-house case below, nothing extra to say here.
+    elif data["derived_chain"] and data["chain_source"] == "keyword":
+        lines.append(
+            f"Вопрос касается не самого кверента, а третьего лица (определено по слову «{data['person_keyword']}» "
+            f"в тексте вопроса) — это лицо обозначается домом {data['person_house']} от кверента. "
+            f"Тема вопроса для этого лица (как если бы дом {data['person_house']} был его собственным домом I) — "
+            f"дом {data['topic_house']}. Перенос дома (классическая техника разворота карты): "
+            f"{data['person_house']} + {data['topic_house']} - 1, приведено к диапазону 1-12 → "
+            f"итоговый производный дом {data['quesited_house']} — его управитель и есть значимая планета (квесит) "
+            "для ЭТОГО человека и ЭТОЙ темы, а не для кверента напрямую."
         )
     lines.append(f"Тема вопроса определена как дом {data['quesited_house']}.")
     if data["is_radical"] and data["radicality_notes"]:

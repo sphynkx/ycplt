@@ -313,6 +313,7 @@ async def chat(req: ChatRequest):
             sent_at,
             tool_decision,
             _extraction_history_context(prior_user_texts),
+            prior_user_texts,
         )
 
     return await _handle_chat_request(conversation_id, req, sent_at, prior_messages)
@@ -537,6 +538,7 @@ async def _handle_tool_request(
     sent_at: float,
     decision: tool_router.ToolDecision,
     history_context: str = "",
+    prior_user_texts: Optional[List[str]] = None,
 ) -> dict:
     """Runs the tool utils/tool_router.py picked, then does one more LLM
     call that turns the raw tool result into a natural-language answer to
@@ -576,6 +578,71 @@ async def _handle_tool_request(
         tool_arg = decision.tool_arg
 
     loop = asyncio.get_running_loop()
+
+    if decision.tool_name == "astro_horary_question":
+        # Horary is uniquely location-sensitive in a way none of the other
+        # _INTERPRETED_TOOL_NAMES are: for natal/transit/synastry, reusing
+        # the SAME person's birth data across an entire conversation is
+        # correct and intended (that's exactly why the generic union above
+        # hands every source to _extract_fields at once), but each horary
+        # question has its OWN distinct casting moment AND place — two
+        # different horary questions asked minutes apart in the same
+        # conversation must NOT silently share a city.
+        #
+        # Three real, reported bugs shaped this before it landed here.
+        # Round 1: a follow-up that gave its own new date/time but no place
+        # fell back to the full current+history union, and the free-text
+        # city search silently resolved an unrelated earlier question's
+        # city — fixed by adding horary._classify_new_horary_round (the
+        # model, shown the current message ALONE, decides NEW vs
+        # CONTINUATION) so a genuinely new-but-incomplete question reports
+        # its missing field instead of silently borrowing one. Round 2: a
+        # correctly-classified CONTINUATION ("Одесса, Украина", nothing
+        # else) still fell back to the FULL union, which is the entire
+        # UNBOUNDED conversation history — pulling in a stray time and a
+        # stray city from a COMPLETELY DIFFERENT, much earlier horary
+        # question. Narrowing that to "current message + the single
+        # immediately preceding one" fixed the reported case, but the user
+        # raised the real underlying point: a round boundary should mean
+        # everything before it is genuinely forgotten, and a continuation
+        # should be free to look back as far as ITS OWN round's start —
+        # never further, but also never artificially capped at exactly one
+        # message if a round runs to two or three follow-ups.
+        #
+        # Fix: horary._collect_current_round_texts walks backward through
+        # prior user messages, classifying each one the SAME way the
+        # current message already was, and stops at the most recent one
+        # that's itself a genuine NEW-question boundary — so a
+        # CONTINUATION only ever pulls in exactly its own round, however
+        # many messages that is, and a fresh round's own missing fields are
+        # never filled in from anything on the other side of that boundary.
+        current_turn = "\n".join(filter(None, [req.query, decision.tool_arg]))
+        prior_texts = prior_user_texts or []
+        is_new = await loop.run_in_executor(None, horary._classify_new_horary_round, req.query)
+        if is_new is True:
+            tool_arg = current_turn
+        elif is_new is False:
+            round_texts = await loop.run_in_executor(
+                None, horary._collect_current_round_texts, prior_texts
+            )
+            tool_arg = "\n".join(filter(None, round_texts + [current_turn]))
+        else:
+            # Classifier unavailable/unparsable — fall back to a
+            # deterministic check, preferring the narrowest arg that's
+            # already self-sufficient, only widening one step at a time
+            # (current message alone, then +1 immediately preceding
+            # message, before finally accepting the full union already
+            # built above as a last resort).
+            _, missing_current = await loop.run_in_executor(None, astro._extract_fields, current_turn)
+            if not missing_current:
+                tool_arg = current_turn
+            else:
+                immediate_prior = prior_texts[-1] if prior_texts else ""
+                narrow_arg = "\n".join(filter(None, [current_turn, immediate_prior]))
+                _, missing_narrow = await loop.run_in_executor(None, astro._extract_fields, narrow_arg)
+                if not missing_narrow:
+                    tool_arg = narrow_arg
+                # else: keep the full union already built above as a last resort.
 
     # Synastry-only hybrid extraction: try the plain deterministic
     # heuristic first (astro.run_synastry's own default), and only fall

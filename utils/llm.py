@@ -4,6 +4,7 @@ Keeps a single Llama instance per process (module-level singleton),
 available through get_llm() after load_llm() has been called at app startup.
 """
 import os
+import re
 import asyncio
 from typing import Optional
 
@@ -12,6 +13,21 @@ from llama_cpp import Llama
 from utils import config
 
 _llm: Optional[Llama] = None
+
+# Some GGUF models (e.g. Qwen3's "-Thinking-" variants) are trained to
+# always emit an internal chain-of-thought scratchpad wrapped in
+# <think>...</think> before the real answer — by design/convention this
+# reasoning trace is far less language-constrained than the model's actual
+# final answer, and reliably comes out in English even when everything
+# else (prompt, expected answer) is in Russian, confirmed by real testing
+# after switching models. This app has no use for that scratchpad (every
+# caller wants the final answer only, in the requested language), and
+# nothing downstream expects it, so it's stripped here — the one shared
+# place every caller's output passes through — rather than in each of the
+# many individual prompts/callers. A no-op for any model that doesn't emit
+# think-tags at all (today's default, Qwen2.5-3B-instruct, doesn't), so
+# this is safe to leave in regardless of which model is configured.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
 def load_llm() -> Llama:
@@ -67,7 +83,17 @@ def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: fl
         # Russian.
         repeat_penalty=config.REPEAT_PENALTY,
     )
-    return out["choices"][0]["message"]["content"]
+    content = out["choices"][0]["message"]["content"]
+    # A model that emits an unclosed <think> (truncated by max_tokens before
+    # it ever reached </think>) would otherwise have its ENTIRE answer
+    # eaten by a greedy strip — only strip a properly closed block, and
+    # leave an unclosed one as-is (a real but rare failure mode: the caller
+    # gets a visibly weird answer that at least isn't silently empty,
+    # rather than this function hiding the fact that generation ran out of
+    # budget mid-thought).
+    if "<think>" in content and "</think>" in content:
+        content = _THINK_BLOCK_RE.sub("", content).strip()
+    return content
 
 
 async def generate_async(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
