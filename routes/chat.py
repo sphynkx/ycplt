@@ -34,13 +34,14 @@ Every /chat call:
 import asyncio
 import base64
 import time
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from db import repository
 from utils import astro
+from utils import chart_draw
 from utils import config
 from utils import electional
 from utils import horary
@@ -442,6 +443,7 @@ async def _handle_chat_request(
         "status": "complete",
         "contexts_used": len(contexts),
         "files": files,
+        "message_id": assistant_msg_id,
     }
 
 
@@ -568,6 +570,186 @@ _BEST_RECOMMENDATION_EXTRACTORS = {
     "astro_horary_question": horary.extract_best_recommendation,
     "astro_electional_chart": electional.extract_best_recommendation,
 }
+
+# --- chart-drawing wiring ----------------------------------------------
+#
+# tool_name -> spec-string function returning (text, subject, second,
+# highlight_house) in ONE pass — the "cheap to recompute" 8 techniques
+# (natal/transit/progression/direction/lunar_return/solar_return/profection
+# in utils/astro.py, horary in utils/horary.py). Each of these functions IS
+# the tool's normal computation (registered in TOOL_REGISTRY's plain
+# run_* form is a thin wrapper around it) — calling it here instead of
+# tool_spec["run"] means the chart-drawing subject comes from the exact
+# same computation as the text reply, not a second rebuild. An earlier
+# version called tool_spec["run"] for the text and a separate
+# get_*_chart_subject(s) getter for the chart, silently DOUBLING every one
+# of these 8 techniques' ephemeris/fixed-star computation on every reply —
+# a real, reported performance regression, fixed by switching to this
+# single-computation form instead.
+#
+# Deliberately excludes:
+#   - astro_synastry_chart: needs the SAME split_hint used to build
+#     tool_result — handled inline in the tool-dispatch block below
+#     instead (astro.run_synastry_and_subject takes split_hint directly).
+#   - astro_electional_chart, astro_rectification_trutine,
+#     astro_rectification_events: each involves an expensive SEARCH
+#     (electional's date-range scan, rectification's candidate-window
+#     scan) — handled inline below via their own "_and_subject"/"_full"
+#     functions (electional.run_electional_chart_and_subject,
+#     rectification._run_rectification_trutine_full,
+#     rectification_events.run_rectification_events_and_subject_async),
+#     which return (text, subject) rather than this dict's 4-tuple shape.
+_SIMPLE_AND_SUBJECT_FUNCS: Dict[str, Callable[[str], Tuple[str, Any, Any, Optional[int]]]] = {
+    "astro_natal_chart": astro.run_natal_and_subject,
+    "astro_transit_chart": astro.run_transit_and_subject,
+    "astro_progression_chart": astro.run_progression_and_subject,
+    "astro_direction_chart": astro.run_direction_and_subject,
+    "astro_lunar_return_chart": astro.run_lunar_return_and_subject,
+    "astro_solar_return_chart": astro.run_solar_return_and_subject,
+    "astro_profection_chart": astro.run_profection_and_subject,
+    "astro_horary_question": horary.run_horary_question_and_subject,
+}
+
+# Short Russian label for the chart's own header block (title_lines[0]) —
+# see chart_draw.draw_wheel_svg's own title_lines param.
+_CHART_TITLE_LABEL: Dict[str, str] = {
+    "astro_natal_chart": "Натальная карта",
+    "astro_transit_chart": "Транзитная карта",
+    "astro_synastry_chart": "Синастрия",
+    "astro_progression_chart": "Прогрессивная карта",
+    "astro_direction_chart": "Карта директных положений",
+    "astro_lunar_return_chart": "Лунное возвращение",
+    "astro_solar_return_chart": "Солнечное возвращение",
+    "astro_profection_chart": "Профекция",
+    "astro_horary_question": "Хорарная карта",
+    "astro_electional_chart": "Электив (наилучшая дата)",
+    "astro_rectification_trutine": "Ректификация (Тритона Гермеса)",
+    "astro_rectification_events": "Ректификация (по событиям)",
+}
+
+# What the outer ring represents, for the second line of the header block —
+# only set for techniques that actually draw one (chart_subject built with
+# second != None); omitted entirely for single-subject techniques.
+_CHART_SECOND_LABEL: Dict[str, str] = {
+    "astro_transit_chart": "Внешнее кольцо: транзитные планеты",
+    "astro_synastry_chart": "Внешнее кольцо: планеты партнёра",
+    "astro_progression_chart": "Внешнее кольцо: прогрессивные планеты",
+    "astro_direction_chart": "Внешнее кольцо: директные положения",
+    "astro_lunar_return_chart": "Внешнее кольцо: лунное возвращение",
+    "astro_solar_return_chart": "Внешнее кольцо: солнечное возвращение",
+}
+
+
+def _chart_datetime_line(subject: Any) -> Optional[str]:
+    """DD.MM.YYYY HH:MM straight off the subject's own stored fields — no
+    locale-dependent month-name formatting needed, and avoids the
+    unreliable subject.iso_formatted_local_datetime string (its own
+    quirks around historical/DST offsets aren't worth working around just
+    for a header line)."""
+    try:
+        return (
+            f"{int(subject.day):02d}.{int(subject.month):02d}.{int(subject.year):04d} "
+            f"{int(subject.hour):02d}:{int(subject.minute):02d}"
+        )
+    except Exception:
+        return None
+
+
+def _chart_place_line(subject: Any, spec_text: str) -> Optional[str]:
+    """Best-effort place label for the header: a real city name if one
+    can be found by name-matching spec_text against the same gazetteer
+    utils/astro.py's own geocoding already uses (astro._lookup_city_exact
+    — exact/alternate-name matches only, no fuzzy guessing for a header
+    line), otherwise plain coordinates. subject.city can't be trusted for
+    this — utils.astro._build_subject only ever passes lat/lon/tz into
+    kerykeion's AstrologicalSubjectFactory, never a city name (fields["city"]
+    is never populated anywhere in this app), so kerykeion's own default
+    placeholder ("Greenwich") would show up instead of the real place."""
+    city = None
+    if spec_text:
+        try:
+            record = astro._lookup_city_exact(spec_text)
+            if record:
+                city = record.get("name")
+        except Exception:
+            city = None
+    try:
+        lat, lon = float(subject.lat), float(subject.lng)
+    except Exception:
+        return city
+    coord = f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}, {abs(lon):.2f}°{'E' if lon >= 0 else 'W'}"
+    return f"{city} ({coord})" if city else coord
+
+
+def _chart_title_lines(tool_name: str, subject: Any, spec_text: str = "") -> List[str]:
+    label = _CHART_TITLE_LABEL.get(tool_name, tool_name)
+    name = (getattr(subject, "name", "") or "").strip()
+    lines = [label]
+    if name and name.lower() not in ("subject", "electional"):
+        lines.append(name)
+    dt_line = _chart_datetime_line(subject)
+    if dt_line:
+        lines.append(dt_line)
+    place_line = _chart_place_line(subject, spec_text)
+    if place_line:
+        lines.append(place_line)
+    return lines
+
+
+async def _attach_chart_if_applicable(
+    loop: asyncio.AbstractEventLoop,
+    assistant_msg_id: int,
+    tool_name: str,
+    query: str,
+    spec_text: str,
+    chart_subject: Any,
+    chart_second: Any,
+    chart_highlight_house: Optional[int],
+) -> List[dict]:
+    """Draws and attaches the wheel-chart SVG for this tool's reply, unless
+    there's no subject to draw (lookup failed somewhere upstream) or the
+    user's own message explicitly declined an image (see
+    utils/chart_draw.should_draw_chart's own docstring on why it defaults
+    to drawing). Mirrors the exact sync file-attachment shape the plain-
+    chat code-block path already uses (db.repository.add_file + a
+    {"id", "filename", "mime_type", "size"} dict) so the frontend needs no
+    changes at all — see utils/chart_draw.py's own module docstring.
+
+    spec_text is the same birth-info text used to build chart_subject
+    (tool_arg, not req.query) — passed through to _chart_title_lines so
+    the header's place label is looked up against the actual text that
+    produced this specific chart, not just the current message."""
+    if chart_subject is None:
+        return []
+    should_draw = await loop.run_in_executor(None, chart_draw.should_draw_chart, query)
+    if not should_draw:
+        return []
+    title_lines = _chart_title_lines(tool_name, chart_subject, spec_text)
+    second_label = _CHART_SECOND_LABEL.get(tool_name) if chart_second is not None else None
+    try:
+        svg_bytes = await loop.run_in_executor(
+            None,
+            lambda: chart_draw.draw_wheel_svg(
+                chart_subject,
+                second=chart_second,
+                title_lines=title_lines,
+                highlight_house=chart_highlight_house,
+                second_label=second_label,
+            ),
+        )
+    except Exception as e:
+        print(f"[chart_draw] rendering failed for {tool_name}: {e!r}")
+        return []
+    filename = chart_draw.unique_chart_filename(prefix=tool_name.replace("astro_", ""))
+    file_id = repository.add_file(assistant_msg_id, filename, "image/svg+xml", svg_bytes)
+    return [
+        {
+            "id": file_id,
+            "filename": filename,
+            "mime_type": "image/svg+xml",
+            "size": len(svg_bytes),
+        }
+    ]
 
 
 async def _handle_tool_request(
@@ -742,6 +924,10 @@ async def _handle_tool_request(
     # transit, datetime, calculator, ...) is untouched by this branch and
     # keeps using the generic tool_spec["run"] dispatch below.
     split_hint = None
+    chart_subject: Any = None
+    chart_second: Any = None
+    chart_highlight_house: Optional[int] = None
+
     if decision.tool_name == "astro_synastry_chart":
         heuristic_missing = await loop.run_in_executor(
             None, astro.synastry_fields_missing, tool_arg
@@ -753,8 +939,38 @@ async def _handle_tool_request(
                 f"(missing={heuristic_missing!r}); LLM segmentation hint: "
                 f"{split_hint!r}"
             )
-        tool_result = await loop.run_in_executor(
-            None, lambda: astro.run_synastry(tool_arg, split_hint=split_hint)
+        # Single computation for both the text reply and the chart's two
+        # subjects (astro.run_synastry_and_subject) — no longer a second,
+        # separate rebuild of both people's charts just to get something
+        # to draw (see _SIMPLE_AND_SUBJECT_FUNCS' own comment on why that
+        # doubling was a real performance regression for every technique
+        # it applied to, synastry included).
+        tool_result, chart_subject, chart_second = await loop.run_in_executor(
+            None, lambda: astro.run_synastry_and_subject(tool_arg, split_hint=split_hint)
+        )
+    elif decision.tool_name == "astro_electional_chart":
+        # Reuses the ONE expensive range-search call for both tool_result
+        # and the winning candidate's subject, instead of re-running the
+        # search — see electional.run_electional_chart_and_subject.
+        tool_result, chart_subject = await loop.run_in_executor(
+            None, electional.run_electional_chart_and_subject, tool_arg
+        )
+    elif decision.tool_name == "astro_rectification_trutine":
+        tool_result, chart_subject = await loop.run_in_executor(
+            None, rectification._run_rectification_trutine_full, tool_arg
+        )
+    elif decision.tool_name == "astro_rectification_events":
+        tool_result, chart_subject = await rectification_events.run_rectification_events_and_subject_async(
+            tool_arg
+        )
+    elif decision.tool_name in _SIMPLE_AND_SUBJECT_FUNCS:
+        # The remaining 8 "cheap" techniques — one call does double duty
+        # (text reply + chart subject), see _SIMPLE_AND_SUBJECT_FUNCS' own
+        # comment for why this replaced the old tool_spec["run"] + separate
+        # get_*_chart_subject(s) two-call pattern.
+        func = _SIMPLE_AND_SUBJECT_FUNCS[decision.tool_name]
+        tool_result, chart_subject, chart_second, chart_highlight_house = await loop.run_in_executor(
+            None, func, tool_arg
         )
     else:
         tool_result = await loop.run_in_executor(None, tool_spec["run"], tool_arg)
@@ -791,6 +1007,10 @@ async def _handle_tool_request(
         assistant_msg_id = repository.add_message(
             conversation_id, "assistant", resp_text, responded_at, thinking_ms
         )
+        chart_files = await _attach_chart_if_applicable(
+            loop, assistant_msg_id, decision.tool_name, req.query, tool_arg,
+            chart_subject, chart_second, chart_highlight_house,
+        )
         repository.touch_conversation(conversation_id)
         return {
             "conversation_id": conversation_id,
@@ -801,8 +1021,9 @@ async def _handle_tool_request(
             "thinking_ms": thinking_ms,
             "status": "complete",
             "contexts_used": 0,
-            "files": [],
+            "files": chart_files,
             "tool_used": decision.tool_name,
+            "message_id": assistant_msg_id,
         }
 
     if (
@@ -1041,6 +1262,10 @@ async def _handle_tool_request(
     assistant_msg_id = repository.add_message(
         conversation_id, "assistant", resp_text, responded_at, thinking_ms
     )
+    chart_files = await _attach_chart_if_applicable(
+        loop, assistant_msg_id, decision.tool_name, req.query, tool_arg,
+        chart_subject, chart_second, chart_highlight_house,
+    )
     repository.touch_conversation(conversation_id)
 
     return {
@@ -1052,8 +1277,9 @@ async def _handle_tool_request(
         "thinking_ms": thinking_ms,
         "status": "complete",
         "contexts_used": 0,
-        "files": [],
+        "files": chart_files,
         "tool_used": decision.tool_name,
+        "message_id": assistant_msg_id,
     }
 
 

@@ -134,6 +134,15 @@
   .code-block .copy-btn { background: rgba(255, 255, 255, 0.12); color: #e6edf3; }
   .code-block .copy-btn:hover { background: rgba(255, 255, 255, 0.22); }
 
+  /* Sits to the left of .msg-copy-btn (same top-right corner, offset by
+     one button-width + gap) rather than stacking on top of it — both are
+     .copy-btn for shared hover/opacity behavior, this just repositions. */
+  .bubble .pdf-export-btn {
+    right: 34px;
+    text-decoration: none;
+    display: inline-block;
+  }
+
   .file-card {
     display: flex;
     align-items: center;
@@ -263,6 +272,6 @@
   </main>
 </div>
 
-<script src="/static/js/app.js"></script>
+<script src="/static/js/app.js?v={{ static_version }}"></script>
 </body>
 </html>

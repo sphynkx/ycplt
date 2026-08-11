@@ -881,6 +881,12 @@ def _compute_horary_chart(spec: str) -> Dict[str, Any]:
         "date": fields["date"], "time": fields.get("time", "12:00"), "tz": fields.get("tz", ""),
         "is_radical": is_radical,
         "radicality_notes": radicality_notes,
+        # Carried so utils/chart_draw.py can draw this exact chart without
+        # rebuilding it from spec a second time (a horary chart is cheap
+        # to recompute either way, unlike electional/rectification's
+        # window scans, but there's no reason to even pay that small cost
+        # when the subject already exists right here).
+        "subject": subject,
     }
 
     topic_house = _classify_topic_house(question_text)
@@ -1080,19 +1086,20 @@ def extract_best_recommendation(report_text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def run_horary_question(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_horary_question"]).
-    Computes the full chart deterministically and returns the FULL
-    underlying report (radicality, significators and their dignities, Moon
-    status, the key aspect or translation/collection of light, verdict) —
-    this becomes the "computed facts" context for the normal RAG-augmented
-    follow-up call every other astro_* tool already uses, reasoning against
-    horary_methodology.txt (see routes/chat.py: this tool is in
-    _INTERPRETED_TOOL_NAMES, no no-followup bypass — see module docstring
-    for why this replaced an earlier short-verdict-only design)."""
+def run_horary_question_and_subject(spec: str) -> Tuple[str, Optional[Any]]:
+    """Full logic for the horary tool, computing the chart via
+    _compute_horary_chart ONCE and returning (report, subject) —
+    previously run_horary_question and get_chart_subject each called
+    _compute_horary_chart independently, meaning every horary reply built
+    the whole chart (radicality checks, dignities, aspects, LLM field
+    extraction) twice: once for the text report, once again just to get a
+    subject for the wheel-chart image. Same "_and_subject" convention
+    utils/electional.py and utils/rectification.py already established
+    for their own expensive computations — see
+    electional.run_electional_chart_and_subject's own docstring."""
     data = _compute_horary_chart(spec)
     if "error" in data:
-        return data["error"]
+        return data["error"], None
 
     verdict_line = f"ИТОГОВЫЙ ВЕРДИКТ: {'Да' if data['verdict'] == 'positive' else 'Нет'} ({data['reason']})."
 
@@ -1179,4 +1186,29 @@ def run_horary_question(spec: str) -> str:
 
     lines.append("")
     lines.append(verdict_line)
-    return "\n".join(lines)
+    return "\n".join(lines), data.get("subject")
+
+
+def run_horary_question(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_horary_question"]).
+    Computes the full chart deterministically and returns the FULL
+    underlying report (radicality, significators and their dignities, Moon
+    status, the key aspect or translation/collection of light, verdict) —
+    this becomes the "computed facts" context for the normal RAG-augmented
+    follow-up call every other astro_* tool already uses, reasoning against
+    horary_methodology.txt (see routes/chat.py: this tool is in
+    _INTERPRETED_TOOL_NAMES, no no-followup bypass — see module docstring
+    for why this replaced an earlier short-verdict-only design). Thin
+    wrapper — see run_horary_question_and_subject for the full logic."""
+    return run_horary_question_and_subject(spec)[0]
+
+
+def get_chart_subject(spec: str) -> Optional[Any]:
+    """Kept as a thin wrapper (rather than removed outright) in case
+    anything besides routes/chat.py's own dispatch still calls it
+    directly — but routes/chat.py itself no longer does; it gets the
+    subject straight from run_horary_question_and_subject's own return
+    value instead, since that already computed it. Still recomputes if
+    called on its own, same "cheap enough to redo" reasoning as before —
+    just no longer the code path actually used for chart drawing."""
+    return run_horary_question_and_subject(spec)[1]

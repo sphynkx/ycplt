@@ -2011,22 +2011,46 @@ def is_error_result(tool_result: str) -> bool:
     return tool_result.startswith(_ERROR_RESULT_PREFIXES)
 
 
+def run_natal_and_subject(spec: str) -> Tuple[str, Optional[Any], None, None]:
+    """Full logic for the natal-chart tool, returning the built subject
+    alongside its text report — added so routes/chat.py's chart-drawing
+    step can reuse the SAME subject instead of rebuilding it a second
+    time via a separate get_natal_chart_subject() call (that used to mean
+    every natal-chart reply parsed the spec and ran the full ephemeris/
+    fixed-star computation twice; see this function's own callers for the
+    "_and_subject" convention already established by
+    electional.run_electional_chart_and_subject and
+    rectification._run_rectification_trutine_full — same idea, applied
+    here for the same reason: never do twice what one call can hand to
+    both a text report and a chart image).
+
+    Returns (text, subject, None, None) — the trailing None, None keep
+    this the same 4-tuple shape as every other "cheap" technique's
+    _and_subject sibling (subject, second_subject_or_overlay,
+    highlight_house), even though natal charts have no second subject or
+    highlighted house — see routes/chat.py's _SIMPLE_AND_SUBJECT_FUNCS
+    for why a uniform shape across all of them keeps that dispatch code
+    a single generic branch instead of one bespoke branch per technique."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields), None, None, None
+    try:
+        subject = _build_subject(fields, name=fields.get("name") or "Subject")
+    except Exception as e:
+        return f"Не удалось построить натальную карту — некорректные данные ({e}).", None, None, None
+    try:
+        return _format_natal_text(subject), subject, None, None
+    except Exception as e:
+        return f"Ошибка при расчёте натальной карты: {e}", None, None, None
+
+
 def run_natal(spec: str) -> str:
     """Tool entry point (utils.tools.TOOL_REGISTRY["astro_natal_chart"]).
     Never raises — any failure becomes a plain-text explanation instead,
     since the caller feeds the return value straight into a follow-up
-    generation, not into error-handling code."""
-    fields, missing = _extract_fields(spec)
-    if missing:
-        return _missing_fields_message(missing, fields)
-    try:
-        subject = _build_subject(fields, name=fields.get("name") or "Subject")
-    except Exception as e:
-        return f"Не удалось построить натальную карту — некорректные данные ({e})."
-    try:
-        return _format_natal_text(subject)
-    except Exception as e:
-        return f"Ошибка при расчёте натальной карты: {e}"
+    generation, not into error-handling code. Thin wrapper — see
+    run_natal_and_subject for the full logic."""
+    return run_natal_and_subject(spec)[0]
 
 
 def _build_transit_subjects(fields: Dict[str, str], name: str) -> Tuple[Optional[Any], Optional[Any], Optional[str]]:
@@ -2086,18 +2110,25 @@ def _build_transit_subjects(fields: Dict[str, str], name: str) -> Tuple[Optional
     return natal, transit_subject, None
 
 
-def run_transit(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_transit_chart"])."""
+def run_transit_and_subject(spec: str) -> Tuple[str, Optional[Any], Optional[Any], None]:
+    """See run_natal_and_subject's docstring for the "_and_subject"
+    convention this follows. Returns (text, natal, transit_subject, None)."""
     fields, missing = _extract_fields(spec)
     if missing:
-        return _missing_fields_message(missing, fields)
+        return _missing_fields_message(missing, fields), None, None, None
     natal, transit_subject, error = _build_transit_subjects(fields, name=fields.get("name") or "Subject")
     if error:
-        return error
+        return error, None, None, None
     try:
-        return _format_transit_text(natal, transit_subject)
+        return _format_transit_text(natal, transit_subject), natal, transit_subject, None
     except Exception as e:
-        return f"Ошибка при расчёте транзитов: {e}"
+        return f"Ошибка при расчёте транзитов: {e}", None, None, None
+
+
+def run_transit(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_transit_chart"]).
+    Thin wrapper — see run_transit_and_subject for the full logic."""
+    return run_transit_and_subject(spec)[0]
 
 
 def get_transit_profiles(spec: str, top_n: int = 12) -> List[Dict]:
@@ -2287,20 +2318,27 @@ def _format_progression_text(natal, progressed, target_dt: datetime, age_years: 
     return "\n".join(lines)
 
 
-def run_progression(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_progression_chart"])."""
+def run_progression_and_subject(spec: str) -> Tuple[str, Optional[Any], Optional[Any], None]:
+    """See run_natal_and_subject's docstring for the "_and_subject"
+    convention. Returns (text, natal, progressed, None)."""
     fields, missing = _extract_fields(spec)
     if missing:
-        return _missing_fields_message(missing, fields)
+        return _missing_fields_message(missing, fields), None, None, None
     natal, progressed, target_dt, age_years, error = _build_progression_subjects(
         fields, name=fields.get("name") or "Subject"
     )
     if error:
-        return error
+        return error, None, None, None
     try:
-        return _format_progression_text(natal, progressed, target_dt, age_years)
+        return _format_progression_text(natal, progressed, target_dt, age_years), natal, progressed, None
     except Exception as e:
-        return f"Ошибка при расчёте прогрессий: {e}"
+        return f"Ошибка при расчёте прогрессий: {e}", None, None, None
+
+
+def run_progression(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_progression_chart"]).
+    Thin wrapper — see run_progression_and_subject for the full logic."""
+    return run_progression_and_subject(spec)[0]
 
 
 def get_progression_profiles(spec: str, top_n: int = 12) -> List[Dict]:
@@ -2401,6 +2439,28 @@ def _build_synastry_subjects(
     return person_a, person_b, None
 
 
+def run_synastry_and_subject(
+    spec: str, split_hint: Optional[Tuple[str, str]] = None
+) -> Tuple[str, Optional[Any], Optional[Any]]:
+    """See run_natal_and_subject's docstring for the "_and_subject"
+    convention — this one predates that name (routes/chat.py used to call
+    _extract_two_person_fields + _build_synastry_subjects a second time
+    itself, right after this same computation, specifically so the drawn
+    chart's person-A/person-B split matched split_hint; that second build
+    is now unnecessary since this function hands both subjects back
+    directly). Returns (text, person_a, person_b)."""
+    fields_a, fields_b, missing = _extract_two_person_fields(spec, split_hint=split_hint)
+    if missing:
+        return _missing_synastry_fields_message(missing), None, None
+    person_a, person_b, error = _build_synastry_subjects(fields_a, fields_b)
+    if error:
+        return error, None, None
+    try:
+        return _format_synastry_text(person_a, person_b), person_a, person_b
+    except Exception as e:
+        return f"Ошибка при расчёте синастрии: {e}", None, None
+
+
 def run_synastry(spec: str, split_hint: Optional[Tuple[str, str]] = None) -> str:
     """Tool entry point (utils.tools.TOOL_REGISTRY["astro_synastry_chart"]).
 
@@ -2408,17 +2468,9 @@ def run_synastry(spec: str, split_hint: Optional[Tuple[str, str]] = None) -> str
     the generic tool-dispatch mechanism (utils.tools.TOOL_REGISTRY callers
     invoke run() with a single positional spec string) — see
     _extract_two_person_fields' own docstring for what it is and why it's
-    safe (segmentation only, never reformatting a date/time/coordinate)."""
-    fields_a, fields_b, missing = _extract_two_person_fields(spec, split_hint=split_hint)
-    if missing:
-        return _missing_synastry_fields_message(missing)
-    person_a, person_b, error = _build_synastry_subjects(fields_a, fields_b)
-    if error:
-        return error
-    try:
-        return _format_synastry_text(person_a, person_b)
-    except Exception as e:
-        return f"Ошибка при расчёте синастрии: {e}"
+    safe (segmentation only, never reformatting a date/time/coordinate).
+    Thin wrapper — see run_synastry_and_subject for the full logic."""
+    return run_synastry_and_subject(spec, split_hint=split_hint)[0]
 
 
 def synastry_fields_missing(spec: str) -> List[str]:
@@ -2676,20 +2728,38 @@ def _format_direction_text(
     return "\n".join(lines)
 
 
-def run_direction(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_direction_chart"])."""
+def run_direction_and_subject(spec: str) -> Tuple[str, Optional[Any], Optional[List[Dict[str, Any]]], None]:
+    """See run_natal_and_subject's docstring for the "_and_subject"
+    convention. Returns (text, natal, overlay_points, None) — overlay_points
+    already shaped for utils.chart_draw.draw_wheel_svg's own
+    second=[{"label", "abs_pos", "retrograde"}, ...] list form, since
+    directions have no independently-cast second chart (see
+    _build_direction_subjects' own docstring: solar arc directions are
+    just every natal point shifted by one shared angle)."""
     fields, missing = _extract_fields(spec)
     if missing:
-        return _missing_fields_message(missing, fields)
+        return _missing_fields_message(missing, fields), None, None, None
     natal, directed_points, target_dt, age_years, arc_degrees, error = _build_direction_subjects(
         fields, name=fields.get("name") or "Subject"
     )
     if error:
-        return error
+        return error, None, None, None
     try:
-        return _format_direction_text(natal, directed_points, target_dt, age_years, arc_degrees)
+        text = _format_direction_text(natal, directed_points, target_dt, age_years, arc_degrees)
     except Exception as e:
-        return f"Ошибка при расчёте дирекций: {e}"
+        return f"Ошибка при расчёте дирекций: {e}", None, None, None
+    kery_to_label = {attr_to_kerykeion_name(attr): label for label, attr in _PLANET_ATTRS + _ANGLE_ATTRS}
+    overlay = [
+        {"label": kery_to_label[kery_name], "abs_pos": point.abs_pos, "retrograde": point.retrograde}
+        for kery_name, point in directed_points.items() if kery_name in kery_to_label
+    ]
+    return text, natal, overlay, None
+
+
+def run_direction(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_direction_chart"]).
+    Thin wrapper — see run_direction_and_subject for the full logic."""
+    return run_direction_and_subject(spec)[0]
 
 
 def get_direction_profiles(spec: str, top_n: int = 12) -> List[Dict]:
@@ -3008,36 +3078,52 @@ def _format_return_text(
     return "\n".join(lines)
 
 
-def run_lunar_return(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_lunar_return_chart"])."""
+def run_lunar_return_and_subject(spec: str) -> Tuple[str, Optional[Any], Optional[Any], None]:
+    """See run_natal_and_subject's docstring for the "_and_subject"
+    convention. Returns (text, natal, return_subject, None)."""
     fields, missing = _extract_fields(spec)
     if missing:
-        return _missing_fields_message(missing, fields)
+        return _missing_fields_message(missing, fields), None, None, None
     natal, return_subject, target_dt, current_return_dt, next_return_dt, error = _build_return_subjects(
         fields, name=fields.get("name") or "Subject", return_type="Lunar"
     )
     if error:
-        return error
+        return error, None, None, None
     try:
-        return _format_return_text(natal, return_subject, "Lunar", target_dt, current_return_dt, next_return_dt)
+        text = _format_return_text(natal, return_subject, "Lunar", target_dt, current_return_dt, next_return_dt)
+        return text, natal, return_subject, None
     except Exception as e:
-        return f"Ошибка при расчёте лунара: {e}"
+        return f"Ошибка при расчёте лунара: {e}", None, None, None
 
 
-def run_solar_return(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_solar_return_chart"])."""
+def run_lunar_return(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_lunar_return_chart"]).
+    Thin wrapper — see run_lunar_return_and_subject for the full logic."""
+    return run_lunar_return_and_subject(spec)[0]
+
+
+def run_solar_return_and_subject(spec: str) -> Tuple[str, Optional[Any], Optional[Any], None]:
+    """See run_natal_and_subject's docstring for the "_and_subject"
+    convention. Returns (text, natal, return_subject, None)."""
     fields, missing = _extract_fields(spec)
     if missing:
-        return _missing_fields_message(missing, fields)
+        return _missing_fields_message(missing, fields), None, None, None
     natal, return_subject, target_dt, current_return_dt, next_return_dt, error = _build_return_subjects(
         fields, name=fields.get("name") or "Subject", return_type="Solar"
     )
     if error:
-        return error
+        return error, None, None, None
     try:
-        return _format_return_text(natal, return_subject, "Solar", target_dt, current_return_dt, next_return_dt)
+        text = _format_return_text(natal, return_subject, "Solar", target_dt, current_return_dt, next_return_dt)
+        return text, natal, return_subject, None
     except Exception as e:
-        return f"Ошибка при расчёте солара: {e}"
+        return f"Ошибка при расчёте солара: {e}", None, None, None
+
+
+def run_solar_return(spec: str) -> str:
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_solar_return_chart"]).
+    Thin wrapper — see run_solar_return_and_subject for the full logic."""
+    return run_solar_return_and_subject(spec)[0]
 
 
 def _get_return_profiles(spec: str, return_type: str, top_n: int) -> List[Dict]:
@@ -3223,25 +3309,36 @@ def _format_profection_text(
     return "\n".join(lines)
 
 
+def run_profection_and_subject(spec: str) -> Tuple[str, Optional[Any], None, Optional[int]]:
+    """See run_natal_and_subject's docstring for the "_and_subject"
+    convention. Returns (text, natal, None, house_num) — highlight_house
+    (not a second subject) is this technique's own third slot, matching
+    chart_draw.draw_wheel_svg's highlight_house param for shading the
+    "activated" house wedge."""
+    fields, missing = _extract_fields(spec)
+    if missing:
+        return _missing_fields_message(missing, fields), None, None, None
+    natal, target_dt, age_full_years, error = _build_profection_context(
+        fields, name=fields.get("name") or "Subject"
+    )
+    if error:
+        return error, None, None, None
+    try:
+        house_num, sign_code, ruler_ru = _profection_house_and_ruler(natal, age_full_years)
+        text = _format_profection_text(natal, target_dt, age_full_years, house_num, sign_code, ruler_ru)
+        return text, natal, None, house_num
+    except Exception as e:
+        return f"Ошибка при расчёте профекции: {e}", None, None, None
+
+
 def run_profection(spec: str) -> str:
     """Tool entry point (utils.tools.TOOL_REGISTRY["astro_profection_chart"]).
     Unlike every other run_* here, this builds NO new ephemeris chart at
     all — profections are pure calendar+rulership arithmetic over the
     already-computed natal chart (see _build_profection_context/
-    _profection_house_and_ruler)."""
-    fields, missing = _extract_fields(spec)
-    if missing:
-        return _missing_fields_message(missing, fields)
-    natal, target_dt, age_full_years, error = _build_profection_context(
-        fields, name=fields.get("name") or "Subject"
-    )
-    if error:
-        return error
-    try:
-        house_num, sign_code, ruler_ru = _profection_house_and_ruler(natal, age_full_years)
-        return _format_profection_text(natal, target_dt, age_full_years, house_num, sign_code, ruler_ru)
-    except Exception as e:
-        return f"Ошибка при расчёте профекции: {e}"
+    _profection_house_and_ruler). Thin wrapper — see
+    run_profection_and_subject for the full logic."""
+    return run_profection_and_subject(spec)[0]
 
 
 def get_profection_profiles(spec: str, top_n: int = 9) -> List[Dict]:

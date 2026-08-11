@@ -812,7 +812,14 @@ def _evaluate_candidate(
         for ev in events
     ]
     total_score = sum(sum(er["technique_scores"].values()) for er in event_results)
-    return {"birth_dt": candidate_birth_dt, "total_score": total_score, "event_results": event_results}
+    return {
+        "birth_dt": candidate_birth_dt, "total_score": total_score, "event_results": event_results,
+        # Free (natal was already built above) — lets the winning
+        # candidate's chart reach utils/chart_draw.py without re-running
+        # this whole multi-event window scan a second time, same reason
+        # rectification.py's own _evaluate_candidate carries "birth_subject".
+        "natal_subject": natal,
+    }
 
 
 def _diverse_top_candidates(results: List[Dict], top_n: int, min_separation_minutes: int) -> List[Dict]:
@@ -910,12 +917,22 @@ def _format_candidate_block(index: int, r: Dict, max_matches_shown: int) -> str:
 _CANDIDATE_EXECUTOR = ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4)))
 
 
-async def run_rectification_events_async(spec: str) -> str:
+async def run_rectification_events_and_subject_async(spec: str) -> Tuple[str, Optional[Any]]:
     """The actual multi-candidate search, run concurrently: each
     candidate's full evaluation (1 natal + up to 2*len(events) further
     charts) is independent of every other candidate's, so all of them are
     dispatched to _CANDIDATE_EXECUTOR at once via asyncio.gather rather
-    than evaluated one at a time in a plain loop — see module docstring."""
+    than evaluated one at a time in a plain loop — see module docstring.
+
+    Returns (report_text, winning_candidate_natal_subject_or_None).
+    run_rectification_events_async (below) is a thin wrapper discarding
+    the second element, kept as the plain str-returning function
+    utils.tools.TOOL_REGISTRY actually calls — this richer-returning
+    sibling exists so routes/chat.py's chart-drawing step can get the
+    winning candidate's already-built chart (see _evaluate_candidate's
+    "natal_subject" key) WITHOUT re-running this whole multi-candidate,
+    multi-event search a second time, exactly the same reasoning
+    rectification.py's own _run_rectification_trutine_full has."""
     birth_text, events, warnings = _extract_events_and_birth_text(spec)
     if not events:
         return (
@@ -923,7 +940,7 @@ async def run_rectification_events_async(spec: str) -> str:
             "либо \"описание: дата\" (например \"брак: 21.01.1983\"), либо \"описание; дата; "
             "[время]; [место]; [широта]; [долгота]; [комментарий]\" (лишние поля после даты можно "
             "не указывать или оставлять пустыми). " + " ".join(warnings)
-        ).strip()
+        ).strip(), None
 
     if len(events) > _MAX_EVENTS:
         warnings.append(f"Событий больше {_MAX_EVENTS} — учтены только первые {_MAX_EVENTS}.")
@@ -939,7 +956,7 @@ async def run_rectification_events_async(spec: str) -> str:
 
     fields, window_start, window_end, step_minutes, missing = _extract_birth_window_fields(birth_text)
     if missing:
-        return _missing_fields_message(missing)
+        return _missing_fields_message(missing), None
 
     name = fields.get("name") or "Subject"
     candidates = _build_candidate_datetimes(
@@ -953,7 +970,7 @@ async def run_rectification_events_async(spec: str) -> str:
     ])
     results = [r for r in raw if r is not None]
     if not results:
-        return "Не удалось рассчитать ни одного варианта карты в заданном окне — проверьте дату/координаты."
+        return "Не удалось рассчитать ни одного варианта карты в заданном окне — проверьте дату/координаты.", None
 
     best = max(results, key=lambda r: r["total_score"])
 
@@ -1061,6 +1078,15 @@ async def run_rectification_events_async(spec: str) -> str:
         report = render(1, 0, max_events_listed=max(10, _MAX_REPORT_CHARS // 150))
     if len(report) > _MAX_REPORT_CHARS:
         report = report[:_MAX_REPORT_CHARS] + "\n[отчёт обрезан, слишком много данных для одного ответа]"
+    return report, best.get("natal_subject")
+
+
+async def run_rectification_events_async(spec: str) -> str:
+    """Thin wrapper over run_rectification_events_and_subject_async,
+    discarding the winning candidate's chart object — kept under this
+    name since it's a real, already-existing async entry point other code
+    may call expecting a plain string."""
+    report, _subject = await run_rectification_events_and_subject_async(spec)
     return report
 
 

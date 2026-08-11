@@ -1551,15 +1551,22 @@ def _compute_electional_chart(
                 "вероятно, проблема с расчётом восхода/захода для этого места (например, "
                 "приполярная широта). Уточните место или конкретный момент для проверки."
             )}
-        return {"mode": "range", "search": search, **search["best"]}
+        # lat/lon carried alongside the winning candidate's own date/time/tz
+        # (already in search["best"]) purely so run_electional_chart_and_
+        # subject can rebuild that candidate's chart for drawing without
+        # re-running this whole window scan a second time — see that
+        # function's own docstring.
+        return {"mode": "range", "search": search, "lat": resolved["lat"], "lon": resolved["lon"], **search["best"]}
 
     resolved = _resolve_single_moment_request(spec)
     if "error" in resolved:
         return resolved
-    return _compute_electional_chart_core(
+    result = _compute_electional_chart_core(
         resolved["fields"], resolved["category"], resolved["category_source"], resolved["purpose_text"],
         querent_natal_subject=querent_natal_subject, querent_natal_desc=querent_natal_desc,
     )
+    result["lat"], result["lon"] = resolved["fields"]["lat"], resolved["fields"]["lon"]
+    return result
 
 
 # --- report formatting --------------------------------------------------------
@@ -1690,7 +1697,25 @@ def _build_report_lines(data: Dict[str, Any]) -> List[str]:
 
 
 def run_electional_chart(spec: str) -> str:
-    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_electional_chart"]).
+    """Tool entry point (utils.tools.TOOL_REGISTRY["astro_electional_chart"])
+    — thin wrapper over run_electional_chart_and_subject, discarding the
+    winning moment's chart object."""
+    return run_electional_chart_and_subject(spec)[0]
+
+
+def run_electional_chart_and_subject(spec: str) -> Tuple[str, Optional[Any]]:
+    """Does the actual work; returns (report_text, winning_moment_subject_
+    or_None). Split out from run_electional_chart so routes/chat.py's
+    chart-drawing step can get the winning moment's chart WITHOUT
+    re-running a potentially expensive range search a second time (up to
+    _MAX_SEARCH_WINDOW_DAYS*24 candidate hours) — same reasoning
+    rectification.py's own _run_rectification_trutine_full and
+    rectification_events.py's own run_rectification_events_and_subject_
+    async have, for the same class of expensive-search tool. The subject
+    is rebuilt (a single cheap _build_subject call, not a search) from the
+    winning candidate's own date/time/lat/lon/tz, which _compute_
+    electional_chart carries alongside the result for exactly this reason
+    (see its own "lat"/"lon" comments).
 
     routes/chat.py appends the FULL prior-conversation user text after
     HISTORY_MARKER, past whatever round-scoped tool_arg it already built —
@@ -1708,7 +1733,16 @@ def run_electional_chart(spec: str) -> str:
         main_spec, querent_natal_subject=querent_natal_subject, querent_natal_desc=querent_natal_desc,
     )
     if "error" in data:
-        return data["error"]
+        return data["error"], None
+
+    winning_subject: Optional[Any] = None
+    try:
+        winning_subject = astro._build_subject(
+            {"date": data["date"], "time": data["time"], "lat": str(data["lat"]), "lon": str(data["lon"]), "tz": data["tz"]},
+            name="electional",
+        )
+    except Exception:
+        winning_subject = None
 
     lines = _build_report_lines(data)
 
@@ -1771,4 +1805,4 @@ def run_electional_chart(spec: str) -> str:
         lines.append("")
         lines.append(best_moment_line)
 
-    return "\n".join(lines)
+    return "\n".join(lines), winning_subject

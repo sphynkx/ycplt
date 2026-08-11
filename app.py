@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 import asyncio
 
 from db.connection import init_db
-from routes import chat, conversations, files, pages
+from routes import chat, conversations, export, files, pages
 from utils import astro
 from utils import config
 from utils import image_jobs
@@ -36,6 +36,7 @@ app.include_router(pages.router)
 app.include_router(chat.router)
 app.include_router(conversations.router)
 app.include_router(files.router)
+app.include_router(export.router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 

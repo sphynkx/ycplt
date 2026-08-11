@@ -1389,6 +1389,205 @@ tool is possible in principle but a bigger lift — it needs outbound internet
 access, a search API/key, and more thought about what an offline-first local
 app should reach out to the network for.
 
+## Astrological wheel-chart rendering
+
+Every `astro_*` tool reply is now accompanied by a rendered wheel chart —
+the same circle-with-houses-and-planets image any desktop astrology
+program draws — attached as a file on the assistant's message, alongside
+its text answer. Pure SVG (`utils/chart_draw.py`), not PNG or a raster
+library: a wheel chart is just circles, radial lines, wedge paths, and
+text, all of which SVG expresses natively as a short XML string, rendered
+in milliseconds with no model or GPU involved. `image/svg+xml` renders
+inline in the chat UI with zero frontend changes — the existing file-
+attachment pipeline (`db.repository.add_file` + `GET /api/files/{id}` +
+the frontend's `mime_type.startsWith('image/')` check) already handles
+any image MIME type, SVG included. Filenames are unix-time-based
+(`utils.chart_draw.unique_chart_filename`, millisecond resolution) so two
+charts attached to the same reply can never collide.
+
+**Wheel convention** (matches mainstream Western astrology software, refined
+against the user's own reference screenshots from a real desktop
+astrology program): Ascendant at 9 o'clock (screen left), houses numbered
+counterclockwise from there (IV/IC at 6 o'clock, VII/Descendant at 3
+o'clock, X/MC at 12 o'clock). Three concentric bands, outer to inner: the
+12 zodiac-sign wedges (pastel by element — fire/earth/air/water), a
+dedicated light-blue **house band** just inside it holding the house
+cusp ticks and Roman-numeral labels, then the planet band. Splitting the
+house band out from the zodiac band is deliberate — an earlier version
+ran house-cusp lines all the way from the edge to the center, which
+visually collided with the aspect web; now the 8 non-angular cusps are
+short ticks confined to the outer bands only, never reaching the
+planet/aspect area. The two angle axes (Ascendant-Descendant,
+Midheaven-Imum Coeli) are drawn as single diameters (each pair is exactly
+180° apart by definition) that poke out past every ring and end in a
+marker — an arrowhead at the Ascendant, a small circle at the
+Midheaven — so the four cardinal points stay identifiable even where
+they'd otherwise be lost among aspect lines nearer the center. Every
+point additionally gets a small filled dot at its TRUE (un-nudged) degree
+right on the zodiac ring's inner edge — necessary because the glyphs
+themselves use a collision-avoiding "lane" system (crowded points nudged
+onto concentric rings within the planet band, each with a thin tick line
+back to its dot) — without that dot, an unaspected planet whose glyph got
+nudged away from its real position would be impossible to locate exactly.
+A retrograde point shows a small "R" riding below the glyph's baseline
+(SVG's `baseline-shift="sub"`), not the traditional "℞" character, which
+read poorly at this size.
+
+**Aspect lines**, per the explicit brief this was built against: trine/
+sextile = green, square = red, conjunction/opposition = blue; every minor
+aspect (semisextile, semisquare, quintile, sesquiquadrate, biquintile,
+quincunx) = purple/lilac, with a lighter or darker shade depending on
+whether `utils/astro.py`'s own harmonious/tense classification calls it
+one or the other. Line width is interpolated between thick (an exact, 0°-
+orb aspect) and thin (right at that aspect's own configured max orb) —
+"how close to exact" drives thickness rather than a fixed width per
+aspect type. Applying aspects (still forming) are solid; separating ones
+are dashed. Every aspect line is anchored to a planet's true-degree dot
+(the same dot described above), never to a separate floating inner point —
+an earlier version anchored aspects to a fixed inner circle with nothing
+marking it, which looked like the lines were "hanging" in empty space.
+Aspect lines on the wheel itself are restricted to the 10 classical
+planets plus Ascendant/MC (`chart_draw._WHEEL_ASPECT_POINTS`) — a real
+visual test with the full active-point set (which also includes the
+lunar node, Chiron, Lilith, and Part of Fortune) produced an unreadable
+web of ~100 possible pairs; those extra points are still placed on the
+ring as glyphs, just without aspect lines of their own.
+
+**Header block.** Each chart's top-left text block now includes the
+technique label, the subject's name (when a real one was given, not the
+generic "Subject"/"electional" placeholder), a `DD.MM.YYYY HH:MM` line
+read straight off the kerykeion subject's own stored fields, and a place
+line — a real city name if one can be matched in the same birth-info text
+via `utils.astro._lookup_city_exact` (the same gazetteer the free-text
+parser already uses), falling back to plain coordinates otherwise.
+`subject.city` itself can't be used for this — `utils.astro._build_subject`
+only ever passes lat/lon/tz into kerykeion, never a city string, so it
+would just show kerykeion's own placeholder ("Greenwich") instead of the
+real place.
+
+**Viewing a chart full-size.** `GET /api/files/{id}` used to always send
+`Content-Disposition: attachment`, which forces a download even when a
+person deliberately opens the file's own URL in a new tab to see it
+larger — routes/files.py now sends `inline` for every `image/*` MIME
+type (still `attachment` for everything else, e.g. extracted code files),
+and the chat UI wraps each image attachment in a `target="_blank"` link
+so clicking it opens the full chart in its own tab instead of triggering
+a download.
+
+**Single vs. dual charts.** Every technique ends up with either one
+kerykeion subject (natal, horary, profection, electional's winning
+moment, each rectification tool's winning candidate) or two (transit,
+synastry, progression, solar/lunar return) — `draw_wheel_svg`'s own
+`(subject, second=...)` signature mirrors that split. When there's a
+second subject, its own planets are drawn in an outer ring at their real
+degree, read against the FIRST (reference) subject's own houses/signs —
+the same interpretive convention this app's dual-chart text reports
+already use (see `astro.get_dual_chart_profiles`), just drawn instead of
+narrated. Solar arc directions are the one exception with no real second
+chart at all (every natal point is shifted by one shared arc, not
+independently cast) — `astro.run_direction_and_subject` returns a plain
+list of overlay points (its 3rd tuple slot) instead of a second subject,
+and the renderer draws that ring with no cross-chart aspect lines
+(there's nothing to compute them against). Profection instead shades its
+one "activated" house wedge distinctly (`highlight_house`, its 4th tuple
+slot).
+
+**Deciding whether to draw at all.** `chart_draw.should_draw_chart`
+default is to draw — the user's own stated requirement is "draw unless
+told not to" — via a one-line LLM classification of the user's message
+for an explicit opt-out ("без картинки", "не рисуй карту", "только
+текст", ...). This is the one LLM-first classifier in the app with a
+*permissive* default: every other classifier here (image intent, new-
+round detection, etc.) defaults to the conservative/narrower behavior
+when no model is loaded or on any exception, but this one defaults to
+`True` (draw) in both of those cases, since drawing is the expected
+normal outcome, not the exceptional one.
+
+**Where the subject comes from, per tool** (`routes/chat.py`,
+`_SIMPLE_AND_SUBJECT_FUNCS` and the surrounding dispatch code in
+`_handle_tool_request`): for 8 of the 10 chart techniques (natal,
+transit, progression, direction, lunar/solar return, profection) plus
+horary, the tool's own `run_*` function has a sibling `run_*_and_subject`
+that does the full field-extraction/ephemeris computation exactly ONCE
+and returns `(text, subject, second, highlight_house)` (a uniform 4-tuple,
+padded with `None` for whichever slots a given technique doesn't use) —
+`run_*` itself is now a thin one-line wrapper (`return
+run_x_and_subject(spec)[0]`). `_SIMPLE_AND_SUBJECT_FUNCS` maps each of
+these 8 tool names straight to its `_and_subject` function so
+`_handle_tool_request` can call it once and get both the reply text and
+the chart subject(s) from that single call; horary's
+`run_horary_question_and_subject` is dispatched the same way, just with
+a 2-tuple (`text, subject`) since it has no second subject or
+highlighted house. This replaced an earlier design where a separate
+`get_*_chart_subject(s)` getter rebuilt the same subject from scratch
+*after* the text reply had already computed it once — harmless-looking
+but a real, reported regression (every one of these 9 techniques was
+doing its full ephemeris/fixed-star/aspect computation twice per
+request); the `_and_subject` pattern eliminates that by construction,
+since the SAME call now produces both the text and the chart data.
+Synastry follows the identical idea via `run_synastry_and_subject`
+(returning `(text, person_a, person_b)`), called with the exact same
+`split_hint` (LLM-assisted person-A/person-B text split) that produced
+the text reply — without that, a rare case where the plain heuristic
+split failed could draw a different pairing than the one described in
+the answer. The three search-based techniques — electional
+(date-range scan) and both rectification tools (candidate-window scan) —
+are the one deliberate exception to "just recompute it": their search is
+too expensive to run twice, so the winning candidate's subject is
+threaded straight out of the SAME search call that produces the text
+report, via sibling functions added specifically for this
+(`electional.run_electional_chart_and_subject`,
+`rectification._run_rectification_trutine_full`,
+`rectification_events.run_rectification_events_and_subject_async`) —
+`run_electional_chart`, `run_rectification_trutine`, and
+`run_rectification_events` (the plain string-returning versions
+`TOOL_REGISTRY` still calls directly) are now thin wrappers around these.
+For an electional range search, this means the chart drawn is the winning
+candidate's own chart, not the querent's natal chart or any rejected
+candidate.
+
+## Exporting a message to PDF
+
+A 📄 button next to each message's copy button (`GET /api/messages/{id}/pdf`,
+`routes/export.py`) renders that one message — its text plus every image
+attachment it has (a chart SVG, most commonly) — as a standalone PDF,
+opened `inline` in a new browser tab (the viewer's own controls cover
+save/print; no separate download endpoint needed). One message per PDF by
+design, not a whole-conversation export: the person's own ask was "a
+button on each reply", and a single message is a simpler, always-fresh
+unit — nothing to go stale if the conversation keeps growing after the
+button was clicked.
+
+`utils/pdf_export.py` renders via **weasyprint** (HTML+CSS → PDF) rather
+than a low-level drawing library like reportlab, for two reasons specific
+to this app's content: reportlab's built-in fonts have no Cyrillic glyphs
+at all (every Russian character would come out as tofu boxes unless a TTF
+font were manually registered), and reportlab has no SVG support at all
+(the rendered wheel charts are SVG — weasyprint embeds them natively via
+a `data:image/svg+xml;base64,...` `<img>`, no separate rasterization
+step). The stylesheet sets `font-family: "DejaVu Sans"` explicitly —
+weasyprint renders through whatever fonts are actually installed on the
+host, same as a browser would, so this needs that font (or an equivalent
+with Cyrillic + reasonable symbol coverage) present at the OS level; see
+`install/requirements.txt`'s own comment on the `weasyprint` line for the
+exact system packages needed on Debian/Ubuntu (Pango, cairo, gdk-pixbuf —
+`pip install weasyprint` alone isn't sufficient, these are C libraries).
+
+The message-text rendering (bold via `**`, headings via `#`, fenced code
+blocks) is a deliberate line-for-line port of `static/js/app.js`'s own
+`renderProseText`/`renderInlineFormatted`/`renderMessageBody` — the PDF
+is meant to look like the same message already shown in the chat UI, not
+a differently-formatted document. If that JS ever changes, mirror the
+change in `utils/pdf_export.py` too (each function there names its exact
+JS counterpart in its own docstring).
+
+A freshly-received reply needs its own DB message id before the button
+can point anywhere real — `routes/chat.py`'s response dicts now include
+`"message_id": assistant_msg_id` on every complete-status reply (previously
+only the async image-job placeholder path returned this), and the chat
+UI's submit handler reads it into `record.id` so the button works
+immediately, not just after a page reload.
+
 ## Why file attachments are stored as BLOBs in SQLite
 
 Code extracted from model replies, and images resolved from ycplt_img, are

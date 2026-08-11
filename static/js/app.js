@@ -85,6 +85,22 @@
     return btn;
   }
 
+  function makePdfExportButton(messageId) {
+    // Plain link styled as a button (not a click handler that fetches and
+    // blob-downloads) — GET /api/messages/{id}/pdf serves
+    // Content-Disposition: inline (see routes/export.py), so opening it
+    // in a new tab shows the PDF in the browser's own viewer, which
+    // already has its own save/print controls; no extra JS needed.
+    const btn = document.createElement('a');
+    btn.className = 'copy-btn pdf-export-btn';
+    btn.title = 'Экспортировать в PDF';
+    btn.textContent = '📄';
+    btn.href = '/api/messages/' + messageId + '/pdf';
+    btn.target = '_blank';
+    btn.rel = 'noopener';
+    return btn;
+  }
+
   // ---------- Рендер сообщений ----------
   //
   // renderProseText below is a deliberately tiny "markdown-lite" renderer,
@@ -212,9 +228,27 @@
     // user just picked, before the server has assigned it a file id (see
     // the submit handler below); every other case (including this same
     // message after a page reload) uses the normal /api/files/{id} URL.
-    img.src = f._localSrc || ('/api/files/' + f.id);
+    const src = f._localSrc || ('/api/files/' + f.id);
+    img.src = src;
     img.alt = f.filename;
-    wrap.appendChild(img);
+    // Wrapping in a link so the image can be opened full-size in its own
+    // tab (e.g. for a wheel chart's fine detail) — previously there was
+    // no way to do this at all, only the inline thumbnail. Only wrap real
+    // server-side attachments (an optimistic local preview has no server
+    // URL yet to open). routes/files.py now serves image/* with
+    // Content-Disposition: inline, so this opens as a normal viewable
+    // page instead of triggering a download.
+    if (f._localSrc) {
+      wrap.appendChild(img);
+    } else {
+      const link = document.createElement('a');
+      link.href = src;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.title = 'Открыть в новом окне';
+      link.appendChild(img);
+      wrap.appendChild(link);
+    }
     return wrap;
   }
 
@@ -248,19 +282,42 @@
 
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
+
+    // Wheel charts (_attach_chart_if_applicable in routes/chat.py) are
+    // always saved as image/svg+xml — every other image attachment
+    // (a generated/edited picture from ycplt_img, or a user's own upload)
+    // is a raster type (image/png etc.), so this mime check is a reliable
+    // way to single out chart images without any extra flag from the
+    // backend. Rendered before the text body, per user feedback wanting
+    // the chart to lead the post instead of trailing after the text.
+    const files = record.files || [];
+    const chartFiles = files.filter((f) => f.mime_type === 'image/svg+xml');
+    const otherFiles = files.filter((f) => f.mime_type !== 'image/svg+xml');
+    for (const f of chartFiles) {
+      bubble.appendChild(renderImageAttachment(f));
+    }
+
     renderMessageBody(bubble, record.content || '');
 
     if (record.content && record.content.trim()) {
       bubble.appendChild(makeCopyButton(() => record.content, 'msg-copy-btn', 'Скопировать сообщение'));
     }
 
-    if (record.files && record.files.length) {
-      for (const f of record.files) {
-        if (isImageFile(f)) {
-          bubble.appendChild(renderImageAttachment(f));
-        } else {
-          bubble.appendChild(renderFileCard(f));
-        }
+    // PDF export needs a real DB message id — absent for the pending
+    // placeholder shown while an image job runs, and would 404 if clicked
+    // then, so it's only added once the message has settled into a real
+    // status. A message loaded from history (page reload/switch) always
+    // has record.id already; a message just received from POST /chat has
+    // it too now (data.message_id — see routes/chat.py's response dicts).
+    if (record.id && record.status !== 'pending') {
+      bubble.appendChild(makePdfExportButton(record.id));
+    }
+
+    for (const f of otherFiles) {
+      if (isImageFile(f)) {
+        bubble.appendChild(renderImageAttachment(f));
+      } else {
+        bubble.appendChild(renderFileCard(f));
       }
     }
     wrap.appendChild(bubble);
@@ -509,6 +566,7 @@
         currentConversationId = data.conversation_id;
         localStorage.setItem('currentConversationId', currentConversationId);
         addMessageFromRecord({
+          id: data.message_id,
           role: 'assistant',
           content: data.response,
           created_at: data.responded_at,

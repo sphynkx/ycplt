@@ -283,6 +283,11 @@ def _evaluate_candidate(fields: Dict[str, str], birth_dt: datetime, gestation_da
         "error_asc_moon": error_asc_moon,
         "error_moon_asc": error_moon_asc,
         "total_error": error_asc_moon + error_moon_asc,
+        # Carried at zero extra cost (birth was already built above) so the
+        # winning candidate's own chart can be handed to utils/chart_draw.py
+        # without re-running this whole window scan a second time — see
+        # run_rectification_trutine_and_subject's own docstring.
+        "birth_subject": birth,
     }
 
 
@@ -329,8 +334,27 @@ def _format_candidate_block(index: int, r: Dict) -> str:
 
 def run_rectification_trutine(spec: str) -> str:
     """Tool entry point (utils.tools.TOOL_REGISTRY["astro_rectification_
-    trutine"]). Never raises — any failure becomes a plain-text explanation
-    instead, same convention as every run_* function in utils/astro.py.
+    trutine"]) — thin wrapper over _run_rectification_trutine_full,
+    discarding the winning candidate's chart object (see that function's
+    own docstring for why it exists as a separate, richer-returning
+    sibling rather than changing this one's plain str contract)."""
+    return _run_rectification_trutine_full(spec)[0]
+
+
+def _run_rectification_trutine_full(spec: str) -> Tuple[str, Optional[Any]]:
+    """Does the actual work; returns (report_text, winning_candidate_
+    subject_or_None). Split out from run_rectification_trutine so
+    routes/chat.py's chart-drawing step can get the winning candidate's
+    already-built chart (see _evaluate_candidate's "birth_subject" key)
+    WITHOUT re-running this whole window scan a second time — the scan
+    itself (potentially hundreds of candidate charts) is the expensive
+    part here, unlike a technique with a single fast chart build, where a
+    cheap from-scratch recompute (this app's usual pattern — see
+    astro.get_transit_profiles' own docstring on why THAT recompute is
+    fine) would be wasteful and pointlessly slow for this one instead.
+
+    Never raises — any failure becomes a plain-text explanation instead,
+    same convention as every run_* function in utils/astro.py.
 
     Deliberately does NOT go through get_planet_profiles-style profiling —
     there's no single chart's "significant points" to rank here, just a
@@ -346,14 +370,14 @@ def run_rectification_trutine(spec: str) -> str:
     output needs done."""
     fields, window_start, window_end, gestation_days, step_minutes, missing = _extract_rectification_fields(spec)
     if missing:
-        return _missing_rectification_fields_message(missing)
+        return _missing_rectification_fields_message(missing), None
 
     name = fields.get("name") or "Subject"
     candidates = _build_candidate_datetimes(window_start, window_end, step_minutes)
 
     results = [r for r in (_evaluate_candidate(fields, dt, gestation_days, name) for dt in candidates) if r]
     if not results:
-        return "Не удалось рассчитать ни одного варианта карты в заданном окне времени — проверьте дату/координаты."
+        return "Не удалось рассчитать ни одного варианта карты в заданном окне времени — проверьте дату/координаты.", None
 
     best = min(results, key=lambda r: r["total_error"])
     top = _diverse_top_candidates(results, _TOP_N_REPORTED, _MIN_SEPARATION_MINUTES)
@@ -407,7 +431,7 @@ def run_rectification_trutine(spec: str) -> str:
             "повторить поиск с более широким окном (time_min=/time_max=) в эту сторону, прежде чем "
             "доверять этому результату как окончательному."
         )
-    return "\n".join(lines)
+    return "\n".join(lines), best.get("birth_subject")
 
 
 _BEST_RECOMMENDATION_RE = re.compile(r"^Лучший найденный вариант.*$", re.MULTILINE)

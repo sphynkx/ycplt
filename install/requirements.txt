@@ -51,3 +51,16 @@ timezonefinder
 # with the package, no separate download) — fallback for the astro tool
 # when only a city name is given, no explicit coordinates.
 geonamescache
+
+# Optional, only needed for the "export message to PDF" button
+# (utils/pdf_export.py, GET /api/messages/{id}/pdf): renders the message's
+# HTML (text + embedded chart images) to a PDF via a real layout engine.
+# Needs system libraries at runtime — Pango, cairo, gdk-pixbuf, and a font
+# with Cyrillic + basic symbol coverage (DejaVu Sans, near-universal on
+# Linux already). On Debian/Ubuntu:
+#   apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 \
+#     libcairo2 fonts-dejavu-core
+# See weasyprint's own docs if `pip install weasyprint` succeeds but PDF
+# generation fails at runtime — that's almost always one of these system
+# libraries missing, not a Python-level problem.
+weasyprint
