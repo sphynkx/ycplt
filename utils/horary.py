@@ -1086,9 +1086,9 @@ def extract_best_recommendation(report_text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def run_horary_question_and_subject(spec: str) -> Tuple[str, Optional[Any]]:
+def run_horary_question_and_subject(spec: str) -> Tuple[str, Optional[Any], None, None]:
     """Full logic for the horary tool, computing the chart via
-    _compute_horary_chart ONCE and returning (report, subject) —
+    _compute_horary_chart ONCE and returning (report, subject, None, None) —
     previously run_horary_question and get_chart_subject each called
     _compute_horary_chart independently, meaning every horary reply built
     the whole chart (radicality checks, dignities, aspects, LLM field
@@ -1096,10 +1096,18 @@ def run_horary_question_and_subject(spec: str) -> Tuple[str, Optional[Any]]:
     subject for the wheel-chart image. Same "_and_subject" convention
     utils/electional.py and utils/rectification.py already established
     for their own expensive computations — see
-    electional.run_electional_chart_and_subject's own docstring."""
+    electional.run_electional_chart_and_subject's own docstring.
+
+    The trailing (None, None) pads this out to the same 4-tuple shape
+    every other _SIMPLE_AND_SUBJECT_FUNCS entry in routes/chat.py returns
+    (text, subject, second, highlight_house) — horary has neither a second
+    subject nor a highlighted house, but routes/chat.py's dispatch
+    unpacks all of _SIMPLE_AND_SUBJECT_FUNCS' results the same generic
+    way, so a bare 2-tuple here raised "not enough values to unpack"
+    (a real bug caught by a live test, not just code review)."""
     data = _compute_horary_chart(spec)
     if "error" in data:
-        return data["error"], None
+        return data["error"], None, None, None
 
     verdict_line = f"ИТОГОВЫЙ ВЕРДИКТ: {'Да' if data['verdict'] == 'positive' else 'Нет'} ({data['reason']})."
 
@@ -1186,7 +1194,7 @@ def run_horary_question_and_subject(spec: str) -> Tuple[str, Optional[Any]]:
 
     lines.append("")
     lines.append(verdict_line)
-    return "\n".join(lines), data.get("subject")
+    return "\n".join(lines), data.get("subject"), None, None
 
 
 def run_horary_question(spec: str) -> str:

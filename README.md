@@ -1512,13 +1512,18 @@ that does the full field-extraction/ephemeris computation exactly ONCE
 and returns `(text, subject, second, highlight_house)` (a uniform 4-tuple,
 padded with `None` for whichever slots a given technique doesn't use) —
 `run_*` itself is now a thin one-line wrapper (`return
-run_x_and_subject(spec)[0]`). `_SIMPLE_AND_SUBJECT_FUNCS` maps each of
-these 8 tool names straight to its `_and_subject` function so
-`_handle_tool_request` can call it once and get both the reply text and
-the chart subject(s) from that single call; horary's
-`run_horary_question_and_subject` is dispatched the same way, just with
-a 2-tuple (`text, subject`) since it has no second subject or
-highlighted house. This replaced an earlier design where a separate
+run_x_and_subject(spec)[0]`). `_SIMPLE_AND_SUBJECT_FUNCS` maps all 9 of these tool names (the 8 above
+plus horary) straight to its `_and_subject` function so
+`_handle_tool_request` can call it once, generically, and unpack the
+same 4-tuple shape for every one of them — including horary's
+`run_horary_question_and_subject`, which pads its own `(text, subject)`
+result out to `(text, subject, None, None)` for exactly this reason (an
+earlier version of this function returned a bare 2-tuple, which crashed
+`_handle_tool_request`'s generic unpack with "not enough values to
+unpack" the first time a live horary request actually hit that code
+path — fixed by conforming to the same 4-tuple shape as every other
+entry in the dict, rather than special-casing horary's dispatch).
+This replaced an earlier design where a separate
 `get_*_chart_subject(s)` getter rebuilt the same subject from scratch
 *after* the text reply had already computed it once — harmless-looking
 but a real, reported regression (every one of these 9 techniques was
