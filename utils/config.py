@@ -45,9 +45,44 @@ PORT = int(os.environ.get("PORT", "4010"))
 # ---------- LLM ----------
 MODEL_PATH = _resolve_path("MODEL_PATH", "models/model.gguf")
 
-# 2 physical cores / 4 threads on the reference i7-5500U — more than 4
-# threads buys nothing, there are no more physical cores.
+# Governs ONLY the token-generation phase (sequential, one token at a
+# time) — see N_THREADS_BATCH below for the separate prompt-processing
+# phase. Originally set to 4 for the old reference i7-5500U (2 physical
+# cores/4 threads — more than 4 bought nothing there). Counterintuitively,
+# raising this on the current, much beefier i7-8700 (6 physical/12
+# logical) did NOT help in real testing — 4 measured faster end-to-end
+# than both 6 and 10 on the same box, same prompt. This isn't a fluke:
+# generation is memory-bandwidth-bound and pays a synchronization barrier
+# once per generated token across every thread involved, so past some
+# point (which depends on memory bandwidth, not core count) adding threads
+# increases that per-token overhead faster than it adds useful parallel
+# work — a well-documented llama.cpp behavior on desktop-class CPUs with
+# a handful of memory channels, not the server-class hardware this kind
+# of setting is often tuned for. If you change this, re-measure a real
+# request end-to-end rather than assuming a higher number is better.
 N_THREADS = int(os.environ.get("N_THREADS", "4"))
+# The prompt-processing/"batch" phase (parallelizable across positions,
+# unlike token generation above) has its own, independent thread count in
+# llama-cpp-python — NOT the same knob as N_THREADS, and NOT set at all
+# before this was added: llama_cpp.Llama's own source defaults
+# n_threads_batch to `multiprocessing.cpu_count()` (all logical cores)
+# whenever it isn't passed explicitly, regardless of whatever N_THREADS
+# is. That silent default is exactly why every logical CPU could be seen
+# pegged at ~100% during a request even with N_THREADS turned down — the
+# batch phase was never governed by N_THREADS in the first place. Exposed
+# here so it can be tuned independently instead of guessing from N_THREADS
+# alone. Defaults to the full logical core count (matching the library's
+# own prior implicit behavior) so leaving this unset changes nothing.
+N_THREADS_BATCH = int(os.environ.get("N_THREADS_BATCH", str(os.cpu_count() or 4)))
+# How many prompt tokens llama.cpp processes per parallel batch during the
+# prompt/prefill phase — a size, not a thread count (see N_THREADS_BATCH
+# above for that). Also never set explicitly before this; llama-cpp-python
+# itself defaults to 512 when omitted, which is what stays in effect here
+# unless overridden. Larger values can speed up prefill on a long RAG-heavy
+# prompt at the cost of more RAM for the batch buffer — worth trying 1024
+# or 2048 on this project's typically long (methodology-document-heavy)
+# prompts, but re-measure rather than assume, same as N_THREADS above.
+N_BATCH = int(os.environ.get("N_BATCH", "512"))
 # 32768 — Qwen2.5's native trained context length, not an arbitrary large
 # number picked to be safe. The previous default here (2048) was sized for
 # plain short chat turns and repeatedly wasn't enough once RAG context,

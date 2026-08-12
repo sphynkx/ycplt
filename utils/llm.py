@@ -50,6 +50,14 @@ def load_llm() -> Llama:
             model_path=config.MODEL_PATH,
             n_ctx=config.N_CTX,
             n_threads=config.N_THREADS,
+            # Previously left unset, which meant llama-cpp-python silently
+            # substituted its own default (all logical cores) for both of
+            # these regardless of N_THREADS above — see config.py's
+            # N_THREADS_BATCH/N_BATCH comments for the full explanation and
+            # why that made every CPU core look pegged even when N_THREADS
+            # was turned down.
+            n_threads_batch=config.N_THREADS_BATCH,
+            n_batch=config.N_BATCH,
             n_gpu_layers=config.N_GPU_LAYERS,
             verbose=False,
         )

@@ -52,7 +52,10 @@
   .conv-item:hover { background: #2b2c2f; }
   .conv-item.active { background: #343541; }
   .conv-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .del-btn {
+  /* Rename (✎) and download (⬇) sit alongside the pre-existing delete
+     (✕) button — same hover-to-reveal pattern, so the row stays quiet
+     until you actually mouse over it. */
+  .del-btn, .dl-btn, .ren-btn {
     opacity: 0;
     background: none;
     border: none;
@@ -60,9 +63,26 @@
     cursor: pointer;
     font-size: 0.85rem;
     padding: 2px 4px;
+    flex-shrink: 0;
   }
-  .conv-item:hover .del-btn { opacity: 1; }
-  .del-btn:hover { color: #ececf1; }
+  .conv-item:hover .del-btn,
+  .conv-item:hover .dl-btn,
+  .conv-item:hover .ren-btn { opacity: 1; }
+  .del-btn:hover, .dl-btn:hover, .ren-btn:hover { color: #ececf1; }
+  /* Replaces .conv-title in place while a rename is in progress (see
+     startRenameConversation in static/js/app.js) — sized/colored to sit
+     naturally in the same dark sidebar row. */
+  .conv-title-input {
+    flex: 1;
+    min-width: 0;
+    background: #343541;
+    border: 1px solid #565869;
+    border-radius: 4px;
+    color: #ececf1;
+    font-size: 0.85rem;
+    padding: 2px 6px;
+    font-family: inherit;
+  }
   #sidebar-empty { padding: 12px 10px; font-size: 0.8rem; color: #8e8ea0; }
 
   /* ---------- Основная область ---------- */

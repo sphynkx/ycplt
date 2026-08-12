@@ -55,6 +55,16 @@ def touch_conversation(conversation_id: int) -> None:
         )
 
 
+def rename_conversation(conversation_id: int, title: str) -> None:
+    """Deliberately does not touch updated_at — a rename shouldn't jump the
+    conversation to the top of the sidebar's most-recently-active ordering
+    the way an actual new message does (see list_conversations' ORDER BY)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id)
+        )
+
+
 def delete_conversation(conversation_id: int) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))

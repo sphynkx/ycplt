@@ -407,6 +407,26 @@
       title.className = 'conv-title';
       title.textContent = conv.title || 'Новый чат';
 
+      const ren = document.createElement('button');
+      ren.className = 'ren-btn';
+      ren.type = 'button';
+      ren.textContent = '✎';
+      ren.title = 'Переименовать чат';
+      ren.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        startRenameConversation(item, title, conv);
+      });
+
+      const dl = document.createElement('button');
+      dl.className = 'dl-btn';
+      dl.type = 'button';
+      dl.textContent = '⬇';
+      dl.title = 'Скачать архив чата (дамп + вложения)';
+      dl.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        window.location.href = '/api/conversations/' + conv.id + '/export';
+      });
+
       const del = document.createElement('button');
       del.className = 'del-btn';
       del.type = 'button';
@@ -415,10 +435,68 @@
       del.addEventListener('click', (ev) => deleteConversation(conv.id, ev));
 
       item.appendChild(title);
+      item.appendChild(ren);
+      item.appendChild(dl);
       item.appendChild(del);
       item.addEventListener('click', () => selectConversation(conv.id));
       convListEl.appendChild(item);
     }
+  }
+
+  // Swaps the .conv-title span for a text input in place, saves via PATCH
+  // on Enter/blur, discards on Escape. A dedicated ✎ button (rather than
+  // e.g. double-click on the title) on purpose — the title text is already
+  // the row's primary click target for opening the chat, so overloading it
+  // with a second gesture would race against that existing click handler
+  // (both fire on the same element) instead of just being a separate,
+  // unambiguous control.
+  function startRenameConversation(item, titleEl, conv) {
+    const input = document.createElement('input');
+    input.className = 'conv-title-input';
+    input.type = 'text';
+    input.value = conv.title || '';
+    item.replaceChild(input, titleEl);
+    input.focus();
+    input.select();
+
+    // Prevents a click inside the input (e.g. to move the caret) from
+    // bubbling up to the row's own click handler and switching to this
+    // conversation mid-edit.
+    input.addEventListener('click', (ev) => ev.stopPropagation());
+
+    let cancelled = false;
+    let finished = false;
+
+    const finish = async () => {
+      if (finished) return;
+      finished = true;
+      const newTitle = input.value.trim();
+      if (!cancelled && newTitle && newTitle !== conv.title) {
+        try {
+          await fetch('/api/conversations/' + conv.id, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: newTitle }),
+          });
+        } catch (e) {
+          // Network error — fall through to reload; the title just stays
+          // whatever it was on the server since the rename didn't happen.
+        }
+      }
+      await loadConversations();
+    };
+
+    input.addEventListener('blur', finish);
+    input.addEventListener('keydown', (ev) => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        input.blur();
+      } else if (ev.key === 'Escape') {
+        cancelled = true;
+        input.blur();
+      }
+    });
   }
 
   function stopPolling() {

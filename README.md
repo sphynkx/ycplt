@@ -90,10 +90,63 @@ Current reference hardware: Intel Core i7-8700 @ 3.20GHz (6 physical cores /
 free disk space (the chat model alone is ~6 GB; add RAM-cache headroom, the
 embedding model, and RAG index data on top). Currently running
 **Qwen3.5-9B, `UD-Q4_K_XL` quant** (~6 GB) as the chat model — see "3. Chat
-model" above for the full download link and quant alternatives — which runs
-comfortably on this hardware for interactive chat, including the heaviest
-single-request workload in this app (a full RAG-interpreted horary or
-electional answer).
+model" above for the full download link and quant alternatives — which is
+fine for plain chat on this hardware, but the heaviest single-request
+workloads (a full RAG-interpreted horary, electional, or progression
+answer — several sequential LLM calls per request, each fed a large
+methodology document) measured 10-20 minutes in real testing, not seconds.
+See "Tuning CPU inference threads" right below before assuming this needs
+better hardware — the two thread-count settings involved were previously
+never independently tunable, and the naive "more threads = faster"
+assumption measured FALSE on this exact machine.
+
+### Tuning CPU inference threads
+
+llama-cpp-python exposes two independent thread-count settings that are
+easy to conflate, and this project only ever set one of them until real
+multi-hour testing on the current reference hardware surfaced the gap:
+
+- **`N_THREADS`** — governs only the token-*generation* phase (sequential,
+  one token at a time). Real measurement on the i7-8700 (6 physical/12
+  logical cores): `N_THREADS=4` finished a progression request end-to-end
+  faster than both `N_THREADS=6` and `N_THREADS=10` on the same prompt —
+  6 was in fact the slowest of the three, over 30 minutes before the test
+  was aborted. This isn't a fluke: generation is memory-bandwidth-bound
+  and pays a synchronization barrier across every thread once per
+  generated token, so past some point that depends on your memory
+  bandwidth (not your core count), more threads add more of that overhead
+  than they add useful parallel work. Don't assume a higher number is
+  better here — re-measure a real request end-to-end.
+- **`N_THREADS_BATCH`** — governs the prompt-*processing*/prefill phase,
+  which is more parallelizable than generation and was never set
+  explicitly in this project before — llama-cpp-python's own default
+  (`multiprocessing.cpu_count()`, i.e. every logical core) silently took
+  over instead. This is why `htop` could show all 12 logical cores at
+  ~100% even while `N_THREADS` was turned down to 6 — that observation
+  was about this setting, not the one being changed. Now independently
+  configurable; see `install/.env.example`.
+- **`N_BATCH`** — a batch *size* (prompt tokens processed per parallel
+  step during prefill), not a thread count; also never set explicitly
+  before (library default: 512).
+
+Tried `N_THREADS=4` + `N_THREADS_BATCH=8` + `N_BATCH=2048` together on a
+natal request next: the tool-dispatch and chart-computation steps were
+each genuinely fast (under a minute apiece, better than any earlier run),
+but the final answer still took 31 minutes end-to-end — clearly the
+generation phase itself, not prefill. Reverting all three to their plain
+defaults (`N_THREADS=4`, `N_THREADS_BATCH`/`N_BATCH` unset) measured 835
+seconds on the same technique — worse than the very first 601s baseline,
+but far better than 31 minutes. No combination of these three settings
+tried so far has beaten the plain defaults, and single-run wall-clock
+comparisons across different techniques (each pulling in different-sized
+methodology text, generating a different actual answer length) are noisy
+enough — background load, thermal behavior over a 20-30 minute run, etc.
+— that a one-off worse or better result doesn't reliably prove a setting
+change is the cause. Bottom line: leave `N_THREADS_BATCH`/`N_BATCH` unset
+(library defaults) unless you're prepared to test a change with several
+repeated runs of the *same* technique/query, not a single comparison
+across different requests — that's the only way to tell a real effect
+from run-to-run noise on this kind of long-running CPU workload.
 
 This replaces an earlier, noticeably weaker reference machine: i7-5500U (2
 physical cores / 4 threads), 12 GB RAM, GeForce 940M (2 GB, no usable GPU
@@ -408,7 +461,16 @@ working as a normal chat; `use_rag` simply has no effect (see
 ## Interface
 
 - **Sidebar** — "+ New chat" button and a list of conversations (ChatGPT-style).
-  Clicking a conversation switches to it; the "✕" deletes it (with confirmation).
+  Clicking a conversation switches to it. Hovering a row reveals three small
+  icon buttons: "✎" renames it in place (an inline text field replaces the
+  title; Enter/blur saves via `PATCH /api/conversations/{id}`, Escape
+  discards — a dedicated button rather than double-clicking the title itself,
+  since that title is already the row's click target for opening the chat
+  and would race against a second gesture on the same element), "⬇"
+  downloads a full archive of that conversation (`GET
+  /api/conversations/{id}/export` — a `.zip` with the message dump as JSON
+  plus every file attachment's raw bytes), and "✕" deletes it (with
+  confirmation, cascades to its messages and files in the database).
 - **Parallel chats** — each conversation is stored separately in the database;
   any number can be kept simultaneously and switched between via the sidebar.
 - **Session persistence** — the current conversation id is stored in the
@@ -468,6 +530,8 @@ working as a normal chat; `use_rag` simply has no effect (see
 | `GET /api/conversations` | List conversations (id, title, updated_at), sorted by last activity. |
 | `POST /api/conversations` | Manually create an empty conversation (usually unnecessary — `/chat` creates one lazily). |
 | `GET /api/conversations/{id}/messages` | Message history for a conversation, including files, timestamps, and `status`. |
+| `PATCH /api/conversations/{id}` | Rename a conversation. Body: `{title}`; 400 on an empty/whitespace-only title, 404 if the conversation doesn't exist. Doesn't touch `updated_at` — a rename shouldn't jump the chat to the top of the sidebar's most-recently-active ordering the way an actual new message does. |
+| `GET /api/conversations/{id}/export` | Download a full archive (`.zip`) of one conversation: `conversation.json` (title, timestamps, every message in order) plus every file attachment's raw bytes under `files/`, referenced from the JSON by `archive_path` rather than embedded inline — keeps the JSON dump plain, readable text even for conversations with several images attached. |
 | `DELETE /api/conversations/{id}` | Delete a conversation (cascades to its messages and files). |
 | `GET /api/files/{id}` | Download a file attachment (extracted code, or a generated image). |
 
@@ -2018,7 +2082,8 @@ it.
 ## Not done yet (but the architecture allows for it)
 
 - A RAG toggle in the browser UI itself (API-only for now).
-- More sidebar features (renaming a chat, searching history, etc.).
+- Searching chat history (renaming and downloading a chat archive are done
+  — see "Interface" above).
 - Pagination of message history for very long conversations.
 - Masked inpainting from the browser UI (mask drawing) — the API/ycplt_img
   side already supports a mask (`mode="inpaint"`, see ycplt_img's own
