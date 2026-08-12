@@ -1,12 +1,32 @@
-# ycplt — local chat server (FastAPI + llama-cpp-python)
+# ycplt — local astrology chat assistant (FastAPI + llama-cpp-python)
 
-A local ChatGPT-like app: a FastAPI server running a GGUF model on CPU
-(llama-cpp-python), a browser UI (sidebar with parallel chats, persisted
-history), optional RAG search over your own documents, code extraction from
-model replies as downloadable file attachments, and automatic image
+A local, self-hosted assistant for Western tropical astrology: natal charts,
+transits, secondary progressions, solar-arc directions, lunar/solar returns,
+profections, synastry, horary questions, electional astrology, and birth-time
+rectification (two methods) — all computed deterministically (Swiss
+Ephemeris via [kerykeion](https://github.com/g-battaglia/kerykeion), fully
+offline, no API keys), then explained in natural language by a local GGUF
+model, grounded against a project-authored, per-technique reasoning
+methodology via RAG rather than left to the model's own unaided judgment. A
+**universal help assistant** (`astro_help_assistant`) is built in for anyone
+who isn't sure which technique they need, doesn't know astrology
+terminology, or just wants a plain-language question answered — see
+"Universal help assistant" below. Every technique's result can be rendered as
+an SVG wheel chart and exported to PDF alongside the text explanation.
+
+The project started as a general-purpose local ChatGPT-like chat app and
+still has that foundation underneath: a FastAPI server running a GGUF model
+on CPU (llama-cpp-python), a browser UI (sidebar with parallel chats,
+persisted history), a small extensible built-in tool layer (date/time,
+calculator, and the astrology tools above), code extraction from model
+replies as downloadable file attachments, and automatic image
 generation/editing requests routed to a companion service
 ([ycplt_img](https://github.com/sphynkx/ycplt_img)) based on the meaning of
-the user's message (no manual toggle).
+the user's message (no manual toggle). All of that general-purpose machinery
+is still there and still works standalone (plain chat, image generation/
+editing, RAG over any documents on any subject) — astrology is simply what
+this deployment's own tool layer and RAG corpus are currently built out
+for.
 
 ## Project layout
 
@@ -77,7 +97,15 @@ GeForce 940M (2 GB) — no usable GPU acceleration for LLM inference. Hence:
 - Chat history lives in **SQLite** (`data/chat.sqlite3`) — enough for a
   single-user local app, no separate database server needed.
 
-## Installation
+## Installation & Setup
+
+Everything needed to go from a fresh checkout to a running app, in order.
+Steps 1-5 are required; 6-8 are each independently optional (astrology
+charts, PDF export, and RAG document search respectively) — skip any you
+don't need, and come back to a given one later any time without redoing the
+others.
+
+### 1. System packages and Python environment
 
 Verified end-to-end on a fresh Fedora install. System packages up front cover
 everything RAG source ingestion needs (`antiword`/`.doc`, `p7zip`+
@@ -85,8 +113,8 @@ everything RAG source ingestion needs (`antiword`/`.doc`, `p7zip`+
 `poppler-utils`/rendering scanned PDF pages, `tesseract`+its Russian
 language pack for OCR'ing anything with no embedded text layer (djvu or
 PDF), `chmlib`/`.chm` help files, `gcc`/`cmake`/`python-devel` to build the
-`ha` archiver from source — see "RAG — search over your own documents"
-below for what each package is for):
+`ha` archiver from source — see "8. Optional: RAG document search" below
+for what each package is for):
 
 ```bash
 dnf install gcc cmake python-devel antiword p7zip p7zip-plugins unrar-free \
@@ -128,7 +156,7 @@ early-1990s DOS `HA` archiver — the format itself is dead and unpackaged
 everywhere, but this gives `build_index.py` a real way to read `.ha` source
 archives instead of skipping them outright.
 
-## Configuration (.env)
+### 2. Configuration (.env)
 
 Copy the template and adjust as needed:
 
@@ -179,7 +207,7 @@ Key variables:
 | `IMAGE_POLL_INTERVAL_SEC` | `10` | How often the background poller checks ycplt_img |
 | `IMAGE_HTTP_TIMEOUT_SEC` | `10` | Timeout for short status/submit requests (not generation itself) |
 
-## Model
+### 3. Chat model
 
 Download a GGUF model and place it at `models/` (or point `MODEL_PATH` at it):
 
@@ -244,7 +272,7 @@ enough to be worth real scrutiny — verify a repo's base model against the
 publisher's own official org page before trusting its README's claims at
 face value.
 
-## Running
+### 4. Running the app
 
 ```bash
 python app.py
@@ -256,7 +284,7 @@ The chat UI is served at `http://<HOST>:<PORT>/` (default
 automatically with the current schema; on later runs, `init_db()` migrates
 an existing database in place if new columns were added (no data loss).
 
-### Running as a systemd service
+#### Running as a systemd service
 
 ```bash
 sudo cp install/ycplt.service /etc/systemd/system/
@@ -268,6 +296,83 @@ The unit file uses `EnvironmentFile=/var/www/ycplt/.env` and intentionally
 has no `User=` line (this deployment runs as root). Adjust
 `WorkingDirectory` and `ExecStart` if the app lives somewhere other than
 `/var/www/ycplt`.
+
+### 5. Optional: astrology chart engine
+
+Every `astro_*` tool (natal, transit, synastry, progressions, directions,
+returns, profection, horary, electional, both rectification techniques, and
+the universal help assistant's technique-selection logic) needs this — skip
+it only if you want ycplt as a plain general-purpose chat app with no
+astrology features at all.
+
+```bash
+pip install kerykeion timezonefinder geonamescache
+```
+
+- **kerykeion** (https://github.com/g-battaglia/kerykeion) does the actual
+  chart computation — Swiss Ephemeris under the hood, fully offline, no API
+  key. It's AGPL-3.0 — see `utils/astro.py`'s own docstring before
+  redistributing this project if that matters for your situation.
+- **timezonefinder** resolves the correct timezone automatically from
+  birth/event coordinates — without it, that lookup is simply skipped
+  (kerykeion still works from explicit coordinates, you'd just need to also
+  supply the timezone yourself).
+- **geonamescache** (~34k world cities, bundled with the package, no
+  separate download) resolves a bare city name with no coordinates given —
+  without it, only explicit coordinates work.
+
+All three are optional independently of each other and of the base app —
+each missing package's own feature is skipped gracefully (best-effort
+imports inside the tool functions), not a hard failure. See "Built-in
+tools" below for how the free-text date/coordinate/city parsing this
+enables actually works.
+
+### 6. Optional: PDF export
+
+Needed for the per-message "PDF" export button (see "Exporting a message to
+PDF" below). `install/requirements.txt` already includes `weasyprint`
+itself, but weasyprint renders through real system-level libraries (Pango,
+cairo, gdk-pixbuf) and fonts, not just a pip package:
+
+```bash
+# Debian/Ubuntu
+apt install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 \
+  libcairo2 fonts-dejavu-core
+# Fedora
+dnf install pango cairo gdk-pixbuf2 dejavu-sans-fonts
+```
+
+The stylesheet asks for `DejaVu Sans` explicitly (Cyrillic + reasonable
+symbol coverage) — weasyprint renders through whatever fonts are actually
+installed on the host, same as a browser would, so without an equivalent
+font present, Cyrillic text in an exported PDF would come out as tofu boxes.
+If `pip install weasyprint` succeeds but PDF generation fails at runtime,
+it's almost always one of these system libraries missing, not a Python-level
+problem — see weasyprint's own docs for the full troubleshooting list.
+
+### 7. Optional: RAG document search
+
+Needed only for `use_rag: true` / the `astro_help_assistant`'s and every
+astro tool's methodology-grounded reasoning step (see "RAG — search over
+your own documents" below for the full setup walkthrough — building a
+corpus, indexing, and enabling it). The dependencies:
+
+```bash
+pip install sentence-transformers faiss-cpu numpy   # core RAG (required for any of this)
+pip install pypdf                 # only needed for *.pdf sources
+pip install charset-normalizer    # auto-detects .txt/.html encoding (cp1251, koi8-r, ...)
+pip install beautifulsoup4        # only needed for *.html/*.htm sources
+pip install striprtf              # only needed for *.rtf sources (pure Python, no system tool)
+pip install patool                # only needed for *.rar/*.arj/*.7z source archives
+```
+
+All covered in one go by `install/requirements.txt` from step 1. The
+system-level tools for `.doc`/`.djvu`/`.chm`/scanned-PDF/archive source
+formats (`antiword`, `djvulibre`, `poppler-utils`, `tesseract`, `chmlib`,
+`ha`, `patool`'s own backends) are the same ones already installed in step
+1 above — nothing further needed there. Without any of these, the app keeps
+working as a normal chat; `use_rag` simply has no effect (see
+`utils/rag.py`).
 
 ## Interface
 
@@ -893,14 +998,9 @@ Built-in tools:
   checked its own equally-long bucket — which could never match a
   shorter one — so a short city name's declined form couldn't become a
   match candidate at all before this fix, regardless of the population
-  comparison above. `pip install kerykeion timezonefinder geonamescache`
-  (kerykeion is AGPL-3.0 — see `utils/astro.py`'s docstring if you plan to
-  redistribute this project) if you want this tool available; without
-  timezonefinder/geonamescache specifically, their part is simply skipped
-  gracefully — kerykeion alone still gets you the explicit-coordinates
-  path, just not automatic timezone lookup or city-name resolution
-  (best-effort imports inside the tool functions, same graceful-absence
-  pattern as everywhere else optional in this project).
+  comparison above. See "Installation & Setup" above ("5. Optional:
+  astrology chart engine") for the exact packages and what each one's
+  absence gracefully falls back to.
 
   Birth data mentioned earlier in the conversation (not just the current
   message) is also picked up, within limits: `routes/chat.py` hands
@@ -1658,13 +1758,9 @@ at all (every Russian character would come out as tofu boxes unless a TTF
 font were manually registered), and reportlab has no SVG support at all
 (the rendered wheel charts are SVG — weasyprint embeds them natively via
 a `data:image/svg+xml;base64,...` `<img>`, no separate rasterization
-step). The stylesheet sets `font-family: "DejaVu Sans"` explicitly —
-weasyprint renders through whatever fonts are actually installed on the
-host, same as a browser would, so this needs that font (or an equivalent
-with Cyrillic + reasonable symbol coverage) present at the OS level; see
-`install/requirements.txt`'s own comment on the `weasyprint` line for the
-exact system packages needed on Debian/Ubuntu (Pango, cairo, gdk-pixbuf —
-`pip install weasyprint` alone isn't sufficient, these are C libraries).
+step). Needs system-level libraries and fonts beyond the `pip install`
+itself — see "Installation & Setup" above ("6. Optional: PDF export") for
+the exact packages.
 
 The message-text rendering (bold via `**`, headings via `#`, fenced code
 blocks) is a deliberate line-for-line port of `static/js/app.js`'s own
@@ -1694,23 +1790,17 @@ is unnecessary complexity for now.
 
 ## RAG — search over your own documents (optional)
 
-1. Install indexing dependencies (`pip install -r install/requirements.txt` covers all of
-   the Python packages below in one go):
-
-   ```bash
-   pip install sentence-transformers faiss-cpu numpy
-   pip install pypdf                 # only needed for *.pdf sources
-   pip install charset-normalizer    # auto-detects .txt/.html encoding (cp1251, koi8-r, ...)
-   pip install beautifulsoup4        # only needed for *.html/*.htm sources
-   pip install striprtf              # only needed for *.rtf sources (pure Python, no system tool)
-   pip install patool                # only needed for *.rar/*.arj/*.7z source archives
-   ```
+1. Install dependencies — see "Installation & Setup" above ("7. Optional: RAG
+   document search") for the exact `pip install` list (all covered in one go
+   by `install/requirements.txt`) and which system tool each source format
+   needs (already installed in step 1 of that section: `antiword`,
+   `djvulibre`, `poppler-utils`, `tesseract`, `chmlib`, `ha`).
 
    `.zip` archives are read directly (stdlib, no extra package). `.rar`/`.arj`/`.7z`,
    legacy binary `.doc` (MS Word 97-2003, NOT `.docx`), `.ha` and `.chm` archives, `.djvu`/`.djv`
    scans, and scanned (no-text-layer) `.pdf` pages all need matching **system** tools — see the
-   "Installation" section above for the package names and the `ha` build steps (Debian/Ubuntu
-   and Fedora both covered there).
+   "Installation & Setup" section above for the package names and the `ha` build steps
+   (Debian/Ubuntu and Fedora both covered there).
 
    `.djvu`/`.djv` specifically needs `djvulibre` (provides the `djvutxt`, `ddjvu`, and
    `djvused` CLI tools) always, plus `tesseract` with a Russian language pack
@@ -1746,7 +1836,7 @@ is unnecessary complexity for now.
    limit). Group documents into topic subfolders if you have more than one subject —
    `rag_data/astrology/planets.txt`, `rag_data/cooking/pasta.txt`, and so on (for this
    project's astro subject specifically, see "Recommended `rag_data/` layout" above for the
-   current 6-subfolder scheme and which `install/methodologies/*_methodology.txt` master copy
+   current 8-subfolder scheme and which `install/methodologies/*_methodology.txt` master copy
    goes in each). Each topic
    subfolder (plus the loose files directly in `rag_data/`, if any) is its own **corpus**,
    with its own index file (see step 3) — not one combined index for everything. Retrieval
