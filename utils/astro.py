@@ -877,6 +877,26 @@ def _extract_fields_llm(text: str) -> Optional[Dict[str, str]]:
     date = _parse_labeled_field("ДАТА", answer)
     time_ = _parse_labeled_field("ВРЕМЯ", answer)
     place = _parse_labeled_field("МЕСТО", answer)
+    # Validate the model's own "ДАТА"/"ВРЕМЯ" lines actually landed in the
+    # strict numeric format the prompt asked for, instead of trusting them
+    # blindly — a real, reported failure on a weaker model (3B-class)
+    # showed it answering something like "1976-июл-05" for "5 июля 1976
+    # года" (converting the day/year but leaving the Russian month name in
+    # place instead of finishing the conversion to a number), which then
+    # crashed several calls downstream at `int(x) for x in
+    # date_str.split("-")` with a raw, user-facing "invalid literal for
+    # int()" error. A value that fails this check is treated exactly like
+    # "нет" was already handled — dropped here so _fill_fields_from_text's
+    # regex fallback (_find_date, which already handles Russian month
+    # names like "5 июля 1976" correctly and always returns a clean
+    # zero-padded ISO string or None) gets a chance to fill it instead,
+    # rather than a half-converted value blocking that fallback from ever
+    # running (_fill_fields_from_text only fills keys not already
+    # present).
+    if date and not re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", date):
+        date = None
+    if time_ and not re.match(r"^\d{1,2}:\d{2}$", time_):
+        time_ = None
     result: Dict[str, str] = {}
     if date:
         result["date"] = date
@@ -2053,6 +2073,48 @@ def run_natal(spec: str) -> str:
     return run_natal_and_subject(spec)[0]
 
 
+# Recognized as "no specific non-current moment given" — i.e. right now —
+# by _parse_moment below. The tool's own TOOL_REGISTRY description tells
+# the routing model to add ";moment=YYYY-MM-DDTHH:MM" ONLY for a moment
+# other than right now, and to default to "right now" otherwise — but a
+# real, reported failure on a weak 3B routing model showed it adding
+# 'moment=текущий момент' anyway when the user's own message said "на
+# текущий момент" (for the current moment), presumably echoing the salient
+# phrase into the field it thought it should fill rather than actually
+# omitting it. That produced a raw Python ValueError surfacing straight
+# into the tool's reply text. Widening the "this means now" set to include
+# the phrasings a model (or a person typing it by hand) is likely to use
+# instead of just "now"/"сейчас" fixes that class of failure without
+# depending on any particular model's instruction-following strength.
+_MOMENT_NOW_SYNONYMS = (
+    "", "now", "сейчас", "текущий момент", "текущий", "на текущий момент",
+    "current", "current moment", "today", "сегодня", "right now",
+)
+
+
+def _parse_moment(moment: str) -> Tuple[Optional[datetime], Optional[str]]:
+    """Shared by run_transit/run_progression/run_lunar_return/
+    run_solar_return/run_profection's identical "moment" field handling.
+    Returns (datetime, None) on success, or (None, error_message) only for
+    a value that isn't a recognized "now" synonym (see
+    _MOMENT_NOW_SYNONYMS) AND doesn't parse under any of the tolerated
+    formats — the strict 'YYYY-MM-DDTHH:MM' the tool description asks for,
+    plus a couple of near-misses (space instead of "T", or date only) a
+    model or a person might plausibly produce instead."""
+    normalized = moment.strip().lower()
+    if normalized in _MOMENT_NOW_SYNONYMS:
+        return datetime.now(), None
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(moment.strip(), fmt), None
+        except ValueError:
+            continue
+    return None, (
+        f"Не удалось разобрать момент времени '{moment}'; "
+        "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
+    )
+
+
 def _build_transit_subjects(fields: Dict[str, str], name: str) -> Tuple[Optional[Any], Optional[Any], Optional[str]]:
     """Shared by run_transit and get_transit_profiles — both need the same
     pair of subjects (natal + the transit-moment subject), and duplicating
@@ -2070,17 +2132,9 @@ def _build_transit_subjects(fields: Dict[str, str], name: str) -> Tuple[Optional
     except Exception as e:
         return None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
 
-    moment = (fields.get("moment") or "now").strip()
-    try:
-        if moment.lower() in ("", "now", "сейчас"):
-            dt = datetime.now()
-        else:
-            dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
-    except Exception as e:
-        return None, None, (
-            f"Не удалось разобрать момент времени '{moment}' ({e}); "
-            "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
-        )
+    dt, error = _parse_moment(fields.get("moment") or "now")
+    if error:
+        return None, None, error
 
     moment_lat_str = fields.get("moment_lat")
     moment_lon_str = fields.get("moment_lon")
@@ -2226,17 +2280,9 @@ def _build_progression_subjects(
     except Exception as e:
         return None, None, None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
 
-    moment = (fields.get("moment") or "now").strip()
-    try:
-        if moment.lower() in ("", "now", "сейчас"):
-            target_dt = datetime.now()
-        else:
-            target_dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
-    except Exception as e:
-        return None, None, None, None, (
-            f"Не удалось разобрать момент времени '{moment}' ({e}); "
-            "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
-        )
+    target_dt, error = _parse_moment(fields.get("moment") or "now")
+    if error:
+        return None, None, None, None, error
 
     try:
         date_str = fields["date"]
@@ -2962,17 +3008,9 @@ def _build_return_subjects(
     except Exception as e:
         return None, None, None, None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
 
-    moment = (fields.get("moment") or "now").strip()
-    try:
-        if moment.lower() in ("", "now", "сейчас"):
-            target_dt = datetime.now()
-        else:
-            target_dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
-    except Exception as e:
-        return None, None, None, None, None, (
-            f"Не удалось разобрать момент времени '{moment}' ({e}); "
-            "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
-        )
+    target_dt, error = _parse_moment(fields.get("moment") or "now")
+    if error:
+        return None, None, None, None, None, error
 
     try:
         from kerykeion.planetary_return_factory import PlanetaryReturnFactory
@@ -3217,17 +3255,9 @@ def _build_profection_context(
     except Exception as e:
         return None, None, None, f"Не удалось построить натальную карту — некорректные данные ({e})."
 
-    moment = (fields.get("moment") or "now").strip()
-    try:
-        if moment.lower() in ("", "now", "сейчас"):
-            target_dt = datetime.now()
-        else:
-            target_dt = datetime.strptime(moment, "%Y-%m-%dT%H:%M")
-    except Exception as e:
-        return None, None, None, (
-            f"Не удалось разобрать момент времени '{moment}' ({e}); "
-            "ожидается формат ГГГГ-ММ-ДДTЧЧ:ММ или 'now'."
-        )
+    target_dt, error = _parse_moment(fields.get("moment") or "now")
+    if error:
+        return None, None, None, error
 
     try:
         date_str = fields["date"]

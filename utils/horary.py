@@ -595,6 +595,21 @@ def _extract_horary_fields_llm(round_text: str) -> Optional[Dict[str, str]]:
 
     date = _parse_extraction_field("ДАТА", answer)
     time_ = _parse_extraction_field("ВРЕМЯ", answer)
+    # Validate the model actually converted the date/time to the strict
+    # numeric format the prompt asks for, rather than trusting it blindly —
+    # same real, reported failure as astro._extract_fields_llm's own
+    # near-identical check (a weaker model can answer e.g. "1976-июл-05"
+    # for "5 июля 1976 года", leaving the Russian month name in place
+    # instead of finishing the conversion), which would otherwise crash
+    # downstream at astro._build_subject's `int(x) for x in
+    # date_str.split("-")` with a raw "invalid literal for int()" error.
+    # Falling back to None here (same as the "нет" case) routes to
+    # _compute_horary_chart's own regex-based fallback path instead, which
+    # already handles Russian month names correctly via astro._find_date.
+    if date and not re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", date):
+        date = None
+    if time_ and not re.match(r"^\d{1,2}:\d{2}$", time_):
+        time_ = None
     if not (date and time_):
         return None
     result = {"date": date, "time": time_}

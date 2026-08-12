@@ -66,7 +66,19 @@ def should_draw_chart(user_text: str) -> bool:
     """True (draw) unless the user's own message explicitly declined an
     image — see this section's own comment for why True is the default
     here even with no model loaded, unlike this app's usual LLM-first
-    convention."""
+    convention.
+
+    Only the FIRST recognizable word of the answer is checked, not a
+    substring search across the whole thing — a real, reported risk with a
+    weaker model (e.g. a 3B instruct model) that doesn't reliably follow
+    "answer with exactly one word": it can preface the real answer with a
+    line of its own reasoning, and a plain "НЕТ" in answer.upper() check
+    would misfire on an aside like "нет явного запрета, значит рисуем"
+    (whose actual conclusion is to draw) purely because the word "нет"
+    appears in it somewhere. Anchoring to the first word keeps this
+    tolerant of that kind of preamble (same tolerance
+    utils/tool_router.py's own _parse already has for its TOOL:/NONE
+    line) without the false-negative risk a blind substring check has."""
     if llm_utils.get_llm() is None:
         return True
     try:
@@ -75,7 +87,21 @@ def should_draw_chart(user_text: str) -> bool:
         )
     except Exception:
         return True
-    return "НЕТ" not in answer.strip().upper()
+    for line in answer.strip().splitlines():
+        words = line.strip().split()
+        if not words:
+            continue
+        token = words[0].strip("*.,:;!?\"'()").upper()
+        if not token:
+            continue
+        if token.startswith("НЕТ"):
+            return False
+        if token.startswith("ДА"):
+            return True
+        # First real word was neither — keep scanning subsequent lines in
+        # case this one was blank punctuation/emphasis noise, same as
+        # tool_router._parse does for its own TOOL:/NONE line.
+    return True
 
 # ---------------------------------------------------------------------------
 # Geometry helpers

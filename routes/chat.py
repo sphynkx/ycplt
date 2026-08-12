@@ -34,6 +34,7 @@ Every /chat call:
 import asyncio
 import base64
 import time
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from fastapi import APIRouter, HTTPException
@@ -639,18 +640,59 @@ _CHART_SECOND_LABEL: Dict[str, str] = {
     "astro_solar_return_chart": "Внешнее кольцо: солнечное возвращение",
 }
 
+# Label prefix for the SECOND subject's own date/time line in the header —
+# only for techniques where chart_second is a real second kerykeion subject
+# with its own birth-data-shaped fields (transit's moving moment,
+# progression's symbolic progressed date, a return chart's exact return
+# moment); omitted for astro_direction_chart (chart_second there is a plain
+# list of synthetic overlay points, not a real subject — see
+# astro.run_direction_and_subject's own docstring) and astro_synastry_chart
+# (handled separately by _synastry_title_lines, since there both subjects
+# are different PEOPLE, not one person plus a second moment). A real,
+# reported gap: the header previously showed only the PRIMARY subject's own
+# date/time/place, leaving no indication at all of what the second ring's
+# moment actually was.
+_CHART_SECOND_DATE_LABEL: Dict[str, str] = {
+    "astro_transit_chart": "Момент транзита",
+    "astro_progression_chart": "Прогрессивная дата",
+    "astro_lunar_return_chart": "Дата возвращения",
+    "astro_solar_return_chart": "Дата возвращения",
+}
+
 
 def _chart_datetime_line(subject: Any) -> Optional[str]:
     """DD.MM.YYYY HH:MM straight off the subject's own stored fields — no
     locale-dependent month-name formatting needed, and avoids the
     unreliable subject.iso_formatted_local_datetime string (its own
     quirks around historical/DST offsets aren't worth working around just
-    for a header line)."""
+    for a header line) — for a subject built via
+    AstrologicalSubjectFactory (natal, transit, progression, synastry).
+
+    Lunar/solar return's own second subject is a DIFFERENT kerykeion model
+    (PlanetReturnModel, from PlanetaryReturnFactory — see
+    astro._build_return_subjects) that has no day/month/year/hour/minute
+    fields at all, only iso_formatted_local_datetime — a real, reported
+    gap: _CHART_SECOND_DATE_LABEL's "Дата возвращения" line silently never
+    appeared for either return type because this function returned None
+    every time for that subject shape. Falls back to parsing that ISO
+    string ONLY when the day/month/etc. fields are genuinely absent
+    (AttributeError), not for any other failure, so this stays a no-op
+    for every other subject shape already working correctly."""
     try:
         return (
             f"{int(subject.day):02d}.{int(subject.month):02d}.{int(subject.year):04d} "
             f"{int(subject.hour):02d}:{int(subject.minute):02d}"
         )
+    except AttributeError:
+        pass
+    except Exception:
+        return None
+    iso = getattr(subject, "iso_formatted_local_datetime", None)
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso)
+        return f"{dt.day:02d}.{dt.month:02d}.{dt.year:04d} {dt.hour:02d}:{dt.minute:02d}"
     except Exception:
         return None
 
@@ -681,7 +723,18 @@ def _chart_place_line(subject: Any, spec_text: str) -> Optional[str]:
     return f"{city} ({coord})" if city else coord
 
 
-def _chart_title_lines(tool_name: str, subject: Any, spec_text: str = "") -> List[str]:
+def _chart_title_lines(
+    tool_name: str, subject: Any, spec_text: str = "", second_subject: Any = None
+) -> List[str]:
+    """second_subject: the SAME chart_second passed to draw_wheel_svg's own
+    `second` param, threaded through here too so the header can name the
+    outer ring's own moment (see _CHART_SECOND_DATE_LABEL) — a real,
+    reported gap: the header used to show ONLY the primary subject's own
+    date/time/place, with nothing at all indicating what specific moment
+    the second ring's positions were even for. Not used for
+    astro_synastry_chart, which has its own _synastry_title_lines instead
+    (there both subjects are different PEOPLE, not one person plus a
+    second moment, so this function's single-person layout doesn't fit)."""
     label = _CHART_TITLE_LABEL.get(tool_name, tool_name)
     name = (getattr(subject, "name", "") or "").strip()
     lines = [label]
@@ -693,6 +746,40 @@ def _chart_title_lines(tool_name: str, subject: Any, spec_text: str = "") -> Lis
     place_line = _chart_place_line(subject, spec_text)
     if place_line:
         lines.append(place_line)
+    second_date_label = _CHART_SECOND_DATE_LABEL.get(tool_name)
+    if second_date_label and second_subject is not None and not isinstance(second_subject, (list, tuple)):
+        second_dt_line = _chart_datetime_line(second_subject)
+        if second_dt_line:
+            lines.append(f"{second_date_label}: {second_dt_line}")
+    return lines
+
+
+def _synastry_title_lines(subject_a: Any, subject_b: Any, spec_text: str) -> List[str]:
+    """Synastry's own header layout, used instead of _chart_title_lines'
+    single-person one — a real, reported gap: the generic layout showed
+    only person A's own name/date/place, with nothing identifying person B
+    beyond the generic "Внешнее кольцо: планеты партнёра" caption, even
+    though a synastry chart is meaningless without knowing who BOTH people
+    are. Each person's own subject already carries a usable name (either
+    their real extracted name, or the "Человек A"/"Человек B" placeholder
+    astro._build_synastry_subjects assigns — see that function's own
+    docstring), so no separate lookup is needed here.
+
+    spec_text is passed to _chart_place_line for BOTH people as a best-
+    effort city-name lookup — since it's the combined two-person text, this
+    can occasionally surface the wrong person's city if both are named
+    exact matches in the gazetteer; each person's own lat/lng (always
+    correct, from their own already-built subject) is included either way,
+    so the coordinate shown is never wrong even when the city name guess
+    is."""
+    label = _CHART_TITLE_LABEL.get("astro_synastry_chart", "Синастрия")
+    lines = [label]
+    for tag, subj in (("A", subject_a), ("B", subject_b)):
+        name = (getattr(subj, "name", "") or "").strip() or f"Человек {tag}"
+        dt_line = _chart_datetime_line(subj) or ""
+        place_line = _chart_place_line(subj, spec_text) or ""
+        detail = ", ".join(part for part in (dt_line, place_line) if part)
+        lines.append(f"{tag}: {name}" + (f" — {detail}" if detail else ""))
     return lines
 
 
@@ -724,7 +811,10 @@ async def _attach_chart_if_applicable(
     should_draw = await loop.run_in_executor(None, chart_draw.should_draw_chart, query)
     if not should_draw:
         return []
-    title_lines = _chart_title_lines(tool_name, chart_subject, spec_text)
+    if tool_name == "astro_synastry_chart" and chart_second is not None:
+        title_lines = _synastry_title_lines(chart_subject, chart_second, spec_text)
+    else:
+        title_lines = _chart_title_lines(tool_name, chart_subject, spec_text, second_subject=chart_second)
     second_label = _CHART_SECOND_LABEL.get(tool_name) if chart_second is not None else None
     try:
         svg_bytes = await loop.run_in_executor(
