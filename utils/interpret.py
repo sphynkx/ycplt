@@ -1620,3 +1620,73 @@ def build_profection_answer_prompt(
         f"{_shared_answer_guardrails()}"
         f"{_no_invented_name_guardrail('Слова «натальный»/«профецированный» в данных')}"
     )
+
+
+def build_help_answer_prompt(
+    query: str, overview_text: str, general_contexts: List[Dict[str, Any]]
+) -> str:
+    """astro_help_assistant's own follow-up prompt (routes/chat.py) —
+    deliberately NOT rag_utils.build_prompt's generic reasoning-mode
+    template, which every other _INTERPRETED_TOOL_NAMES entry uses fine
+    but this one tool cannot: that template opens by asserting its context
+    IS relevant to the question ("Context below includes... relevant to
+    the question", see rag_utils.build_prompt) and then has the model
+    "list the specific facts from the context that matter for this
+    question" — true by construction for every other astro_* tool (their
+    computed_chunk is always this exact person's real, just-computed
+    chart), but only SOMETIMES true here, by design: astro_help_
+    assistant's whole point (per its own TOOL_REGISTRY description and
+    astro_help_methodology.txt) is to also gracefully handle a question
+    that turns out to have nothing to do with astrology at all.
+
+    A real failure was observed using the generic template: asked "На
+    каком материке расположен Кейптаун?" through the help-mode toggle
+    (ChatRequest.force_help), the model treated the handed-in technique
+    overview as "the relevant facts" per the prompt's own framing and
+    answered with a technique rundown instead of the actual geography
+    question — the prompt itself never gave the model permission to
+    decide the context DIDN'T apply. This prompt makes that relevance
+    check an explicit first step instead of an assumed premise, and
+    splits the two outcomes (irrelevant -> answer normally, ignore the
+    material entirely; relevant -> use the material) as concretely as
+    build_profection_answer_prompt etc. split their own section
+    instructions, rather than trusting a vaguer "use if relevant" aside to
+    override the template's opening assumption.
+
+    overview_text is astro_help_overview()'s fixed cheat-sheet (already
+    wrapped with its own intro line by routes/chat.py's computed_chunk
+    special-case for this tool); general_contexts is whatever
+    rag_utils.retrieve_context returned (always includes astro_help_
+    methodology.txt's chunks via topic_hint, per _TOOL_TOPIC)."""
+    context_parts = [overview_text]
+    if general_contexts:
+        context_parts.append(
+            "\n\n---\n\n".join(c["text"] for c in general_contexts)
+        )
+    context_block = "\n\n===\n\n".join(context_parts)
+
+    return (
+        f'Пользователь написал: "{query}"\n\n'
+        "Ниже — справочный материал этого приложения о его "
+        "астрологических методиках (что каждая делает, когда какую "
+        "выбирать, как оформить запрос). Он МОЖЕТ быть релевантен вопросу "
+        "пользователя, а может быть совершенно НЕ релевантен — реши это "
+        "первым делом, прежде чем отвечать:\n\n"
+        f"{context_block}\n\n"
+        "Шаг 1 (не показывай его в ответе, просто пройди про себя): "
+        "вопрос пользователя ДЕЙСТВИТЕЛЬНО о выборе или объяснении "
+        "методик этого приложения, либо о том, как оформить к нему "
+        "запрос?\n\n"
+        "Если НЕТ — вопрос не про астрологию и не про методики этого "
+        "приложения (общие знания, бытовой вопрос, что угодно другое): "
+        "полностью проигнорируй весь материал выше и ответь на реальный "
+        "вопрос пользователя обычным образом, кратко и по существу, ни "
+        "словом не упоминая методики или астрологию.\n\n"
+        "Если ДА — используй материал выше: подскажи, какая методика "
+        "(или несколько) подходит, объясни разницу между техниками если "
+        "об этом спросили, и/или подскажи, как правильно оформить запрос "
+        "— в дружелюбном тоне для человека без астрологического опыта, не "
+        "перечисляя сразу все методики без разбора.\n\n"
+        "Ответь на языке вопроса пользователя. Не упоминай эти шаги и не "
+        "объясняй ход рассуждения — сразу дай итоговый ответ."
+    )

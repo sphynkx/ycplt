@@ -35,6 +35,72 @@ def get_current_datetime(_arg: str = "") -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S, %A")
 
 
+# A short, deterministic cheat-sheet of every astro_* technique, handed to
+# the RAG-augmented follow-up as computed_chunk alongside the retrieved
+# astro_help_methodology.txt content (see routes/chat.py's _TOOL_TOPIC and
+# the computed_chunk wording special-cased there for this one tool). This
+# is NOT the same text as any TOOL_REGISTRY description below — those are
+# written densely, for the tool_router's classifier prompt, not for a
+# person; this is written for a beginner who doesn't know astrology
+# terminology yet and just wants a plain-language pointer to "which one do
+# I need". Kept here (not duplicated into the methodology file) so the
+# per-technique one-liners have exactly one place to update when a
+# technique's own description changes.
+_TECHNIQUE_OVERVIEW_RU = """\
+Доступные методики и для чего каждая нужна:
+
+- Натальная карта (натал) — базовый портрет человека по дате, времени и \
+месту рождения: характер, склонности, сильные и слабые стороны. Точка \
+входа почти для любого запроса про конкретного человека.
+- Транзит — что происходит СЕЙЧАС (или в любой другой конкретный момент): \
+как текущее положение планет влияет на натальную карту. Короткий, "что \
+происходит на этой неделе/сегодня" горизонт.
+- Прогрессии (симв. "день за год") — как характер и внутренние акценты \
+человека медленно меняются на протяжении ЖИЗНИ. Горизонт — годы и \
+десятилетия, не дни.
+- Дирекции (солнечная дуга) — похоже на прогрессии, но все точки карты \
+сдвигаются на ОДИНАКОВЫЙ угол; используется, когда нужно именно это \
+классическое имя техники ("дирекция"), а не общий вопрос "что происходит".
+- Лунар (лунное возвращение) — отдельная карта на момент, когда Луна \
+возвращается в свой натальный градус (примерно раз в месяц); горизонт — \
+ближайший месяц.
+- Солар (солнечное возвращение) — то же самое для Солнца (примерно раз в \
+год, около дня рождения); горизонт — ближайший год.
+- Профекция — классическая техника: какой дом/знак натальной карты \
+"активирован" в этом году и какая планета им управляет ("хозяин года"). \
+Не строит новую карту, а размечает уже существующую.
+- Синастрия — сравнение натальных карт ДВУХ людей: совместимость, \
+динамика отношений.
+- Хорар (хорарный вопрос) — ответ да/нет на конкретный заданный ВОПРОС, \
+карта строится на момент и место, когда сам вопрос был задан (не дата \
+рождения). Подходит для "случится ли X", "стоит ли Y".
+- Электива (элективная астрология) — обратная сторона хорара: не вопрос \
+"случится ли", а выбор УДАЧНОГО МОМЕНТА для начала дела (подписать \
+договор, пожениться, уехать в поездку). Либо оценивает уже предложенный \
+момент, либо сама ищет лучший момент в заданном диапазоне дат.
+- Ректификация (два варианта — по трутине Гермеса и по жизненным \
+событиям) — уточнение НЕТОЧНОГО времени рождения, когда оно известно \
+приблизительно.
+
+Как правильно оформить запрос: не нужен никакой специальный формат — \
+просто укажи дату, время и место рождения (или место и момент вопроса — \
+для хорара/электива) в свободной форме, например: "5 июля 1976 года в \
+4:30 в Одессе". Время и место можно уточнить в ходе диалога, если их не \
+хватает — при их отсутствии ассистент сам попросит уточнить, что именно \
+нужно добавить.
+"""
+
+
+def astro_help_overview(_arg: str = "") -> str:
+    """Returns the deterministic technique cheat-sheet above. Takes (and
+    ignores) an argument only to match every other tool's (str) -> str
+    signature — this tool needs no birth data or free-text extraction of
+    its own; the user's actual question is what the RAG-augmented
+    follow-up reasons over, this overview is just the reference material a
+    plain conversational reply would otherwise lack."""
+    return _TECHNIQUE_OVERVIEW_RU
+
+
 _ALLOWED_BINOPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -354,5 +420,29 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "convert it yourself."
         ),
         "run": electional.run_electional_chart,
+    },
+    "astro_help_assistant": {
+        "description": (
+            "General-purpose ASTROLOGY GUIDANCE for a user who doesn't "
+            "know astrology and isn't sure which technique/tool they need "
+            "yet, or wants technique(s) explained/compared, or wants help "
+            "phrasing a request. Use ONLY when the user is asking ABOUT "
+            "the app's astrology techniques themselves — e.g. 'какая карта "
+            "мне нужна', 'чем отличаются транзит и прогрессия', 'что мне "
+            "для этого нужно указать', 'хочу узнать вероятность события — "
+            "какой метод использовать', or a vague 'хочу сделать себе "
+            "гороскоп, с чего начать'. Do NOT use this: (a) for a request "
+            "that already names a specific technique or already contains "
+            "enough birth/question data to run one directly — use that "
+            "specific astro_* tool instead, this one is only for when the "
+            "user themselves doesn't know which tool applies yet; (b) for "
+            "any question NOT about this app's own astrology techniques — "
+            "general knowledge, small talk, or anything unrelated (e.g. "
+            "'когда родился Пушкин', 'на каком материке Кейптаун') is NOT "
+            "astrology guidance and must NOT use this tool, answer those "
+            "directly instead. Argument: the user's own question, copied "
+            "as written."
+        ),
+        "run": astro_help_overview,
     },
 }

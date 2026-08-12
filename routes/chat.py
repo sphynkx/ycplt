@@ -76,6 +76,15 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = 0.7
     use_rag: Optional[bool] = False
+    # Set when the user armed the composer's ❓ help-mode toggle before
+    # typing this message (see templates/index.html/static/js/app.js) —
+    # force-routes straight to astro_help_assistant, bypassing tool_
+    # router's own classification for THIS message. See chat()'s use of
+    # this flag for why: classification is a small-model judgment call
+    # that's least reliable exactly when the user themselves doesn't know
+    # what they're asking for yet, which is precisely this feature's use
+    # case — a deterministic UI toggle can't misclassify.
+    force_help: Optional[bool] = False
 
     # Optional image attachment: presence of image_data means "edit this
     # image" (see chat() below). image_data is the raw file bytes, base64-
@@ -201,45 +210,13 @@ def _extraction_history_context(prior_texts: List[str]) -> str:
     return "\n".join(prior_texts)
 
 
-@router.post("/chat")
-async def chat(req: ChatRequest):
-    if llm_utils.get_llm() is None:
-        raise HTTPException(status_code=500, detail="Модель не загружена")
-
-    conversation_id = req.conversation_id
-    if conversation_id is None:
-        conversation_id = repository.create_conversation(_auto_title(req.query))
-    elif repository.get_conversation(conversation_id) is None:
-        raise HTTPException(status_code=404, detail="Диалог не найден")
-
-    image_bytes: Optional[bytes] = None
-    if req.image_data:
-        try:
-            image_bytes = base64.b64decode(req.image_data, validate=True)
-        except Exception:
-            raise HTTPException(
-                status_code=400, detail="Некорректные данные изображения (ожидается base64)"
-            )
-
-    sent_at = time.time()
-    user_msg_id = repository.add_message(conversation_id, "user", req.query, sent_at)
-    if image_bytes is not None:
-        repository.add_file(
-            user_msg_id,
-            req.image_filename or "upload.png",
-            req.image_mime_type or "image/png",
-            image_bytes,
-        )
-
-    if image_bytes is not None:
-        if await intent.is_edit_instruction_async(req.query):
-            return await _handle_image_edit_request(conversation_id, req, image_bytes)
-        return await _handle_image_question(conversation_id, req, image_bytes)
-
-    if await intent.is_image_request_async(req.query):
-        return await _handle_image_request(conversation_id, req.query)
-
-    prior_messages = _prior_messages(conversation_id, exclude_message_id=user_msg_id)
+async def _classify_tool_with_retry(
+    req: ChatRequest, prior_messages: List[Dict]
+) -> tool_router.ToolDecision:
+    """The router's normal (non-forced) classification path — extracted
+    out of chat() unchanged so req.force_help (see ChatRequest and chat()
+    below) can skip straight past it instead of needing to be threaded
+    through every line of it as an extra condition."""
     tool_decision = await tool_router.classify_async(
         req.query, _classifier_history_context(prior_messages)
     )
@@ -307,6 +284,72 @@ async def chat(req: ChatRequest):
             retry_decision.tool_arg.strip() or retry_decision.tool_name == "get_current_datetime"
         ):
             tool_decision = retry_decision
+
+    return tool_decision
+
+
+@router.post("/chat")
+async def chat(req: ChatRequest):
+    if llm_utils.get_llm() is None:
+        raise HTTPException(status_code=500, detail="Модель не загружена")
+
+    conversation_id = req.conversation_id
+    if conversation_id is None:
+        conversation_id = repository.create_conversation(_auto_title(req.query))
+    elif repository.get_conversation(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="Диалог не найден")
+
+    image_bytes: Optional[bytes] = None
+    if req.image_data:
+        try:
+            image_bytes = base64.b64decode(req.image_data, validate=True)
+        except Exception:
+            raise HTTPException(
+                status_code=400, detail="Некорректные данные изображения (ожидается base64)"
+            )
+
+    sent_at = time.time()
+    user_msg_id = repository.add_message(conversation_id, "user", req.query, sent_at)
+    if image_bytes is not None:
+        repository.add_file(
+            user_msg_id,
+            req.image_filename or "upload.png",
+            req.image_mime_type or "image/png",
+            image_bytes,
+        )
+
+    if image_bytes is not None:
+        if await intent.is_edit_instruction_async(req.query):
+            return await _handle_image_edit_request(conversation_id, req, image_bytes)
+        return await _handle_image_question(conversation_id, req, image_bytes)
+
+    if await intent.is_image_request_async(req.query):
+        return await _handle_image_request(conversation_id, req.query)
+
+    prior_messages = _prior_messages(conversation_id, exclude_message_id=user_msg_id)
+
+    if req.force_help:
+        # The composer's ❓ toggle (see ChatRequest.force_help's own
+        # comment): a deterministic override, not another classification
+        # attempt. This intentionally skips tool_router entirely rather
+        # than just biasing it, because the whole point of this mode is a
+        # user who doesn't know what to ask for yet — exactly the case
+        # where a small model's own judgment call is least trustworthy.
+        # tool_arg is simply the user's own message; astro_help_assistant
+        # needs no field extraction of its own (utils/tools.py's
+        # astro_help_overview ignores its argument), and astro_help_
+        # methodology.txt's own "not about astrology at all" section
+        # covers a genuinely unrelated question typed in this mode —
+        # answer it plainly rather than forcing an irrelevant technique
+        # recommendation onto it.
+        tool_decision = tool_router.ToolDecision(
+            tool_name="astro_help_assistant",
+            tool_arg=req.query,
+            raw_answer="<forced: help-mode toggle, classifier not run>",
+        )
+        print(f"[tool_router] forced by help-mode toggle: tool={tool_decision.tool_name!r}")
+    else:
+        tool_decision = await _classify_tool_with_retry(req, prior_messages)
 
     if tool_decision.tool_name:
         prior_user_texts = _prior_user_texts(conversation_id, exclude_message_id=user_msg_id)
@@ -499,6 +542,20 @@ _INTERPRETED_TOOL_NAMES = {
     # naturally" prompt over the raw computed report alone would never see
     # electional_methodology.txt at all.
     "astro_electional_chart",
+    # astro_help_assistant — conversational technique-selection/explanation
+    # helper (utils.tools.astro_help_overview), added per explicit user
+    # request for a "universal assistant" that doesn't assume any astrology
+    # knowledge. Listed here for the same tool_arg-concatenation reason as
+    # every entry above (harmless even though its "run" function ignores
+    # tool_arg entirely — see astro_help_overview's own docstring) and
+    # because it DOES need the RAG-augmented follow-up below: a bare
+    # "answer naturally" prompt over the raw overview text alone would
+    # never see astro_help_methodology.txt's fuller technique-comparison
+    # and example-query material. Its computed_chunk wording is
+    # special-cased just below — it's a reference overview, not a specific
+    # person's computed chart data, and saying otherwise would be actively
+    # misleading here.
+    "astro_help_assistant",
 }
 
 # tool_name -> rag_data/ subfolder name, per README's "Recommended
@@ -526,6 +583,7 @@ _TOOL_TOPIC: Dict[str, str] = {
     "astro_profection_chart": "astro_progressions",
     "astro_horary_question": "astro_horar",
     "astro_electional_chart": "astro_elect",
+    "astro_help_assistant": "astro_help",
 }
 
 # These two tools' raw report IS the final answer by default — no
@@ -1137,25 +1195,46 @@ async def _handle_tool_request(
         rag_contexts = rag_utils.retrieve_context(
             req.query, topic_hint=_TOOL_TOPIC.get(decision.tool_name)
         )
-        computed_chunk = {
-            "text": (
-                "ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА (уже вычислены и предоставлены — "
-                "это не пример и не общий случай, а точная натальная/"
-                "транзитная/прогрессивная/синастрическая карта конкретного "
-                "человека (или двух людей) из вопроса пользователя; не "
-                "пересчитывать, не менять и не утверждать, что этих данных "
-                "не хватает или что они не были даны):\n"
-                f"{tool_result}"
-            ),
-            "topic": "astrology",
-            # Always included regardless of retrieval ranking, for two
-            # reasons: the model needs the actual computed data no matter
-            # what, and marking it always_include=True guarantees
-            # build_prompt's step-by-step reasoning-mode prompt activates
-            # for every astro answer, even on a run where no real
-            # methodology chunk happened to rank in the top-k on its own.
-            "always_include": True,
-        }
+        if decision.tool_name == "astro_help_assistant":
+            # astro_help_assistant has no specific person's chart behind
+            # it at all — tool_result is utils.tools.astro_help_overview's
+            # fixed technique cheat-sheet, reference material for ANY
+            # user, not a computed fact about the current question. The
+            # generic wording above ("точная...карта конкретного
+            # человека...не утверждать, что этих данных не хватает") would
+            # be actively misleading here (there's no missing-data case to
+            # deny, and no specific chart to insist is real) — a distinct,
+            # accurately-scoped chunk instead.
+            computed_chunk = {
+                "text": (
+                    "СПРАВОЧНЫЙ МАТЕРИАЛ О МЕТОДИКАХ ПРИЛОЖЕНИЯ (общий "
+                    "обзор для любого пользователя, не данные конкретного "
+                    "человека):\n"
+                    f"{tool_result}"
+                ),
+                "topic": "astrology",
+                "always_include": True,
+            }
+        else:
+            computed_chunk = {
+                "text": (
+                    "ДАННЫЕ ДЛЯ ЭТОГО ЗАПРОСА (уже вычислены и предоставлены — "
+                    "это не пример и не общий случай, а точная натальная/"
+                    "транзитная/прогрессивная/синастрическая карта конкретного "
+                    "человека (или двух людей) из вопроса пользователя; не "
+                    "пересчитывать, не менять и не утверждать, что этих данных "
+                    "не хватает или что они не были даны):\n"
+                    f"{tool_result}"
+                ),
+                "topic": "astrology",
+                # Always included regardless of retrieval ranking, for two
+                # reasons: the model needs the actual computed data no matter
+                # what, and marking it always_include=True guarantees
+                # build_prompt's step-by-step reasoning-mode prompt activates
+                # for every astro answer, even on a run where no real
+                # methodology chunk happened to rank in the top-k on its own.
+                "always_include": True,
+            }
 
         # Multi-stage RAG: rank the chart's own significant facts/points,
         # run a targeted retrieval query per one, and have the model
@@ -1282,6 +1361,25 @@ async def _handle_tool_request(
             # user's own wording if they named both people by name.
             followup_prompt = interpret.build_synastry_answer_prompt(
                 req.query, str(tool_result), digested, rag_contexts, name_a, name_b
+            )
+        elif decision.tool_name == "astro_help_assistant":
+            # NOT rag_utils.build_prompt below — a real, reported failure:
+            # asked "На каком материке расположен Кейптаун?" through the
+            # help-mode toggle, the model answered with a rundown of
+            # astrology techniques instead of the actual geography
+            # question. Root cause: build_prompt's reasoning-mode template
+            # opens by asserting its context IS relevant to the question
+            # and tells the model to enumerate "the specific facts from
+            # the context that matter" — true by construction for every
+            # OTHER _INTERPRETED_TOOL_NAMES entry (their computed_chunk is
+            # always this exact person's real chart), but only sometimes
+            # true here, since this tool must also handle a question with
+            # nothing to do with astrology at all (see astro_help_
+            # methodology.txt). interpret.build_help_answer_prompt makes
+            # that relevance check an explicit first step instead of an
+            # assumed premise — see its own docstring for the full story.
+            followup_prompt = interpret.build_help_answer_prompt(
+                req.query, computed_chunk["text"], rag_contexts
             )
         else:
             # Order matters: raw computed data first, then general

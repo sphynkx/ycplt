@@ -136,11 +136,20 @@
 
   /* Sits to the left of .msg-copy-btn (same top-right corner, offset by
      one button-width + gap) rather than stacking on top of it — both are
-     .copy-btn for shared hover/opacity behavior, this just repositions. */
+     .copy-btn for shared hover/opacity behavior, this just repositions.
+     Labeled "PDF" as plain text rather than an emoji — 📄 (page facing
+     up) used to double as both this button AND the generic file-card
+     icon (renderFileCard in app.js), so the two looked identical despite
+     meaning different things; there's no single emoji that reads
+     unambiguously as "PDF" across platforms, so a short text label is the
+     more reliable choice here. */
   .bubble .pdf-export-btn {
-    right: 34px;
+    right: 40px;
     text-decoration: none;
     display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
   }
 
   .file-card {
@@ -183,16 +192,28 @@
     border-radius: 8px;
     border: 1px solid #ccc;
   }
-  #attach-btn {
-    flex-shrink: 0;
-    width: 42px;
+  /* Attach + help toggle, stacked vertically in one narrow column instead
+     of two full-height buttons — the original side-by-side 42px-wide
+     buttons ate noticeably into the textarea's own width for no benefit,
+     since neither is used anywhere near as often as typing itself. */
+  #composer-icons { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+  .composer-icon-btn {
+    width: 34px;
+    height: 27px;
+    padding: 0;
+    line-height: 1;
     border: 1px solid #ccc;
-    border-radius: 8px;
+    border-radius: 6px;
     background: #fff;
-    font-size: 1.1rem;
+    font-size: 0.95rem;
     cursor: pointer;
   }
-  #attach-btn:hover { background: #ececec; }
+  .composer-icon-btn:hover { background: #ececec; }
+  /* Armed state for #help-btn (see static/js/app.js's setHelpMode) — the
+     button doesn't send anything by itself, it just marks the NEXT
+     message for forced help-mode routing, so it needs a clearly different
+     look while armed or a user could easily forget it's on. */
+  .composer-icon-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; }
   button[type="submit"] {
     padding: 0 18px;
     border: none;
@@ -233,6 +254,29 @@
     flex-shrink: 0;
   }
   #attachment-preview .attachment-remove:hover { color: #c0392b; }
+
+  #help-mode-indicator {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+    border: 1px solid #2563eb;
+    border-radius: 8px;
+    background: #eef3ff;
+    font-size: 0.82rem;
+    color: #1d4ed8;
+  }
+  #help-mode-indicator .help-mode-cancel {
+    background: none;
+    border: none;
+    color: #1d4ed8;
+    cursor: pointer;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  #help-mode-indicator .help-mode-cancel:hover { color: #c0392b; }
 </style>
 </head>
 <body>
@@ -260,8 +304,15 @@
           <span class="attachment-hint">— изображение будет отредактировано согласно запросу</span>
           <button type="button" class="attachment-remove" title="Убрать вложение">✕</button>
         </div>
+        <div id="help-mode-indicator">
+          <span>Режим помощи включён — следующее сообщение обработает помощник (вопрос может быть любым)</span>
+          <button type="button" class="help-mode-cancel" title="Отменить режим помощи">✕</button>
+        </div>
         <form id="chat-form">
-          <button id="attach-btn" type="button" title="Прикрепить изображение для редактирования">📎</button>
+          <div id="composer-icons">
+            <button id="attach-btn" class="composer-icon-btn" type="button" title="Прикрепить изображение для редактирования">📎</button>
+            <button id="help-btn" class="composer-icon-btn" type="button" title="Режим помощи: следующее сообщение обработает помощник">❓</button>
+          </div>
           <input id="image-input" type="file" accept="image/*" hidden>
           <textarea id="query" rows="2" placeholder="Напиши сообщение..." required></textarea>
           <button id="send-btn" type="submit">Отправить</button>

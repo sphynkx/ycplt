@@ -300,12 +300,34 @@ has no `User=` line (this deployment runs as root). Adjust
   message. Falls back to the legacy `execCommand('copy')` when the page
   isn't a secure context (e.g. opened over plain `http://` from a LAN
   address), since the modern Clipboard API refuses to work there.
+- **Help-mode toggle** — a small ❓ button stacked under the 📎 attach
+  button, for a user with no astrology background who isn't sure which
+  technique applies (or whether one does at all) — or who just wants to
+  ask the assistant something, on any topic, without being force-fit into
+  a specific technique. Clicking it *arms* help mode (the button
+  highlights and a banner appears above the composer); nothing is sent —
+  the user still types and sends their own question, on whatever topic
+  they want, exactly as normal. That one message is submitted with
+  `force_help: true` (`ChatRequest.force_help`, `routes/chat.py`), which
+  routes it straight to `astro_help_assistant` WITHOUT running
+  `tool_router`'s own classification at all — a deliberate bypass, not
+  just a bias, because the router's small-model judgment call is least
+  reliable exactly when the user themselves doesn't know what they're
+  asking for yet (the whole reason this mode exists). One-shot: the toggle
+  disarms itself once that message is sent (click it again for another
+  help-mode question); the small banner also has its own "✕" to disarm it
+  before sending. An earlier version of this feature sent a fixed canned
+  question instead of letting the user type their own — replaced after
+  feedback that a single hardcoded prompt can't represent "ask anything,
+  possibly unrelated to astrology entirely". See "Universal help
+  assistant" below for how `astro_help_assistant` itself handles a
+  genuinely unrelated question once it gets one.
 
 ## API
 
 | Method/path | Description |
 |---|---|
-| `POST /chat` | Send a message. Body: `{query, conversation_id?, use_rag?, max_tokens?, temperature?, image_data?, image_filename?, image_mime_type?, strength?}`. Without `conversation_id`, creates a new conversation. `max_tokens` defaults to `null` — no artificial cap; the model generates until it stops on its own or fills the context window (`N_CTX`). `image_data` is a base64-encoded image (no `data:...;base64,` prefix); if present, `utils/intent.py` classifies the accompanying text as an edit instruction (submits an img2img job — `strength`, 0..1, default 0.75, controls how much the result may diverge from the input) or a question about the image (submits a caption job) — see "Editing"/"Understanding an uploaded image" below. Any of image-generation, image-edit, or image-caption requests return a `pending` placeholder immediately instead of chat text; otherwise returns the model's reply with `sent_at`/`responded_at` (ms), `thinking_ms`, and a `files` list. |
+| `POST /chat` | Send a message. Body: `{query, conversation_id?, use_rag?, max_tokens?, temperature?, image_data?, image_filename?, image_mime_type?, strength?, force_help?}`. Without `conversation_id`, creates a new conversation. `max_tokens` defaults to `null` — no artificial cap; the model generates until it stops on its own or fills the context window (`N_CTX`). `image_data` is a base64-encoded image (no `data:...;base64,` prefix); if present, `utils/intent.py` classifies the accompanying text as an edit instruction (submits an img2img job — `strength`, 0..1, default 0.75, controls how much the result may diverge from the input) or a question about the image (submits a caption job) — see "Editing"/"Understanding an uploaded image" below. `force_help` (default `false`) skips `tool_router`'s classification entirely and routes straight to `astro_help_assistant` — set by the composer's ❓ help-mode toggle (see "Interface" and "Universal help assistant" below), not meant to be combined with `image_data`. Any of image-generation, image-edit, or image-caption requests return a `pending` placeholder immediately instead of chat text; otherwise returns the model's reply with `sent_at`/`responded_at` (ms), `thinking_ms`, and a `files` list. |
 | `GET /health` | Model/RAG-index status and the configured `image_service_url`. For vision/generation model diagnostics, see ycplt_img's own `GET /health` — this app doesn't hold any of those models. |
 | `GET /api/conversations` | List conversations (id, title, updated_at), sorted by last activity. |
 | `POST /api/conversations` | Manually create an empty conversation (usually unnecessary — `/chat` creates one lazily). |
@@ -1328,6 +1350,71 @@ Built-in tools:
   `rag_data/astro_elect/` — again, without the muhurta or Globa source
   files, even as reference material for the corpus.
 
+  **Universal help assistant (`astro_help_assistant`, `utils/tools.py`'s
+  `astro_help_overview`).** Every technique above assumes the user already
+  knows which one they need. This tool is for the opposite case — a user
+  with no astrology background who isn't sure what to ask for, wants
+  techniques explained/compared, or wants help phrasing a request — added
+  per explicit user request for a conversational "universal assistant"
+  rather than a static help page. Reuses the exact same machinery every
+  other `astro_*` tool already uses (`_INTERPRETED_TOOL_NAMES` +
+  `_TOOL_TOPIC` + the RAG-augmented reasoning-mode follow-up in
+  `routes/chat.py`) instead of a bespoke code path: `astro_help_overview`
+  returns a fixed, deterministic one-line-per-technique cheat sheet (no
+  birth data or free-text extraction of its own — it ignores its
+  argument), which becomes the computed-facts context for the same
+  follow-up call, reasoning against `astro_help_methodology.txt` (master
+  copy under `install/methodologies/`; copy it into `rag_data/astro_help/`
+  — see "Recommended `rag_data/` layout" below). That methodology
+  document is deliberately NOT another factual astrology corpus — it's
+  written for THIS decision (which technique fits a plain-language need),
+  covering: a decision tree from a bytovoy description to a specific tool;
+  an explicit resolution for the most common real confusion (transit vs.
+  progressions vs. directions vs. lunar/solar return vs. profection — all
+  "what's happening now/soon" questions with different horizons and
+  mechanics); the horary-vs-electional-vs-return distinction (who controls
+  the moment — an event that just happens to you vs. one you can schedule
+  yourself); and guidance on phrasing a request in plain language, one
+  concrete example per technique. `routes/chat.py` special-cases this
+  tool's own `computed_chunk` wording (not the shared "точная карта
+  конкретного человека" phrasing every other tool's computed_chunk uses —
+  there's no specific person's chart behind this one, just reference
+  material, and claiming otherwise would mislead the model into treating a
+  generic overview as this user's own data).
+
+  `TOOL_REGISTRY`'s description for this tool is deliberately narrow, since
+  a router entry this conversational-sounding risks over-triggering: it's
+  scoped to genuine uncertainty about which technique applies, technique
+  explanation/comparison requests, and request-phrasing help — explicitly
+  NOT for a message that already names a specific technique or already
+  carries enough data to run one directly (that should still route to the
+  specific tool), and NOT for anything unrelated to this app's own
+  techniques (general knowledge, small talk — e.g. "когда родился
+  Пушкин", "на каком материке Кейптаун" — falls through to the plain,
+  non-tool chat path completely unaffected, same as it always did before
+  this tool existed). This also means the assistant is reachable
+  automatically mid-conversation, in the middle of any other technique's
+  own dialogue, whenever the router judges a message this way — no extra
+  plumbing needed for that, since the router already re-classifies every
+  new message against every registered tool regardless of what the
+  previous reply used.
+
+  Reachable two ways: naturally, by typing a question about which
+  technique to use (goes through the router logic just described), or via
+  the composer's ❓ help-mode toggle (see "Interface" above), which
+  bypasses that router logic entirely for one message —
+  `ChatRequest.force_help` short-circuits `chat()` straight to
+  `astro_help_assistant` with the user's own typed text as `tool_arg`, no
+  classification call made at all. The forced path exists precisely
+  because router classification is a small-model judgment call, least
+  reliable exactly when the user doesn't know what they're asking for yet
+  — a UI toggle can't misclassify. It also means a forced message can be
+  about literally anything, not just this app's techniques (the toggle
+  doesn't pre-filter what the user types) — section 6 of `astro_help_
+  methodology.txt` exists specifically for that case: a genuinely
+  unrelated question gets a plain, direct answer instead of a forced
+  technique recommendation.
+
   **Recommended `rag_data/` layout.** Each technique's own methodology
   write-up is maintained centrally under `install/methodologies/` (see the
   project layout tree above) and only takes effect once copied into the
@@ -1347,6 +1434,7 @@ Built-in tools:
   | `astro_rectif` | `rectification_trutine_methodology.txt`, `rectification_events_methodology.txt` | both rectification tools |
   | `astro_horar` | `horary_methodology.txt` | horary questions (`astro_horary_question`'s reasoning step) |
   | `astro_elect` | `electional_methodology.txt` | electional astrology (`astro_electional_chart`'s reasoning step) — deliberately excludes Vedic muhurta and Globa's lecture material from the source corpus, per explicit design decision; don't add those files to this subfolder even as reference texts |
+  | `astro_help` | `astro_help_methodology.txt` | technique selection/explanation help (`astro_help_assistant`'s reasoning step) — not a factual astrology corpus, a decision-guide for which technique fits a plain-language need |
 
   In each subfolder, put the methodology file(s) first, then whatever
   factual reference corpus you've selected for that topic (planet/house/

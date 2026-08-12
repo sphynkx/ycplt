@@ -7,11 +7,14 @@
   const convListEl = document.getElementById('conv-list');
   const newChatBtn = document.getElementById('new-chat-btn');
   const attachBtn = document.getElementById('attach-btn');
+  const helpBtn = document.getElementById('help-btn');
   const imageInput = document.getElementById('image-input');
   const attachmentPreviewEl = document.getElementById('attachment-preview');
   const attachmentThumbEl = attachmentPreviewEl.querySelector('.attachment-thumb');
   const attachmentNameEl = attachmentPreviewEl.querySelector('.attachment-name');
   const attachmentRemoveEl = attachmentPreviewEl.querySelector('.attachment-remove');
+  const helpModeIndicatorEl = document.getElementById('help-mode-indicator');
+  const helpModeCancelEl = helpModeIndicatorEl.querySelector('.help-mode-cancel');
 
   let currentConversationId = localStorage.getItem('currentConversationId');
   currentConversationId = currentConversationId ? parseInt(currentConversationId, 10) : null;
@@ -19,6 +22,23 @@
   // An image picked via the attach button, staged until the next send.
   // { dataUrl, base64, mimeType, filename } or null.
   let pendingImage = null;
+
+  // Whether the ❓ help-mode toggle is armed for the NEXT message. This is
+  // deliberately just a flag, not a canned message: the whole point (per
+  // explicit feedback on the first version of this feature) is that the
+  // user types their OWN question — which may be about anything, not just
+  // astrology — and it gets force-routed to astro_help_assistant
+  // (ChatRequest.force_help, routes/chat.py) instead of going through
+  // tool_router's own classification, which is exactly the least reliable
+  // for a user who doesn't know what to ask for yet. One-shot: consumed
+  // by the next send, same lifecycle as pendingImage above.
+  let helpModeArmed = false;
+
+  function setHelpMode(active) {
+    helpModeArmed = active;
+    helpBtn.classList.toggle('active', active);
+    helpModeIndicatorEl.style.display = active ? 'flex' : 'none';
+  }
 
   // Polling for background-resolved messages (e.g. pending image jobs).
   const POLL_INTERVAL_MS = 5000;
@@ -91,10 +111,16 @@
     // Content-Disposition: inline (see routes/export.py), so opening it
     // in a new tab shows the PDF in the browser's own viewer, which
     // already has its own save/print controls; no extra JS needed.
+    //
+    // Text label, not an emoji: 📄 (page facing up) used to be reused here
+    // AND for the generic file-attachment icon (renderFileCard below),
+    // making the two visually indistinguishable despite meaning different
+    // things — "PDF" reads unambiguously regardless of platform emoji
+    // rendering.
     const btn = document.createElement('a');
     btn.className = 'copy-btn pdf-export-btn';
     btn.title = 'Экспортировать в PDF';
-    btn.textContent = '📄';
+    btn.textContent = 'PDF';
     btn.href = '/api/messages/' + messageId + '/pdf';
     btn.target = '_blank';
     btn.rel = 'noopener';
@@ -513,19 +539,29 @@
   });
   attachmentRemoveEl.addEventListener('click', clearAttachedImage);
 
+  // ---------- Режим помощи ----------
+  // Arms/disarms help-mode for the NEXT message only — see helpModeArmed's
+  // own comment above. Nothing is sent here; the user still types and
+  // sends their own message as usual, on any topic.
+  helpBtn.addEventListener('click', () => setHelpMode(!helpModeArmed));
+  helpModeCancelEl.addEventListener('click', () => setHelpMode(false));
+
   // ---------- Отправка сообщения ----------
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const query = textarea.value.trim();
     if (!query) return;
 
-    // Captured before clearAttachedImage() resets the composer, so the
-    // request still carries the image the user actually picked.
+    // Captured before clearAttachedImage()/setHelpMode(false) reset the
+    // composer, so the request still reflects what the user actually
+    // armed/attached for THIS message.
     const imageToSend = pendingImage;
+    const forceHelp = helpModeArmed;
 
     errorBox.textContent = '';
     textarea.value = '';
     sendBtn.disabled = true;
+    setHelpMode(false); // one-shot — consumed by this message
 
     const userRecord = { role: 'user', content: query, created_at: Date.now() };
     if (imageToSend) {
@@ -551,6 +587,9 @@
         body.image_data = imageToSend.base64;
         body.image_filename = imageToSend.filename;
         body.image_mime_type = imageToSend.mimeType;
+      }
+      if (forceHelp) {
+        body.force_help = true;
       }
       const resp = await fetch('/chat', {
         method: 'POST',
