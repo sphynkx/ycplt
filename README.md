@@ -85,15 +85,41 @@ data/                      — generated data:
 
 ## Hardware and why this stack
 
-Reference hardware: i7-5500U (2 physical cores / 4 threads), 12 GB RAM,
-GeForce 940M (2 GB) — no usable GPU acceleration for LLM inference. Hence:
+Current reference hardware: Intel Core i7-8700 @ 3.20GHz (6 physical cores /
+12 threads), 16 GB RAM, no discrete GPU used for inference — at least 25 GB
+free disk space (the chat model alone is ~6 GB; add RAM-cache headroom, the
+embedding model, and RAG index data on top). Currently running
+**Qwen3.5-9B, `UD-Q4_K_XL` quant** (~6 GB) as the chat model — see "3. Chat
+model" above for the full download link and quant alternatives — which runs
+comfortably on this hardware for interactive chat, including the heaviest
+single-request workload in this app (a full RAG-interpreted horary or
+electional answer).
+
+This replaces an earlier, noticeably weaker reference machine: i7-5500U (2
+physical cores / 4 threads), 12 GB RAM, GeForce 940M (2 GB, no usable GPU
+acceleration for LLM inference) — on that hardware, even a 7B model ran at
+around 1 token/sec, too slow for comfortable chat, which is why the
+project's shipped default started at 3B and only moved up to today's 9B
+default after this hardware upgrade (see "3. Chat model" above for the
+full history of that change and the measured latency difference between
+the two). If you're deploying on hardware closer to the OLD reference specs
+above, drop back down to a 3B-class (or smaller) model instead — see the
+lighter alternatives listed in "3. Chat model".
+
+Hence, independent of whichever specific machine this runs on:
 
 - Inference via **llama-cpp-python** — native GGUF support, CPU inference,
   actively maintained.
-- A **3B-class model in Q4_K_M quantization**, not 7B: on this CPU a 7B model
-  runs at ~1 token/sec, too slow for comfortable chat.
-- GPU is not used (`N_GPU_LAYERS=0` by default): the 940M (compute capability
-  5.0, 2 GB VRAM) gives no practical speedup.
+- Model size/quantization should be picked to match the actual CPU
+  available, not assumed — a model that's comfortably fast on a modern
+  6-core/12-thread desktop can be unusably slow on an older 2-core/4-thread
+  laptop CPU, and vice versa there's no reason to stay on a smaller/weaker
+  model than the hardware can actually support (see the small-vs-large
+  model trade-off discussion in "3. Chat model" above).
+- GPU is not used (`N_GPU_LAYERS=0` by default) on either reference machine
+  — raise it if you do have a GPU with enough VRAM for the model you're
+  running; llama-cpp-python supports GPU offload, this project simply
+  hasn't needed it on either machine documented here.
 - Chat history lives in **SQLite** (`data/chat.sqlite3`) — enough for a
   single-user local app, no separate database server needed.
 
@@ -227,7 +253,9 @@ image-understanding half, unused here (this app only calls
 `create_chat_completion` for text).
 
 Replaced the earlier Qwen2.5-3B-instruct default after real testing on the
-same reference hardware below (i7-5500U, 2c/4t, 12 GB RAM, no usable GPU):
+OLD reference hardware from "Hardware and why this stack" above (i7-5500U,
+2c/4t, 12 GB RAM, no usable GPU) — since superseded by the current
+i7-8700/16 GB reference machine, see that section for the full story:
 noticeably fewer of the small model's characteristic failures
 (contradicting a tool's own computed verdict, inventing facts not present
 in the supplied data, garbling non-Russian text mid-answer) at a real but
@@ -248,8 +276,11 @@ latency doesn't fit your use case):
 
 - **Qwen2.5-3B-Instruct-GGUF** (file `qwen2.5-3b-instruct-q4_k_m.gguf`, ~2 GB) —
   https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF — the original
-  default on this same reference hardware, ~250s for a full horary answer
-  vs 9B's 400-550s, at the cost of the small-model failure modes above.
+  default on the OLD reference hardware (see "Hardware and why this stack"
+  above), ~250s there for a full horary answer vs 9B's 400-550s, at the
+  cost of the small-model failure modes above. On the current i7-8700
+  reference machine both would run considerably faster than either of
+  those figures.
 - If too slow even at 3B — **Qwen2.5-1.5B-Instruct-GGUF** (faster, lower quality).
 - **Qwen2.5-7B-Instruct, Q4_K_M** (~4.7 GB):
   https://huggingface.co/paultimothymooney/Qwen2.5-7B-Instruct-Q4_K_M-GGUF
