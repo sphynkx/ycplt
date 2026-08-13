@@ -31,7 +31,7 @@ derivation.
 """
 import math
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from utils import astro
 from utils import llm as llm_utils
@@ -235,15 +235,20 @@ _SECOND_CHART_TEXT_COLOR = "#7a2f8a"
 _HOUSEBAND_FILL = "#EAF4FC"
 
 
-def _aspect_style(aspect_name: str, orbit: float, movement: str) -> Tuple[str, float, Optional[str]]:
+def _aspect_style(aspect_name: str, orbit: float, movement: str, max_orb: float) -> Tuple[str, float, Optional[str]]:
     """Returns (stroke_color, stroke_width, dasharray) for one aspect.
     Width is linearly interpolated between a thick line at an exact (0
-    deg orb) aspect and a thin one at the aspect's own configured max orb
-    (astro._ALL_ASPECTS) — "how close to exact" the way the user asked
-    for, not a fixed width per aspect type. Applying aspects (still
+    deg orb) aspect and a thin one at max_orb — "how close to exact" the
+    way the user asked for, not a fixed width per aspect type. max_orb is
+    now passed in by the caller rather than looked up here, since the
+    correct value depends on which orb scheme this chart uses — see
+    _orb_limit_fn below (astro.natal_orb_limit/transit_orb_limit/
+    synastry_orb_limit's per-body moiety orb for most techniques, or
+    astro._classical_orb_limit's luminary-aware orb for a horary/
+    electional chart — all of them depend on which two bodies are
+    actually involved, not just the aspect name). Applying aspects (still
     forming, per astro._ASPECT_MOVEMENT_RU's own convention) are solid;
     separating ones are dashed."""
-    max_orb = next((a["orb"] for a in astro._ALL_ASPECTS if a["name"] == aspect_name), 8.0)
     tightness = 1.0 - min(abs(orbit), max_orb) / max_orb if max_orb else 1.0
     width = 1.0 + 3.0 * max(0.0, min(1.0, tightness))
     dasharray = None if movement == "Applying" else "6,5"
@@ -254,6 +259,29 @@ def _aspect_style(aspect_name: str, orbit: float, movement: str) -> Tuple[str, f
         nature = astro._ASPECT_NATURE.get(aspect_name, "")
         color = _MINOR_HARMONIOUS_COLOR if "гармонич" in nature else _MINOR_OTHER_COLOR
     return color, width, dasharray
+
+
+def _orb_limit_fn(classical_aspects: bool, is_cross: bool, dual_orb_profile: str) -> Callable[[str, str, str], float]:
+    """Picks which of astro.py's per-technique orb functions applies to one
+    aspect-computation block (inner-chart or cross-chart) of this wheel.
+
+    classical_aspects=True always wins (horary/electional's own scheme,
+    untouched by this per-technique work — see astro._classical_orb_limit).
+
+    Otherwise: inner-chart aspects (is_cross=False) are a single chart's
+    own INTERNAL aspects — always astro.natal_orb_limit, regardless of
+    which technique produced that chart (a real natal chart, a progressed
+    chart read alone, a return chart read alone, ...): the "natal" profile
+    models one chart looked at by itself, not the natal technique
+    specifically. Cross-chart aspects (is_cross=True, the outer ring
+    against the inner one) use astro.synastry_orb_limit or
+    astro.transit_orb_limit depending on dual_orb_profile — see
+    draw_wheel_svg's own docstring for which techniques pass which."""
+    if classical_aspects:
+        return astro._classical_orb_limit
+    if is_cross:
+        return astro.synastry_orb_limit if dual_orb_profile == "synastry" else astro.transit_orb_limit
+    return astro.natal_orb_limit
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +399,8 @@ def draw_wheel_svg(
     title_lines: Optional[List[str]] = None,
     highlight_house: Optional[int] = None,
     second_label: Optional[str] = None,
+    classical_aspects: bool = False,
+    dual_orb_profile: str = "transit",
 ) -> bytes:
     """Renders one astrological wheel as a standalone SVG document
     (UTF-8 bytes, ready to hand to db.repository.add_file with
@@ -399,7 +429,49 @@ def draw_wheel_svg(
     generic subject.name/date line if not given.
 
     highlight_house: optional house number (1-12) to shade distinctly
-    (used by run_profection for the "activated" house this year)."""
+    (used by run_profection for the "activated" house this year).
+
+    classical_aspects: False (default) draws aspects with this app's
+    per-technique orb system (see dual_orb_profile below and
+    astro.natal_orb_limit/transit_orb_limit/synastry_orb_limit) — correct
+    for every technique except the two below, per
+    interpretation_methodology.txt (no separate numeric orb scheme is
+    prescribed there; whatever orb the code already computes is the
+    intended one). Pass True only for a horary or electional chart
+    (routes/chat.py sets this from tool_name): those two techniques' own
+    methodology docs specify a genuinely different scheme — only six
+    classical aspect types (not the five extra minors), with an orb that
+    depends on which bodies are involved (8-10° for Sun/Moon, 6-7° for
+    other planets, flat 5° for quincunx) rather than a per-body moiety
+    table. Before this flag existed, every chart — including
+    horary/electional — was always drawn with the general table, so a
+    horary/electional wheel could show aspect lines (e.g. a quintile) that
+    don't exist under that technique's own doctrine at all, and even its
+    classical aspects could appear with the wrong orb cutoff. See
+    astro._CLASSICAL_ASPECTS_WIDE/filter_classical_aspects for the shared
+    implementation (also used by utils/horary.py and utils/electional.py
+    for their own verdict computation, so the picture now matches the
+    reasoning).
+
+    dual_orb_profile: only matters when classical_aspects=False AND there
+    is a real second subject (routes/chat.py sets this from tool_name).
+    "transit" (default) is for one real chart plus a technique-derived
+    moment overlaid on it — transit, progression, lunar/solar return
+    (direction never reaches this code path at all: its second is a list
+    of synthetic overlay points, not a real subject, so is_real_second_
+    subject is already False and no cross-chart aspects are computed).
+    "synastry" is for astro_synastry_chart specifically — two real
+    people's charts conventionally get a different, wider orb than a
+    single derived moment. Either way, the INNER chart's own aspects
+    (this subject's own planets against each other) always use the natal
+    profile (astro.natal_orb_limit) regardless of dual_orb_profile — a
+    chart's own internal aspects don't change meaning just because it's
+    being compared to something else. See utils/astro.py's own comment
+    above _NATAL_ORB_BY_BODY/_TRANSIT_ORB_BY_BODY/_SYNASTRY_ORB_BY_BODY
+    for where these numbers come from (the user's reference astrology
+    software) and why they're structured as per-body moiety tables."""
+    orb_limit_inner = _orb_limit_fn(classical_aspects, is_cross=False, dual_orb_profile=dual_orb_profile)
+    orb_limit_cross = _orb_limit_fn(classical_aspects, is_cross=True, dual_orb_profile=dual_orb_profile)
     dual = second is not None
     second_points = _normalize_second(second)
     is_real_second_subject = dual and not isinstance(second, (list, tuple))
@@ -576,15 +648,21 @@ def draw_wheel_svg(
     # _WHEEL_ASPECT_POINTS' own comment on why) ---
     from kerykeion import AspectsFactory
 
+    aspect_table = astro._CLASSICAL_ASPECTS_WIDE if classical_aspects else astro._PER_TECHNIQUE_ASPECTS_WIDE
     inner_aspects = AspectsFactory.natal_aspects(
-        subject, active_points=_WHEEL_ASPECT_POINTS, active_aspects=astro._ALL_ASPECTS,
+        subject, active_points=_WHEEL_ASPECT_POINTS, active_aspects=aspect_table,
     ).aspects
+    if classical_aspects:
+        inner_aspects = astro.filter_classical_aspects(inner_aspects)
     kery_to_label = {astro.attr_to_kerykeion_name(attr): label for label, attr in astro._PLANET_ATTRS + astro._ANGLE_ATTRS}
     for a in inner_aspects:
         l1, l2 = kery_to_label.get(a.p1_name), kery_to_label.get(a.p2_name)
         if not l1 or not l2 or l1 not in true_pos_by_label or l2 not in true_pos_by_label:
             continue
-        color, width, dasharray = _aspect_style(a.aspect, a.orbit, a.aspect_movement)
+        max_orb = orb_limit_inner(a.aspect, a.p1_name, a.p2_name)
+        if a.orbit > max_orb:
+            continue
+        color, width, dasharray = _aspect_style(a.aspect, a.orbit, a.aspect_movement, max_orb)
         x1, y1 = true_pos_by_label[l1]
         x2, y2 = true_pos_by_label[l2]
         dash_attr = f' stroke-dasharray="{dasharray}"' if dasharray else ""
@@ -607,8 +685,10 @@ def draw_wheel_svg(
 
         if is_real_second_subject:
             cross_aspects = AspectsFactory.dual_chart_aspects(
-                subject, second, active_points=_WHEEL_ASPECT_POINTS, active_aspects=astro._ALL_ASPECTS,
+                subject, second, active_points=_WHEEL_ASPECT_POINTS, active_aspects=aspect_table,
             ).aspects
+            if classical_aspects:
+                cross_aspects = astro.filter_classical_aspects(cross_aspects)
             for a in cross_aspects:
                 inner_name = a.p1_name if a.p1_owner == subject.name else a.p2_name
                 outer_name = a.p2_name if a.p1_owner == subject.name else a.p1_name
@@ -621,7 +701,10 @@ def draw_wheel_svg(
                     continue
                 theta2 = _theta_for_degree(outer_point[1], asc_deg)
                 x2, y2 = _polar(cx, cy, r_signband_outer, theta2)
-                color, width, dasharray = _aspect_style(a.aspect, a.orbit, a.aspect_movement)
+                max_orb = orb_limit_cross(a.aspect, a.p1_name, a.p2_name)
+                if a.orbit > max_orb:
+                    continue
+                color, width, dasharray = _aspect_style(a.aspect, a.orbit, a.aspect_movement, max_orb)
                 x1, y1 = true_pos_by_label[l1]
                 dash_attr = f' stroke-dasharray="{dasharray}"' if dasharray else ""
                 svg.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{color}" stroke-width="{width:.2f}"{dash_attr} opacity="0.7"/>')

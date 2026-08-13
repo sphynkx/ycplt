@@ -176,6 +176,50 @@ Hence, independent of whichever specific machine this runs on:
 - Chat history lives in **SQLite** (`data/chat.sqlite3`) — enough for a
   single-user local app, no separate database server needed.
 
+## Concurrency: one model, many chats
+
+The sidebar supports any number of parallel conversations, and the app
+runs as one `uvicorn` process (no `workers=` argument) with one process-
+wide `Llama` instance (`utils/llm.py`) — so what actually happens when two
+chats are used at the same time is worth being precise about.
+
+**What genuinely runs in parallel.** FastAPI dispatches each `/chat`
+request's blocking work (astro chart computation, RAG retrieval, tool
+routing) onto a thread pool via `loop.run_in_executor(...)`, and none of
+that touches the shared model — two different conversations' chart/data
+prep can and does run at the same time on separate threads, using whatever
+spare CPU cores are available.
+
+**What does not, and why.** Actual answer generation is a different
+story: `llama-cpp-python`'s `Llama` class has no internal thread-safety
+guard at all (checked directly against its source) — two threads calling
+`create_chat_completion` on the same instance at the same time would race
+on its internal context/KV cache with nothing stopping them. Before this
+was noticed, nothing in this app prevented that either: two chats
+answered close together in time could have corrupted each other's output
+or crashed, not just been slow. `utils/llm.py`'s `generate_sync` (the one
+function every LLM call in this app funnels through, sync or async) now
+serializes every call on a module-level `threading.Lock` — a plain
+`threading.Lock`, not `asyncio.Lock`, since most callers reach it from a
+worker thread (`run_in_executor`), not from inside a coroutine, where an
+`asyncio.Lock` wouldn't even be usable. Verified directly: four
+simulated concurrent calls through a slowed-down fake model never
+overlapped and took the full serial time, not the parallel time.
+
+**The honest limit.** This turns an unsafe race into a safe, correct,
+one-request-at-a-time queue for generation — it does NOT make two chats'
+answers generate *simultaneously*. That's a real hardware/architecture
+limit, not a bug: there is exactly one CPU-bound model instance, and
+genuinely simultaneous generation of two different answers would need a
+second one resident in memory (a real option — see "Hardware and why this
+stack" above for what that costs in RAM — just a much bigger change than
+this fix). In practice: send a message in a second chat while the first
+is still working, and it queues safely behind it rather than racing with
+it or being silently dropped — the reply lands in its own conversation's
+history once its turn comes, correctly, regardless of which chat happens
+to be open on screen by then (see "Parallel chats" above for the matching
+frontend fix).
+
 ## Installation & Setup
 
 Everything needed to go from a fresh checkout to a running app, in order.
@@ -473,6 +517,15 @@ working as a normal chat; `use_rag` simply has no effect (see
   confirmation, cascades to its messages and files in the database).
 - **Parallel chats** — each conversation is stored separately in the database;
   any number can be kept simultaneously and switched between via the sidebar.
+  Switching away from a chat mid-request does NOT cancel it — the backend
+  keeps computing regardless of what's on screen, and its answer lands in
+  the right conversation's history whether or not that conversation is
+  still the one open when it finishes (`sentForConversationId` in
+  `static/js/app.js`'s submit handler, fixing a real bug where the reply
+  used to unconditionally splice into whatever chat happened to be open at
+  the moment it arrived). Sending a message in a second chat while the
+  first is still working is safe but NOT simultaneous generation — see
+  "Concurrency: one model, many chats" below.
 - **Session persistence** — the current conversation id is stored in the
   browser's `localStorage`; on page reload, history is restored from
   `GET /api/conversations/{id}/messages`.
@@ -1735,6 +1788,82 @@ visual test with the full active-point set (which also includes the
 lunar node, Chiron, Lilith, and Part of Fortune) produced an unreadable
 web of ~100 possible pairs; those extra points are still placed on the
 ring as glyphs, just without aspect lines of their own.
+
+**Per-technique aspect set/orb.** Wheel-chart drawing (`utils/chart_draw.py`,
+used by both chat and PDF export, which just reuses the same stored SVG
+bytes) now uses four separate orb profiles instead of one flat table for
+everything — real astrology software conventionally uses different orbs
+depending on what's being compared, and this app previously didn't.
+
+- *Classical* (horary/electional, `draw_wheel_svg`'s `classical_aspects=True`,
+  set from `tool_name` in `routes/chat.py._attach_chart_if_applicable`):
+  only the six classical aspect types (conjunction/sextile/square/trine/
+  quincunx/opposition — not the five extra minors), with an orb that
+  depends on which bodies are involved — 8-10° when either party is the
+  Sun or Moon, 6-7° between other planets, a flat 5° for quincunx — per
+  `horary_methodology.txt` section 4 (`electional_methodology.txt` reuses
+  the same rule explicitly). This was the first fix made here and remains
+  untouched by the three profiles below (deliberately — the two
+  methodology docs are the ground truth for this pair, not any of the
+  screenshots that shaped the other three).
+- *Natal* (`astro.natal_orb_limit`): a chart's own INTERNAL aspects —
+  applies no matter which technique produced that chart (a real natal
+  chart, a progressed or return chart read on its own, ...). Orb is a
+  genuine per-body table (the classical "moiety" convention): each body
+  has its own allowance per aspect type, and the real orb between two
+  specific bodies is the average of their two allowances (e.g. Sun's
+  conjunction orb 12° + Moon's 10° → 11° for a Sun-Moon conjunction).
+- *Transit-family* (`astro.transit_orb_limit`): cross-chart aspects
+  between one real chart and a technique-derived moment — transit,
+  progression, lunar return, solar return (direction never reaches this
+  at all: its "second" is a list of synthetic overlay points, not a real
+  subject, so cross-chart aspects are never computed for it in the first
+  place). Same per-body-average rule as natal, just far tighter overall
+  and only differentiating Sun/Moon from everything else on the four
+  tightest minor-aspect rows.
+- *Synastry* (`astro.synastry_orb_limit`): cross-chart aspects for
+  `astro_synastry_chart` specifically — two real people conventionally
+  get a different, wider orb than a single derived moment. Flat per-aspect
+  orb, no per-body variation (the reference table had none). Semi-sextile
+  and quincunx have no dedicated row at all and fall back to the generic
+  `astro._ALL_ASPECTS` default, matching the reference software's own gap.
+
+All four numeric tables (`astro._NATAL_ORB_BY_BODY`/`_TRANSIT_ORB_BY_BODY`/
+`_SYNASTRY_ORB_BY_BODY`, plus the pre-existing `_CLASSICAL_ASPECTS_WIDE`)
+were transcribed from the user's own reference astrology software's
+per-technique aspect/orb configuration screens, deliberately excluding
+aspect families (septile/novile/decile) this app never computed before
+and has no methodology text prescribing.
+
+This used to be a real, reported bug: every chart was always drawn with
+one flat general table regardless of technique, so e.g. a horary wheel
+could show an aspect line (a quintile) that doesn't exist under horary's
+own doctrine at all, and a synastry chart used the same tight orb as a
+transit overlay despite the two techniques conventionally using very
+different widths. Investigating the horary/electional half of this also
+surfaced that `utils/horary.py`'s own verdict computation had the
+identical gap — worse, a previous fix attempt (a local `_HORARY_ASPECTS`
+list, correctly reasoned) was written but never actually passed to
+kerykeion, so it did nothing — and `utils/electional.py`'s own
+`_ELECTIONAL_ASPECTS` correctly restricted the aspect *types* but never
+added the luminary-aware orb either; both are now fixed and share the
+classical implementation with the wheel.
+
+kerykeion's own `active_aspects` parameter can only express one orb per
+aspect *name*, not per pair of bodies (and its own pydantic validation
+requires that orb to be a whole-degree int) — so every non-classical
+chart is computed against `astro._PER_TECHNIQUE_ASPECTS_WIDE`, a table
+widened (and rounded up) to whatever the widest natal/transit/synastry
+allowance for that aspect could ever be, then filtered back down in
+Python to the real, narrower, per-pair cutoff via
+`astro.natal_orb_limit`/`transit_orb_limit`/`synastry_orb_limit` before
+anything is drawn — the same "wide table, then post-filter" pattern the
+classical profile already used. `chart_draw.draw_wheel_svg` takes a new
+`dual_orb_profile` parameter ("transit" by default, "synastry" for
+`astro_synastry_chart`) to pick which of the two cross-chart functions
+applies; the inner chart's own aspects always use the natal profile
+regardless of that flag, since a chart's own internal aspects don't
+change meaning just because it's being compared to something else.
 
 **Header block.** Each chart's top-left text block now includes the
 technique label, the subject's name (when a real one was given, not the

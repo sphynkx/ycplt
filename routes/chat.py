@@ -874,6 +874,23 @@ async def _attach_chart_if_applicable(
     else:
         title_lines = _chart_title_lines(tool_name, chart_subject, spec_text, second_subject=chart_second)
     second_label = _CHART_SECOND_LABEL.get(tool_name) if chart_second is not None else None
+    # horary_methodology.txt section 4 (electional_methodology.txt reuses
+    # the same rule) specifies a genuinely different aspect set/orb scheme
+    # from every other technique here — see astro._CLASSICAL_ASPECT_NAMES'
+    # own comment and chart_draw.draw_wheel_svg's classical_aspects
+    # docstring for the full story. Every other tool_name keeps drawing
+    # with the general aspect table, unchanged.
+    classical_aspects = tool_name in ("astro_horary_question", "astro_electional_chart")
+    # Cross-chart orb profile for the non-classical case (see
+    # chart_draw.draw_wheel_svg's own dual_orb_profile docstring):
+    # synastry gets its own flat-per-aspect table (two real people), every
+    # other dual technique with a real second subject (transit,
+    # progression, lunar/solar return) shares the "transit" profile —
+    # direction needs no entry here at all, since its chart_second is a
+    # list of overlay points, not a real subject, so chart_draw.py's own
+    # is_real_second_subject check already skips cross-chart aspects for
+    # it regardless of what's passed here.
+    dual_orb_profile = "synastry" if tool_name == "astro_synastry_chart" else "transit"
     try:
         svg_bytes = await loop.run_in_executor(
             None,
@@ -883,6 +900,8 @@ async def _attach_chart_if_applicable(
                 title_lines=title_lines,
                 highlight_house=chart_highlight_house,
                 second_label=second_label,
+                classical_aspects=classical_aspects,
+                dual_orb_profile=dual_orb_profile,
             ),
         )
     except Exception as e:

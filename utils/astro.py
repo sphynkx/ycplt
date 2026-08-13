@@ -87,6 +87,7 @@ morphological analyzer), and a name shared by multiple places worldwide
 larger population. Good enough for the common case, not a substitute for
 a real geocoding service.
 """
+import math
 import re
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -390,6 +391,245 @@ _MINOR_ASPECTS = [
 # type, per the methodology's "точность важнее типа" rule, so a very tight
 # minor aspect can legitimately outrank a loose major one.
 _ALL_ASPECTS = _MAJOR_ASPECTS + _MINOR_ASPECTS
+
+# ---------- Classical (horary/electional) aspect set + luminary-aware orb ----------
+# horary_methodology.txt section 4 (electional_methodology.txt explicitly
+# reuses this same rule — "в тех же орбисах... что и в хорарной технике")
+# specifies a DIFFERENT orb scheme from _ALL_ASPECTS above, on two counts:
+# (1) only six classical aspects count at all — conjunction, sextile,
+# square, trine, quincunx, opposition — none of _MINOR_ASPECTS' other five
+# (semi-sextile/semi-square/quintile/sesquiquadrate/biquintile) are part of
+# classical horary/electional doctrine; (2) the orb itself depends on which
+# BODIES are involved, not just the aspect type: 8-10° when either party is
+# the Sun or Moon, 6-7° between any other two planets, a flat 5° for
+# quincunx regardless of which bodies are involved. kerykeion's own
+# active_aspects table can only express one orb per aspect NAME (not
+# per-pair), so this can't be done with a single AspectsFactory call the
+# way _ALL_ASPECTS is used everywhere else — see _CLASSICAL_ASPECTS_WIDE
+# and filter_classical_aspects below for how callers actually apply this.
+#
+# This was previously specified in the methodology doc but never actually
+# implemented anywhere in code: utils/horary.py used to define its own
+# (correctly reasoned, but never wired up) _HORARY_ASPECTS restricting the
+# aspect set, then called AspectsFactory with astro._ALL_ASPECTS anyway —
+# dead code, not a real fix. utils/electional.py's own _ELECTIONAL_ASPECTS
+# DID correctly restrict the aspect set, but used _MAJOR_ASPECTS'/
+# _MINOR_ASPECTS' flat per-type orbs (8/8/7/7/5/3) rather than this
+# luminary-aware rule. utils/chart_draw.py's wheel renderer never
+# distinguished technique at all, always using _ALL_ASPECTS regardless —
+# so a horary or electional chart could draw non-classical minor-aspect
+# lines (e.g. a quintile) that shouldn't exist under this doctrine at all,
+# with a generic orb determining which of the classical aspects appeared.
+_CLASSICAL_ASPECT_NAMES = {
+    "conjunction", "opposition", "trine", "square", "sextile", "quincunx",
+}
+_LUMINARY_KERYKEION_NAMES = {"Sun", "Moon"}
+# Fed to AspectsFactory's active_aspects — deliberately the WIDEST orb
+# either branch of the luminary-aware rule could ever allow (10° for the
+# five non-quincunx classical aspects, 5° for quincunx, which is already
+# its final value with no further widening), so kerykeion's own orb
+# filtering can never exclude an aspect before filter_classical_aspects
+# below gets a chance to apply the real, narrower, per-pair cutoff.
+_CLASSICAL_ASPECTS_WIDE = [
+    {"name": name, "orb": 10} for name in ("conjunction", "opposition", "trine", "square", "sextile")
+] + [{"name": "quincunx", "orb": 5}]
+
+
+def _classical_orb_limit(aspect_name: str, p1_name: str, p2_name: str) -> float:
+    """The real per-pair cutoff described above — quincunx is a flat 5°
+    regardless of participants; every other classical aspect gets 10° if
+    either party is the Sun or Moon, else 7°. These are the upper bound of
+    each range the methodology gives ("8-10°" / "6-7°") — a single flat
+    number per case, consistent with how the rest of this app already
+    collapses an orb allowance to one cutoff per aspect rather than
+    modeling full per-planet moieties."""
+    if aspect_name == "quincunx":
+        return 5.0
+    if p1_name in _LUMINARY_KERYKEION_NAMES or p2_name in _LUMINARY_KERYKEION_NAMES:
+        return 10.0
+    return 7.0
+
+
+def filter_classical_aspects(raw_aspects: List[Any]) -> List[Any]:
+    """Post-filters a kerykeion aspects list (computed with
+    _CLASSICAL_ASPECTS_WIDE as active_aspects, so nothing valid was
+    excluded too early) down to real classical horary/electional doctrine:
+    only the six aspect names in _CLASSICAL_ASPECT_NAMES, and only within
+    that pair's real orb per _classical_orb_limit above. Every caller that
+    wants classical (not general _ALL_ASPECTS) aspects — utils/horary.py,
+    utils/electional.py, and utils/chart_draw.py's wheel renderer when
+    drawing a horary/electional chart — should call AspectsFactory with
+    _CLASSICAL_ASPECTS_WIDE and then pass its .aspects list through this
+    function before using it for anything (scoring, verdict text, or
+    drawing)."""
+    return [
+        a for a in raw_aspects
+        if a.aspect in _CLASSICAL_ASPECT_NAMES
+        and a.orbit <= _classical_orb_limit(a.aspect, a.p1_name, a.p2_name)
+    ]
+
+
+# ---------- Per-technique orb: natal / transit-family / synastry ----------
+# A real, reported gap in the wheel-chart renderer (utils/chart_draw.py):
+# every chart used the one flat, technique-agnostic _ALL_ASPECTS orb
+# regardless of which technique it was for, even though real astrology
+# software conventionally uses DIFFERENT orbs for a single natal chart's
+# own internal aspects vs. a synastry comparison between two people vs. a
+# transit/progression/direction/return "one real chart + one derived
+# moment" comparison. Extracted from the user's own reference astrology
+# software (screenshots of its per-technique aspect/orb configuration
+# pages) — three tables below, deliberately NOT covering horary/
+# electional (see _CLASSICAL_ASPECTS_WIDE's own comment for why those stay
+# on their own, methodology-text-grounded scheme instead), and
+# deliberately NOT extending to aspect types beyond what this app already
+# computes (the reference software's pages also showed septile/novile/
+# decile-family angles at unusual non-round degree values — 51.43°,
+# 40°, 36°, 102.86°, 154.29° — which aren't part of any methodology
+# document here and were left out rather than guessed at).
+#
+# Natal's own page gave a genuinely different orb PER BODY (not just per
+# aspect type) — the classical "moiety" convention: each body has its own
+# orb allowance, and the real orb between two specific bodies is the
+# average of their two individual allowances (see _moiety_orb_limit
+# below). Transit's and synastry's own pages, by contrast, showed one
+# flat orb per aspect type regardless of which two bodies were involved
+# (transit differentiates Sun/Moon from everything else on the tightest
+# half-aspects only; synastry doesn't differentiate by body at all) — so
+# for those two, "_default" is effectively the only entry most rows need,
+# and averaging two identical numbers is a no-op, which is why one shared
+# _moiety_orb_limit implementation below covers all three tables
+# correctly regardless of whether a given table actually varies by body.
+#
+# Any aspect/body combination with no explicit entry below falls back to
+# _ALL_ASPECTS' existing flat per-aspect-type orb — e.g. synastry's own
+# page had no row at all for semi-sextile or quincunx, meaning neither
+# aspect is treated specially there; they keep behaving exactly as they
+# did before any of this existed.
+_NATAL_ORB_BY_BODY: Dict[str, Dict[str, float]] = {
+    "conjunction": {"Sun": 12.0, "Moon": 10.0, "Jupiter": 8.0, "True_North_Lunar_Node": 0.1, "_default": 5.0},
+    "opposition": {"Sun": 12.0, "Moon": 10.0, "Jupiter": 8.0, "True_North_Lunar_Node": 0.1, "_default": 5.0},
+    "trine": {"Sun": 12.0, "Moon": 8.0, "True_North_Lunar_Node": 0.1, "_default": 5.0},
+    "square": {"Sun": 10.0, "Moon": 8.0, "Jupiter": 7.0, "True_North_Lunar_Node": 0.1, "_default": 5.0},
+    "sextile": {"Sun": 6.5, "Moon": 6.0, "_default": 5.0},
+    "semi-sextile": {"Sun": 1.5, "Moon": 1.0, "_default": 1.0},
+    "semi-square": {"_default": 1.0},
+    "quintile": {"Sun": 1.5, "Moon": 1.5, "_default": 1.0},
+    "sesquiquadrate": {"_default": 1.0},
+    "biquintile": {"_default": 1.0},
+    "quincunx": {"_default": 1.0},
+}
+_TRANSIT_ORB_BY_BODY: Dict[str, Dict[str, float]] = {
+    "conjunction": {"_default": 1.0},
+    "opposition": {"_default": 1.0},
+    "trine": {"_default": 1.0},
+    "square": {"_default": 1.0},
+    "sextile": {"_default": 1.0},
+    "semi-sextile": {"Sun": 1.0, "Moon": 1.0, "_default": 0.5},
+    "semi-square": {"Sun": 1.0, "Moon": 1.0, "_default": 0.5},
+    "quintile": {"_default": 1.0},
+    "sesquiquadrate": {"Sun": 1.0, "Moon": 1.0, "_default": 0.5},
+    "biquintile": {"Sun": 1.0, "Moon": 1.0, "_default": 0.5},
+    "quincunx": {"_default": 1.0},
+}
+_SYNASTRY_ORB_BY_BODY: Dict[str, Dict[str, float]] = {
+    "conjunction": {"_default": 7.35},
+    "opposition": {"_default": 3.67},
+    "trine": {"_default": 2.43},
+    "square": {"_default": 1.8},
+    "sextile": {"_default": 1.17},
+    "semi-square": {"_default": 0.87},
+    "quintile": {"_default": 1.37},
+    "sesquiquadrate": {"_default": 0.53},
+    "biquintile": {"_default": 1.15},
+    # semi-sextile, quincunx: no row in the reference software's synastry
+    # page at all — falls through to _ALL_ASPECTS' generic orb.
+}
+
+
+def _generic_orb_limit(aspect_name: str) -> float:
+    """The flat per-aspect-type orb from _ALL_ASPECTS — the fallback used
+    wherever a per-technique table above has no entry for this aspect."""
+    return next((a["orb"] for a in _ALL_ASPECTS if a["name"] == aspect_name), 8.0)
+
+
+def _orb_by_body(table: Dict[str, Dict[str, float]], aspect_name: str, body: str) -> Optional[float]:
+    per_aspect = table.get(aspect_name)
+    if per_aspect is None:
+        return None
+    return per_aspect.get(body, per_aspect.get("_default"))
+
+
+def _moiety_orb_limit(table: Dict[str, Dict[str, float]], aspect_name: str, p1_name: str, p2_name: str) -> float:
+    """orb(A,B) = average of each body's own per-aspect orb from `table`
+    — the classical moiety convention, each body contributing its own
+    half of the final orb. Falls back to _generic_orb_limit if `table`
+    has no entry at all for this aspect, or (defensively) if a body
+    somehow resolves to no value even via "_default"."""
+    o1 = _orb_by_body(table, aspect_name, p1_name)
+    o2 = _orb_by_body(table, aspect_name, p2_name)
+    if o1 is None or o2 is None:
+        return _generic_orb_limit(aspect_name)
+    return (o1 + o2) / 2.0
+
+
+def natal_orb_limit(aspect_name: str, p1_name: str, p2_name: str) -> float:
+    """Orb for a chart's own INTERNAL aspects — applies universally to any
+    single chart read on its own, whichever technique produced it (a real
+    natal chart, a progressed chart considered alone, a return chart
+    alone, ...), not just utils/astro.py's own run_natal."""
+    return _moiety_orb_limit(_NATAL_ORB_BY_BODY, aspect_name, p1_name, p2_name)
+
+
+def transit_orb_limit(aspect_name: str, p1_name: str, p2_name: str) -> float:
+    """Orb for CROSS-chart aspects between one real chart and a technique-
+    derived moment — transit, progression, direction, lunar/solar return.
+    NOT for synastry (see synastry_orb_limit below) — two real people
+    conventionally get a different, wider orb than a single moment
+    overlaid on a natal chart."""
+    return _moiety_orb_limit(_TRANSIT_ORB_BY_BODY, aspect_name, p1_name, p2_name)
+
+
+def synastry_orb_limit(aspect_name: str, p1_name: str, p2_name: str) -> float:
+    """Orb for CROSS-chart aspects between two real people's charts."""
+    return _moiety_orb_limit(_SYNASTRY_ORB_BY_BODY, aspect_name, p1_name, p2_name)
+
+
+# Per _ALL_ASPECTS' own entries, widened wherever any per-technique table
+# above allows a wider orb than the generic default (only natal's
+# conjunction/opposition/trine/square/sextile ever do, since its
+# Sun/Moon/Jupiter entries exceed the generic 8/8/7/7/5) — fed to
+# AspectsFactory's active_aspects for every non-classical chart so
+# kerykeion's own orb filtering can never exclude an aspect before
+# natal_orb_limit/transit_orb_limit/synastry_orb_limit above get a chance
+# to apply the real, technique-specific cutoff. Computed once at import
+# time from the tables above, not hand-maintained separately — stays
+# correct automatically if those tables ever change.
+_PER_TECHNIQUE_TABLES = (_NATAL_ORB_BY_BODY, _TRANSIT_ORB_BY_BODY, _SYNASTRY_ORB_BY_BODY)
+_PER_TECHNIQUE_ASPECTS_WIDE = [
+    {
+        "name": spec["name"],
+        # kerykeion's own AspectsFactory validates active_aspects' "orb"
+        # as an int (a pydantic model field) — this table only needs to
+        # be wide enough that kerykeion never excludes an aspect before
+        # the real per-pair natal_orb_limit/transit_orb_limit/
+        # synastry_orb_limit gets a chance to apply the true cutoff
+        # afterward, so rounding UP to the next whole degree is exactly
+        # as safe as the real fractional value and keeps pydantic happy.
+        "orb": math.ceil(
+            max(
+                [spec["orb"]]
+                + [
+                    max(table[spec["name"]].values())
+                    for table in _PER_TECHNIQUE_TABLES
+                    if spec["name"] in table
+                ]
+            )
+        ),
+    }
+    for spec in _ALL_ASPECTS
+]
+
+
 # Fixed stars barely move, so what matters is a personal point sitting
 # right on top of one — kept tight and separate from _ALL_ASPECTS' orbs.
 _STAR_CONJUNCTION_ORB = 1.5

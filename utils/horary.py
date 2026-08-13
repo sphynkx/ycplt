@@ -757,24 +757,29 @@ def _third_point_aspects(aspects, target_kery_name: str) -> Dict[str, Tuple[str,
 _FAVORABLE_ASPECTS = {"trine", "sextile", "conjunction"}
 _HARD_ASPECTS = {"square", "opposition", "quincunx"}
 
-# Classical horary aspect set ONLY — deliberately narrower than astro._ALL_ASPECTS
-# (which also includes semi-sextile/semi-square/quintile/sesquiquadrate/
-# biquintile, correct for natal/transit/synastry reading elsewhere in this
-# app, but not part of classical horary doctrine at all — see
-# horary_methodology.txt section 4, which lists exactly these six and no
-# others). Found via real testing: a "квинтиль" (72°) between the two
-# significators was picked as the chart's *direct_aspect* below, and because
-# quintile is in neither _FAVORABLE_ASPECTS nor _HARD_ASPECTS above, the
-# verdict cascade could only ever read it as a negative outcome — a minor,
-# non-classical modern aspect was silently overriding whatever real Ptolemaic
-# aspect (or lack of one) the significators actually had. Restricting the
-# AspectsFactory call itself to this list (rather than filtering afterward)
-# is both the correct methodological scope and prevents this class of bug
-# outright, including for the third-point translation/collection-of-light
-# search below, which reuses the same `aspects` list.
-_HORARY_ASPECTS = [a for a in astro._MAJOR_ASPECTS] + [
-    a for a in astro._MINOR_ASPECTS if a["name"] == "quincunx"
-]
+# Classical horary aspect set + orb — see astro._CLASSICAL_ASPECT_NAMES/
+# _CLASSICAL_ASPECTS_WIDE/filter_classical_aspects for the shared
+# implementation (also used by utils/electional.py and, for chart
+# rendering, utils/chart_draw.py). Deliberately narrower AND differently-
+# orbed than astro._ALL_ASPECTS used everywhere else in this app — see
+# horary_methodology.txt section 4: only six aspect types count at all
+# (not _MINOR_ASPECTS' other five — semi-sextile/semi-square/quintile/
+# sesquiquadrate/biquintile — which are correct for natal/transit/synastry
+# reading but not part of classical horary doctrine), and the orb depends
+# on which bodies are involved (8-10° for Sun/Moon, 6-7° for other
+# planets, flat 5° for quincunx), not just the aspect type.
+#
+# This used to be a local _HORARY_ASPECTS list here, defined with the
+# aspect-type restriction correctly reasoned out (found via real testing:
+# a "квинтиль" (72°) between the two significators was picked as the
+# chart's *direct_aspect* below, and because quintile is in neither
+# _FAVORABLE_ASPECTS nor _HARD_ASPECTS above, the verdict cascade could
+# only ever read it as a negative outcome — a minor, non-classical modern
+# aspect was silently overriding whatever real Ptolemaic aspect the
+# significators actually had) — but never actually passed to
+# AspectsFactory below, which kept using astro._ALL_ASPECTS regardless.
+# That was dead code, not a real fix; also never had the luminary-aware
+# orb at all. Both are fixed now via the shared astro.py helpers.
 
 
 def _compute_horary_chart(spec: str) -> Dict[str, Any]:
@@ -864,8 +869,9 @@ def _compute_horary_chart(spec: str) -> Dict[str, Any]:
     from kerykeion import AspectsFactory
 
     aspects = AspectsFactory.natal_aspects(
-        subject, active_points=astro._ASPECT_ACTIVE_POINTS, active_aspects=astro._ALL_ASPECTS,
+        subject, active_points=astro._ASPECT_ACTIVE_POINTS, active_aspects=astro._CLASSICAL_ASPECTS_WIDE,
     ).aspects
+    aspects = astro.filter_classical_aspects(aspects)
 
     # Secondary radicality factor that needs aspects to be known: an applying
     # hard aspect from Saturn to a planet actually sitting in house VII.

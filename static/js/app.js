@@ -632,9 +632,20 @@
 
     // Captured before clearAttachedImage()/setHelpMode(false) reset the
     // composer, so the request still reflects what the user actually
-    // armed/attached for THIS message.
+    // armed/attached for THIS message. sentForConversationId is captured
+    // for the same reason but a different purpose: a request can take
+    // minutes (a full RAG-interpreted astro answer), and the backend
+    // keeps computing it regardless of what's on screen by the time it
+    // finishes — nothing cancels it just because the user switched to
+    // another chat. Without this, the response handler below used to
+    // unconditionally overwrite currentConversationId and splice the
+    // reply into whatever's currently displayed, which could inject one
+    // conversation's answer into a completely different, currently-open
+    // one. Comparing against this captured id at response time is what
+    // fixes that — see below.
     const imageToSend = pendingImage;
     const forceHelp = helpModeArmed;
+    const sentForConversationId = currentConversationId;
 
     errorBox.textContent = '';
     textarea.value = '';
@@ -677,33 +688,60 @@
       const data = await resp.json();
       pending.remove();
 
+      // True only if the user is still looking at the same chat this
+      // request was sent from (or, for a brand-new chat, hasn't since
+      // switched to some OTHER existing conversation) — see
+      // sentForConversationId's own comment above for why this matters.
+      // A brand-new chat has no id to compare until the server assigns
+      // one, so that case is judged by "still on the new-chat screen"
+      // instead.
+      const stillOnSameChat = sentForConversationId === null
+        ? currentConversationId === null
+        : currentConversationId === sentForConversationId;
+
       if (!resp.ok) {
-        errorBox.textContent = data.detail || 'Ошибка запроса';
+        if (stillOnSameChat) {
+          errorBox.textContent = data.detail || 'Ошибка запроса';
+        }
       } else {
-        currentConversationId = data.conversation_id;
-        localStorage.setItem('currentConversationId', currentConversationId);
-        addMessageFromRecord({
-          id: data.message_id,
-          role: 'assistant',
-          content: data.response,
-          created_at: data.responded_at,
-          thinking_ms: data.thinking_ms,
-          status: data.status,
-          files: data.files
-        });
+        // The reply is already persisted server-side under
+        // data.conversation_id regardless of what's on screen — refresh
+        // the sidebar unconditionally so it shows up there (new title/
+        // updated_at) even if the user has moved on to another chat.
         await loadConversations();
 
-        // An image request returns status "pending" immediately (the job
-        // runs on ycplt_img in the background). Start polling right away so
-        // the placeholder gets replaced with the image once it's ready,
-        // instead of waiting for the user to reload or switch chats.
-        if (data.status === 'pending') {
-          schedulePoll(currentConversationId);
+        if (stillOnSameChat) {
+          currentConversationId = data.conversation_id;
+          localStorage.setItem('currentConversationId', currentConversationId);
+          addMessageFromRecord({
+            id: data.message_id,
+            role: 'assistant',
+            content: data.response,
+            created_at: data.responded_at,
+            thinking_ms: data.thinking_ms,
+            status: data.status,
+            files: data.files
+          });
+
+          // An image request returns status "pending" immediately (the job
+          // runs on ycplt_img in the background). Start polling right away so
+          // the placeholder gets replaced with the image once it's ready,
+          // instead of waiting for the user to reload or switch chats.
+          if (data.status === 'pending') {
+            schedulePoll(currentConversationId);
+          }
         }
+        // else: the user switched to a different chat while this was in
+        // flight. Its answer stays safely in the database under its own
+        // conversation — opening that conversation (now or later) loads
+        // it from the server as normal; we just must not force-switch the
+        // UI back to it or splice its content into whatever's open now.
       }
     } catch (err) {
       pending.remove();
-      errorBox.textContent = 'Не удалось связаться с сервером: ' + err;
+      if (sentForConversationId === null ? currentConversationId === null : currentConversationId === sentForConversationId) {
+        errorBox.textContent = 'Не удалось связаться с сервером: ' + err;
+      }
     } finally {
       sendBtn.disabled = false;
       textarea.focus();

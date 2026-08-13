@@ -244,14 +244,21 @@ def _assess_strength(label: str, point, sign_code: str, house_num: int, sun, mar
     return verdict, strong + weak
 
 
-# --- classical aspect set — same restriction as horary.py, same reason
-# (quintile etc. are not part of classical doctrine here) ----------------
+# --- classical aspect set + orb — see astro._CLASSICAL_ASPECT_NAMES/
+# _CLASSICAL_ASPECTS_WIDE/filter_classical_aspects for the shared
+# implementation (also used by utils/horary.py, and by utils/chart_draw.py
+# for chart rendering) — electional_methodology.txt explicitly reuses
+# horary's own orb rule ("в тех же орбисах... что и в хорарной технике",
+# section 4 there: 8-10° for aspects involving Sun/Moon, 6-7° between
+# other planets, flat 5° for quincunx) rather than defining its own. This
+# used to be a local _ELECTIONAL_ASPECTS list restricting only the aspect
+# TYPE set (correctly, to the six classical types) but still using
+# _MAJOR_ASPECTS'/_MINOR_ASPECTS' flat per-type orbs (8/8/7/7/5/3) with no
+# luminary-aware differentiation at all — fixed by using the shared
+# astro.py helpers at both call sites below instead. ----------------------
 
 _FAVORABLE_ASPECTS = {"trine", "sextile", "conjunction"}
 _HARD_ASPECTS = {"square", "opposition", "quincunx"}
-_ELECTIONAL_ASPECTS = [a for a in astro._MAJOR_ASPECTS] + [
-    a for a in astro._MINOR_ASPECTS if a["name"] == "quincunx"
-]
 
 
 # --- activity category -> (house, sympathetic planets, planets to avoid at
@@ -621,8 +628,9 @@ def _querent_natal_transit_score(querent_natal_subject, moment_subject) -> Tuple
 
     aspects = AspectsFactory.dual_chart_aspects(
         querent_natal_subject, moment_subject,
-        active_points=astro._ASPECT_ACTIVE_POINTS, active_aspects=_ELECTIONAL_ASPECTS,
+        active_points=astro._ASPECT_ACTIVE_POINTS, active_aspects=astro._CLASSICAL_ASPECTS_WIDE,
     ).aspects
+    aspects = astro.filter_classical_aspects(aspects)
 
     score = 0
     notes: List[str] = []
@@ -1302,8 +1310,9 @@ def _compute_electional_chart_core(
     from kerykeion import AspectsFactory
 
     aspects = AspectsFactory.natal_aspects(
-        subject, active_points=astro._ASPECT_ACTIVE_POINTS, active_aspects=_ELECTIONAL_ASPECTS,
+        subject, active_points=astro._ASPECT_ACTIVE_POINTS, active_aspects=astro._CLASSICAL_ASPECTS_WIDE,
     ).aspects
+    aspects = astro.filter_classical_aspects(aspects)
 
     querent_sign, _ = astro._sign_from_abs_pos(cusps[0])
     quesited_sign, _ = astro._sign_from_abs_pos(cusps[quesited_house - 1])
