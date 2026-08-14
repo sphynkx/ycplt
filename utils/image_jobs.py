@@ -24,8 +24,21 @@ tracking is needed on this side for that:
 
 Either way, once resolved (done or error) the job is acknowledged (DELETE)
 so ycplt_img can drop it from its queue.
+
+Duration ("thinking_ms"): a real, reported gap — image-job messages never
+showed how long they took at all (unlike a normal chat reply's "думал
+X.X с"), and their displayed "sent" timestamp could visibly jump forward
+past when the user actually sent the request (routes/chat.py used to
+stamp created_at only after intent classification + job submission
+finished, not at the moment the message was received). Both are fixed
+together: routes/chat.py now stores the message's created_at as the true
+early sent_at, and this module computes thinking_ms as wall-clock time
+from that same created_at to job completion — full "how long since you
+hit send", the number a user actually wants for something that can take
+tens of minutes, not just the image model's own generation time.
 """
 import asyncio
+import time
 from typing import Optional
 
 from db import repository
@@ -63,6 +76,17 @@ async def _poll_once() -> None:
     for msg in pending:
         job_id = msg["image_job_id"]
         message_id = msg["id"]
+        # Still in seconds here (unlike repository.list_messages' own
+        # created_at, which converts to ms for the frontend) — this is the
+        # true moment the user's request was received (see routes/chat.py's
+        # _handle_image_request/_handle_image_edit_request/_handle_image_
+        # question, which now use chat()'s own early sent_at rather than a
+        # fresh, much-later timestamp). Used below to compute a
+        # thinking_ms-equivalent duration once the job resolves — full
+        # wall-clock time since the request was sent, matching what a user
+        # actually wants to know ("how long did this take"), not just the
+        # image model's own generation time.
+        created_at = msg["created_at"]
         try:
             status = await loop.run_in_executor(None, image_client.get_status, job_id)
         except image_client.ImageServiceError as e:
@@ -73,9 +97,9 @@ async def _poll_once() -> None:
         is_caption = status.get("mode") == "caption"
         if state == "done":
             if is_caption:
-                await _resolve_caption_done(message_id, job_id, status, loop)
+                await _resolve_caption_done(message_id, job_id, status, created_at, loop)
             else:
-                await _resolve_done(message_id, job_id, loop)
+                await _resolve_done(message_id, job_id, created_at, loop)
         elif state == "error":
             error_text = status.get("error_message") or "unknown error"
             label = "Ошибка распознавания изображения" if is_caption else "Ошибка генерации изображения"
@@ -84,21 +108,24 @@ async def _poll_once() -> None:
         # queued / processing: nothing to do yet, check again next tick
 
 
-async def _resolve_done(message_id: int, job_id: int, loop: asyncio.AbstractEventLoop) -> None:
+async def _resolve_done(
+    message_id: int, job_id: int, created_at: float, loop: asyncio.AbstractEventLoop
+) -> None:
     try:
         image_bytes = await loop.run_in_executor(None, image_client.get_result, job_id)
     except image_client.ImageServiceError as e:
         print(f"[image_jobs] failed to fetch result for job {job_id}: {e}")
         return
 
+    thinking_ms = int((time.time() - created_at) * 1000)
     filename = f"image_{job_id}.png"
     repository.add_file(message_id, filename, "image/png", image_bytes)
-    repository.complete_image_message(message_id, "Готово!")
+    repository.complete_image_message(message_id, "Готово!", thinking_ms)
     await loop.run_in_executor(None, image_client.delete_job, job_id)
 
 
 async def _resolve_caption_done(
-    message_id: int, job_id: int, status: dict, loop: asyncio.AbstractEventLoop
+    message_id: int, job_id: int, status: dict, created_at: float, loop: asyncio.AbstractEventLoop
 ) -> None:
     """mode="caption": the raw answer is already included in the status
     response as result_text (see ycplt_img's db.get_job_status) — no
@@ -135,5 +162,6 @@ async def _resolve_caption_done(
             print(f"[image_jobs] caption rephrase failed for job {job_id}: {e}")
             text = raw_caption
 
-    repository.complete_image_message(message_id, text)
+    thinking_ms = int((time.time() - created_at) * 1000)
+    repository.complete_image_message(message_id, text, thinking_ms)
     await loop.run_in_executor(None, image_client.delete_job, job_id)

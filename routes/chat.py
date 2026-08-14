@@ -320,11 +320,11 @@ async def chat(req: ChatRequest):
 
     if image_bytes is not None:
         if await intent.is_edit_instruction_async(req.query):
-            return await _handle_image_edit_request(conversation_id, req, image_bytes)
-        return await _handle_image_question(conversation_id, req, image_bytes)
+            return await _handle_image_edit_request(conversation_id, req, image_bytes, sent_at)
+        return await _handle_image_question(conversation_id, req, image_bytes, sent_at)
 
     if await intent.is_image_request_async(req.query):
-        return await _handle_image_request(conversation_id, req.query)
+        return await _handle_image_request(conversation_id, req.query, sent_at)
 
     prior_messages = _prior_messages(conversation_id, exclude_message_id=user_msg_id)
 
@@ -366,7 +366,7 @@ async def chat(req: ChatRequest):
 
 
 async def _handle_image_question(
-    conversation_id: int, req: ChatRequest, image_bytes: bytes
+    conversation_id: int, req: ChatRequest, image_bytes: bytes, sent_at: float
 ) -> dict:
     """Called when an image is attached but utils/intent.py's
     is_edit_instruction_async decided the accompanying text isn't an
@@ -381,7 +381,18 @@ async def _handle_image_question(
     _handle_image_request/_handle_image_edit_request; the background
     poller (utils/image_jobs.py) resolves it into the actual text answer
     once ready, or an error if the vision model isn't set up there.
-    """
+
+    sent_at: the ORIGINAL time chat()'s own sent_at was captured, before
+    any of the intent classification calls above it (is_edit_instruction_
+    async here) ran — used as this placeholder's created_at instead of a
+    fresh time.time() taken only now, after those calls already finished.
+    A real, reported bug: previously this used its own late timestamp, so
+    a message could visibly show a "sent" time strictly later than when
+    the user actually pressed send — sometimes by well over a minute, if
+    classification happened to be queued behind other model activity (see
+    utils/llm.py's _FifoLock) — even though the pending state shows no
+    clock at all in the meantime, so that late timestamp was the very
+    first (and, until this fix, only) one ever displayed."""
     loop = asyncio.get_running_loop()
     try:
         job_id = await loop.run_in_executor(
@@ -391,13 +402,12 @@ async def _handle_image_question(
     except image_client.ImageServiceError as e:
         raise HTTPException(status_code=502, detail=f"Сервис изображений недоступен: {e}")
 
-    placeholder_at = time.time()
     placeholder_text = "Распознаю изображение…"
     assistant_msg_id = repository.add_message(
         conversation_id,
         "assistant",
         placeholder_text,
-        placeholder_at,
+        sent_at,
         status="pending",
         image_job_id=job_id,
     )
@@ -406,9 +416,9 @@ async def _handle_image_question(
     return {
         "conversation_id": conversation_id,
         "query": req.query,
-        "sent_at": int(placeholder_at * 1000),
+        "sent_at": int(sent_at * 1000),
         "response": placeholder_text,
-        "responded_at": int(placeholder_at * 1000),
+        "responded_at": int(sent_at * 1000),
         "thinking_ms": None,
         "status": "pending",
         "message_id": assistant_msg_id,
@@ -1490,20 +1500,24 @@ async def _handle_tool_request(
     }
 
 
-async def _handle_image_request(conversation_id: int, query: str) -> dict:
+async def _handle_image_request(conversation_id: int, query: str, sent_at: float) -> dict:
+    """sent_at: see _handle_image_question's own docstring — the real
+    moment the user's message was received, captured before the
+    is_image_request_async classification call that runs ahead of this
+    function, used as this placeholder's created_at instead of a fresh
+    (and potentially much later) time.time()."""
     loop = asyncio.get_running_loop()
     try:
         job_id = await loop.run_in_executor(None, image_client.submit_job, query)
     except image_client.ImageServiceError as e:
         raise HTTPException(status_code=502, detail=f"Сервис изображений недоступен: {e}")
 
-    placeholder_at = time.time()
     placeholder_text = "Генерирую изображение… это может занять до нескольких десятков минут."
     assistant_msg_id = repository.add_message(
         conversation_id,
         "assistant",
         placeholder_text,
-        placeholder_at,
+        sent_at,
         status="pending",
         image_job_id=job_id,
     )
@@ -1512,9 +1526,9 @@ async def _handle_image_request(conversation_id: int, query: str) -> dict:
     return {
         "conversation_id": conversation_id,
         "query": query,
-        "sent_at": int(placeholder_at * 1000),
+        "sent_at": int(sent_at * 1000),
         "response": placeholder_text,
-        "responded_at": int(placeholder_at * 1000),
+        "responded_at": int(sent_at * 1000),
         "thinking_ms": None,
         "status": "pending",
         "message_id": assistant_msg_id,
@@ -1524,7 +1538,7 @@ async def _handle_image_request(conversation_id: int, query: str) -> dict:
 
 
 async def _handle_image_edit_request(
-    conversation_id: int, req: ChatRequest, image_bytes: bytes
+    conversation_id: int, req: ChatRequest, image_bytes: bytes, sent_at: float
 ) -> dict:
     """Submits an img2img job to ycplt_img using the attached image as the
     starting point.
@@ -1539,6 +1553,13 @@ async def _handle_image_edit_request(
     just that region instead (see its README "Removing a named object").
     Any other kind of edit (color, style, additions, ...) leaves
     remove_target unset and goes through plain img2img as before.
+
+    sent_at: see _handle_image_question's own docstring — captured before
+    is_edit_instruction_async AND get_removal_target_async below (two
+    classification calls, both real model generations), used as this
+    placeholder's created_at so the displayed "sent" time reflects when
+    the user actually sent the message, not when these calls happened to
+    finish.
     """
     loop = asyncio.get_running_loop()
     strength = req.strength if req.strength is not None else DEFAULT_EDIT_STRENGTH
@@ -1557,13 +1578,12 @@ async def _handle_image_edit_request(
     except image_client.ImageServiceError as e:
         raise HTTPException(status_code=502, detail=f"Сервис изображений недоступен: {e}")
 
-    placeholder_at = time.time()
     placeholder_text = "Редактирую изображение… это может занять до нескольких десятков минут."
     assistant_msg_id = repository.add_message(
         conversation_id,
         "assistant",
         placeholder_text,
-        placeholder_at,
+        sent_at,
         status="pending",
         image_job_id=job_id,
     )
@@ -1572,9 +1592,9 @@ async def _handle_image_edit_request(
     return {
         "conversation_id": conversation_id,
         "query": req.query,
-        "sent_at": int(placeholder_at * 1000),
+        "sent_at": int(sent_at * 1000),
         "response": placeholder_text,
-        "responded_at": int(placeholder_at * 1000),
+        "responded_at": int(sent_at * 1000),
         "thinking_ms": None,
         "status": "pending",
         "message_id": assistant_msg_id,

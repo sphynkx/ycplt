@@ -635,6 +635,26 @@ If classified as an image request:
    the message `status = "complete"`, and acknowledges the job (`DELETE`) so
    ycplt_img drops it from its queue. On a reported error, the message is
    marked `status = "error"` with the failure reason.
+
+   **Timestamp and duration, fixed.** The pending placeholder's stored
+   `created_at` is the moment `chat()` itself received the request (its own
+   early `sent_at`, from *before* any intent-classification calls run), not
+   a fresh timestamp taken only after those calls and the job submission had
+   already finished. This used to be a real, reported bug: since the
+   "pending" state shows no clock at all in the UI, the very first (and,
+   before this fix, only) timestamp a message ever displayed was that late
+   one — visibly *later* than when the user actually pressed send, by
+   however long classification took (worse under real model contention,
+   since those calls share the same `_FifoLock`-serialized queue as every
+   other generation — see "Concurrency: one model, many chats"). Once
+   resolved, `utils/image_jobs.py` now also computes a `thinking_ms`
+   equivalent — full wall-clock time from that same `created_at` to
+   completion — and passes it to `complete_image_message`, so an image
+   reply's meta line reads "Ответ HH:MM:SS · думал X.X с" exactly like a
+   normal chat reply, instead of never showing a duration at all (`thinking_ms`
+   previously stayed `NULL` for every image job, silently). No frontend
+   changes were needed for this — `static/js/app.js`'s existing rendering
+   already displays `thinking_ms` whenever it's non-null.
 4. In the browser, a message with `status = "pending"` is shown in a
    distinct (dimmed/italic) style, and the page polls
    `GET /api/conversations/{id}/messages` every few seconds while any message
