@@ -199,26 +199,48 @@ was noticed, nothing in this app prevented that either: two chats
 answered close together in time could have corrupted each other's output
 or crashed, not just been slow. `utils/llm.py`'s `generate_sync` (the one
 function every LLM call in this app funnels through, sync or async) now
-serializes every call on a module-level `threading.Lock` — a plain
-`threading.Lock`, not `asyncio.Lock`, since most callers reach it from a
-worker thread (`run_in_executor`), not from inside a coroutine, where an
-`asyncio.Lock` wouldn't even be usable. Verified directly: four
-simulated concurrent calls through a slowed-down fake model never
-overlapped and took the full serial time, not the parallel time.
+serializes every call through a module-level FIFO queue.
 
-**The honest limit.** This turns an unsafe race into a safe, correct,
-one-request-at-a-time queue for generation — it does NOT make two chats'
-answers generate *simultaneously*. That's a real hardware/architecture
-limit, not a bug: there is exactly one CPU-bound model instance, and
-genuinely simultaneous generation of two different answers would need a
-second one resident in memory (a real option — see "Hardware and why this
-stack" above for what that costs in RAM — just a much bigger change than
-this fix). In practice: send a message in a second chat while the first
-is still working, and it queues safely behind it rather than racing with
-it or being silently dropped — the reply lands in its own conversation's
-history once its turn comes, correctly, regardless of which chat happens
-to be open on screen by then (see "Parallel chats" above for the matching
-frontend fix).
+**Why a queue and not just a lock.** A single `/chat` request already
+makes several *sequential* calls into this module on its own — intent
+classification, tool routing, a tool's own field/round extraction,
+digest/fact-summarization, and finally the answer itself (anywhere from
+2 to 7 calls depending on the request, see `generate_sync`'s own
+docstring). A plain `threading.Lock` only guarantees that two calls never
+run at the same instant — it makes no promise about *order* among
+several waiting threads, so with two conversations genuinely in flight
+at once, one conversation's own back-to-back calls had no guarantee of
+finishing in a sane order relative to the other's, and there was no
+guarantee against one conversation being repeatedly outraced by another.
+`utils/llm.py`'s `_FifoLock` fixes this: every caller — a quick
+classifier call and a long final-answer generation alike — draws a
+ticket the instant it asks for the lock and is served strictly in that
+arrival order, regardless of which conversation it belongs to. It's a
+plain `threading.Lock`-based implementation under the hood (not
+`asyncio.Lock`), for the same reason as before: most callers reach it
+from a worker thread via `run_in_executor`, not from inside a coroutine,
+where `asyncio.Lock` isn't usable at all. Verified directly: eight
+threads with staggered start times, mixing the fake model's calls,
+completed in exactly their arrival order every time, with zero mutual-
+exclusion violations and the expected fully-serialized total time. When
+there's real contention, the app logs a line noting how many requests
+are already ahead in the queue — silent the rest of the time.
+
+**The honest limit.** This turns an unsafe, unordered race into a safe,
+strictly-ordered, one-request-at-a-time queue for generation — it does
+NOT make two chats' answers generate *simultaneously*. That's a real
+hardware/architecture limit, not a bug: there is exactly one CPU-bound
+model instance, and genuinely simultaneous generation of two different
+answers would need a second one resident in memory (a real option — see
+"Hardware and why this stack" above for what that costs in RAM — just a
+much bigger change than this fix). In practice: send a message in a
+second chat while the first is still working, and it queues safely and
+fairly behind it rather than racing with it or being silently dropped —
+the reply lands in its own conversation's history once its turn comes,
+correctly, regardless of which chat happens to be open on screen by then
+(see "Parallel chats" above for the matching frontend fix, which already
+guards against a reply ever being misapplied to whichever chat is open
+when it arrives).
 
 ## Installation & Setup
 

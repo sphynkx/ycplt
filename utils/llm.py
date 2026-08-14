@@ -15,16 +15,70 @@ from utils import config
 
 _llm: Optional[Llama] = None
 
-# Serializes every call into _llm — see generate_sync's own comment on why
-# this exists. A plain threading.Lock (not asyncio.Lock) on purpose: most
-# callers reach generate_sync from a worker thread (routes/chat.py and
-# nearly every utils/*.py caller dispatch their whole tool/handler function
-# via loop.run_in_executor(None, ...), not from inside a coroutine), where
-# an asyncio.Lock simply isn't usable — it only works from within the event
-# loop. A threading.Lock works correctly from both a plain sync call and
-# from generate_async's own run_in_executor-dispatched thread, covering
-# every call path with one lock in the one place they all funnel through.
-_llm_lock = threading.Lock()
+
+class _FifoLock:
+    """A mutex that grants access in strict first-come-first-served order —
+    unlike a plain threading.Lock, whose underlying OS mutex makes no
+    ordering promise among several blocked waiters (whichever thread the
+    OS/runtime happens to wake next gets it, which in practice is "roughly
+    fair" but not guaranteed, and isn't even the point: a plain Lock only
+    guarantees mutual exclusion, not ordering).
+
+    This matters here specifically because a single /chat request already
+    makes several SEQUENTIAL calls into this module of its own accord (see
+    generate_sync's own docstring: intent/tool-router classification, a
+    tool's own field/round classifiers, digest_facts_async, the final
+    answer) — every one of those previously raced independently for
+    _llm_lock. With two conversations' requests genuinely running at once
+    (see README's own "Concurrency: one model, many chats" section), a
+    plain Lock gave no guarantee that either conversation's OWN sequence of
+    calls would even complete in order relative to the other's, let alone
+    that one conversation wouldn't be starved indefinitely by a second one
+    that happens to keep winning the race. A ticket-based FIFO lock fixes
+    both: every caller — a quick classifier call and a long final-answer
+    generation alike — draws a ticket the instant it asks for the lock and
+    is served strictly in that arrival order, regardless of which
+    conversation it belongs to or how long any one call takes.
+
+    A plain threading.Lock (not asyncio.Lock) underneath the ticketing on
+    purpose, for the same reason the old comment here gave: most callers
+    reach generate_sync from a worker thread (nearly every utils/*.py
+    caller dispatches its whole tool/handler function via
+    loop.run_in_executor(None, ...), not from inside a coroutine, where an
+    asyncio.Lock isn't usable at all), and this needs to work identically
+    from a plain sync call and from generate_async's own
+    run_in_executor-dispatched thread."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._next_ticket = 0
+        self._now_serving = 0
+
+    def __enter__(self) -> "_FifoLock":
+        with self._cv:
+            my_ticket = self._next_ticket
+            self._next_ticket += 1
+            if my_ticket != self._now_serving:
+                # Only printed when there's real contention (someone else
+                # is already being served or already queued ahead) — a
+                # quiet no-op the rest of the time, so normal single-chat
+                # use generates no extra log noise.
+                print(f"[llm] request queued: {my_ticket - self._now_serving} ahead of it, waiting for a turn")
+            while my_ticket != self._now_serving:
+                self._cv.wait()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        with self._cv:
+            self._now_serving += 1
+            self._cv.notify_all()
+        return False
+
+
+# See _FifoLock's own docstring above for why this replaced a plain
+# threading.Lock — every generate_sync call (the one place every caller,
+# sync or async, funnels through) now goes through here.
+_llm_lock = _FifoLock()
 
 # Some GGUF models (e.g. Qwen3's "-Thinking-" variants) are trained to
 # always emit an internal chain-of-thought scratchpad wrapped in
@@ -106,12 +160,15 @@ def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: fl
     CPU-bound model instance without a second one resident in memory (a
     real option, just a much bigger RAM/ops cost, not something this fixes
     by itself) — what this lock actually buys is turning an unsafe race
-    into a safe, correct, one-at-a-time FIFO-ish queue: whichever request
-    gets here first finishes before the next one starts, instead of both
-    corrupting each other. Chart/data computation for a different
-    conversation is NOT affected — that work doesn't touch _llm at all and
-    genuinely can run in parallel; only the actual model call is
-    serialized here."""
+    into a safe, correct, strictly-ordered FIFO queue (see _FifoLock's own
+    docstring for why "strictly ordered" needed calling out separately
+    from just "safe"): whichever request asked for the lock first is
+    guaranteed to be served first, and finishes before the next one
+    starts, instead of both corrupting each other or racing in whatever
+    order the OS happened to wake them. Chart/data computation for a
+    different conversation is NOT affected — that work doesn't touch _llm
+    at all and genuinely can run in parallel; only the actual model call
+    is serialized (and now queued) here."""
     if _llm is None:
         raise RuntimeError("Model is not loaded")
     with _llm_lock:
