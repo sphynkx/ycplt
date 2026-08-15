@@ -178,6 +178,73 @@ async def get_removal_target_async(query: str) -> Optional[str]:
     return await loop.run_in_executor(None, get_removal_target, query)
 
 
+_RECONSTRUCTION_PROMPT = """You already know this message asks to remove
+"{target}" from an attached image. Now decide: does the message ALSO
+describe what should appear in the removed object's place — something
+more specific than just "empty background" or "nothing there" (e.g.
+"recreate the metal panel with holes that was behind it", "put a plain
+wall there instead", "fill it with grass matching the rest of the lawn")?
+
+If yes, reply with a short English phrase describing that content,
+written as a text-to-image prompt fragment (e.g. "a section of a
+perforated stainless steel panel with round holes, matching the
+surrounding metal texture"). Translate to English if the message wasn't
+in English.
+
+If the message only says to remove/delete "{target}" with no further
+description of what should replace it, reply with exactly: NONE
+
+Message: "{query}"
+Answer:"""
+
+
+def _parse_reconstruction_prompt(answer: str) -> Optional[str]:
+    normalized = answer.strip().strip(".\"'")
+    if not normalized or normalized.upper().startswith("NONE"):
+        return None
+    return normalized
+
+
+def get_reconstruction_prompt(query: str, target: str) -> Optional[str]:
+    """Only meaningful once get_removal_target has already identified this
+    as a "remove {target}" instruction — a second, narrow classification
+    pass deciding whether the SAME message also describes what should be
+    drawn in {target}'s place, as opposed to just wanting it gone.
+
+    This exists because plain removal (ycplt_img's LaMa path, no text
+    prompt at all — see that service's README "Removing a named object")
+    and a described reconstruction are genuinely different jobs needing
+    different tools: LaMa can only extend generic surrounding texture, it
+    has no way to paint a SPECIFIC, describable thing (a particular
+    pattern, material, or object) into the hole. When the user did
+    describe something specific, ycplt_img routes through its
+    StableDiffusion "inpaint" checkpoint instead (see its
+    srv/worker.py's _generate_removal_edit) with this text as the prompt
+    — the right tool once there's an actual description to work from.
+
+    Returns None (plain removal, the common/default case) on any error,
+    an ambiguous answer, or if the message simply doesn't describe
+    anything beyond "remove it" — never raises, so a failure here just
+    means the job falls back to LaMa instead of blocking the edit
+    entirely."""
+    if llm_utils.get_llm() is None:
+        return None
+    try:
+        answer = llm_utils.generate_sync(
+            _RECONSTRUCTION_PROMPT.format(target=target, query=query),
+            max_tokens=60,
+            temperature=0.0,
+        )
+    except Exception:
+        return None
+    return _parse_reconstruction_prompt(answer)
+
+
+async def get_reconstruction_prompt_async(query: str, target: str) -> Optional[str]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, get_reconstruction_prompt, query, target)
+
+
 # --- synastry two-person text segmentation (LLM fallback) ----------------
 #
 # Why this exists: utils/astro.py's synastry free-text extraction is

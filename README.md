@@ -699,7 +699,23 @@ request differently from a plain-text one:
    then automatically segments and inpaints just that region instead of
    running plain img2img — see its README "Removing a named object". Any
    other kind of edit leaves `remove_target` unset.
-5. From there, an edit job follows the identical pending →
+5. If (and only if) a `remove_target` was found, a second, narrower
+   classification runs: `utils/intent.get_reconstruction_prompt_async`
+   decides whether the SAME message also describes what should appear in
+   the removed object's place, not just "gone" (e.g. "убери кота с фото.
+   На месте кота воссоздай участок металлического барабана с
+   отверстиями" describes a specific replacement; plain "убери кота"
+   does not). This exists because ycplt_img's default removal path
+   (LaMa, prompt-free — see its README) can only extend generic
+   background into the hole; it has no way to paint something SPECIFIC
+   there. When a description is found (translated to an English
+   text-to-image prompt fragment), it's sent along as `reconstruct_prompt`,
+   which routes the job through ycplt_img's prompt-guided `INPAINT_MODEL`
+   checkpoint instead of LaMa for that one job — see ycplt_img's README
+   "Describing what should replace the removed object". A plain "remove
+   X" with no further description leaves `reconstruct_prompt` unset and
+   keeps using LaMa exactly as before, unaffected by this extra check.
+6. From there, an edit job follows the identical pending →
    background-poller → complete flow as image generation
    (`utils/image_jobs.py` doesn't distinguish generate jobs from edit jobs
    — it just polls a job id and resolves it), so no changes were needed
@@ -771,6 +787,20 @@ authoritative API reference (this is a quick summary from the client side):
  "init_image_b64": "<base64-encoded source image>"
  // strength/negative_prompt are ignored for this path — ycplt_img sets
  // its own for the auto-mask + inpaint step
+}
+
+// Removing a named object AND describing its replacement (also
+// mode="img2img" + remove_target, plus an optional reconstruct_prompt —
+// see utils/intent.get_reconstruction_prompt_async and ycplt_img's README
+// "Describing what should replace the removed object"):
+{"prompt": "убери кота с фото. На месте кота воссоздай участок металлического барабана с отверстиями",
+ "mode": "img2img", "remove_target": "cat",
+ "reconstruct_prompt": "a section of perforated stainless steel panel with round holes, matching the surrounding metal texture",
+ "width": 512, "height": 512, "steps": 20, "cfg_scale": 7.5,
+ "init_image_b64": "<base64-encoded source image>"
+ // reconstruct_prompt is only sent when get_reconstruction_prompt_async
+ // found a real description; omitted (falls back to LaMa) for a plain
+ // "remove X" with nothing further said about the replacement
 }
 
 // Understanding an uploaded image:

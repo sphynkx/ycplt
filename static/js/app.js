@@ -44,6 +44,22 @@
   const POLL_INTERVAL_MS = 5000;
   let pollTimer = null;
 
+  // Fingerprint of the last set of messages actually rendered by
+  // refreshConversation() — lets it skip a needless rebuild when nothing
+  // has changed since the previous poll tick (see refreshConversation
+  // below for why this matters: a plain "just re-render every tick"
+  // approach was a real, reported bug — it wiped and rebuilt the ENTIRE
+  // message list, including re-requesting every image attachment via a
+  // fresh <img> src, every POLL_INTERVAL_MS for as long as any job was
+  // pending, which could be many minutes for a slow generation. Nothing
+  // about an already-correctly-displayed message needs to change just
+  // because the timer fired again.
+  let lastRenderedSignature = null;
+
+  function messagesSignature(messages) {
+    return messages.map((m) => m.id + ':' + (m.status || 'complete')).join('|');
+  }
+
   // ---------- Форматирование ----------
   function fmtTime(ms) {
     return new Date(ms).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -521,9 +537,17 @@
     if (!resp.ok) return;
     const messages = await resp.json();
 
-    historyEl.innerHTML = '';
-    for (const m of messages) {
-      addMessageFromRecord(m);
+    // Skip the rebuild entirely if nothing has actually changed since the
+    // last render (see lastRenderedSignature's own comment above) — a job
+    // that's still pending after this many seconds means literally
+    // nothing new happened, so there's nothing to re-render.
+    const signature = messagesSignature(messages);
+    if (signature !== lastRenderedSignature) {
+      lastRenderedSignature = signature;
+      historyEl.innerHTML = '';
+      for (const m of messages) {
+        addMessageFromRecord(m);
+      }
     }
 
     if (messages.some((m) => m.status === 'pending')) {
@@ -535,6 +559,13 @@
     currentConversationId = id;
     localStorage.setItem('currentConversationId', id);
     stopPolling();
+    // A picked-but-not-yet-sent image is scoped to whatever conversation
+    // was open when it was picked — switching chats before sending it
+    // should not carry it along to a different conversation (a real,
+    // reported gap: neither this function nor newChat() used to reset it
+    // at all).
+    clearAttachedImage();
+    lastRenderedSignature = null; // force a real render for the new conversation
 
     const resp = await fetch(`/api/conversations/${id}/messages`);
     historyEl.innerHTML = '';
@@ -544,6 +575,7 @@
       for (const m of messages) {
         addMessageFromRecord(m);
       }
+      lastRenderedSignature = messagesSignature(messages);
     }
     await loadConversations();
 
@@ -558,6 +590,8 @@
     localStorage.removeItem('currentConversationId');
     historyEl.innerHTML = '';
     errorBox.textContent = '';
+    clearAttachedImage(); // see selectConversation's comment on the same call
+    lastRenderedSignature = null;
     loadConversations();
     textarea.focus();
   }

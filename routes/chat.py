@@ -33,6 +33,7 @@ Every /chat call:
 """
 import asyncio
 import base64
+import io
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -1554,26 +1555,70 @@ async def _handle_image_edit_request(
     Any other kind of edit (color, style, additions, ...) leaves
     remove_target unset and goes through plain img2img as before.
 
+    If a remove_target was found, a further check
+    (utils/intent.get_reconstruction_prompt_async) decides whether the
+    message ALSO describes what should appear in the removed object's
+    place (e.g. "remove the cat, recreate the perforated metal panel
+    behind it") — plain "remove X" and "remove X, then draw Y there" are
+    different enough tasks that ycplt_img handles them with different
+    tools entirely (LaMa vs a prompted diffusion inpaint — see its
+    srv/worker.py's _generate_removal_edit); this is what decides which
+    one a given message gets.
+
+    width/height are read from the actual uploaded image (real, reported
+    bug: this used to never be sent at all, silently defaulting to
+    image_client.submit_job's own 512x512 — harmless for a plain
+    whole-image img2img edit, since ycplt_img just resizes the source
+    internally, but NOT harmless once remove_target/reconstruct_prompt
+    routes a job through a masked edit there: the mask needs to line up
+    pixel-for-pixel with whatever resolution generation actually happens
+    at, and a mismatch there produced visibly corrupted output confined
+    to the masked region — see ycplt_img's srv/worker.py
+    _generate_removal_edit for the full story and its own defensive
+    rounding fix). Reading real dimensions here is the actual fix; falls
+    back to leaving width/height unset (submit_job's own defaults) if the
+    upload can't be decoded as an image for any reason — never blocks the
+    edit request over a diagnostic nicety.
+
     sent_at: see _handle_image_question's own docstring — captured before
-    is_edit_instruction_async AND get_removal_target_async below (two
-    classification calls, both real model generations), used as this
+    is_edit_instruction_async, get_removal_target_async, AND (when
+    applicable) get_reconstruction_prompt_async below (up to three
+    classification calls, all real model generations), used as this
     placeholder's created_at so the displayed "sent" time reflects when
     the user actually sent the message, not when these calls happened to
     finish.
     """
     loop = asyncio.get_running_loop()
     strength = req.strength if req.strength is not None else DEFAULT_EDIT_STRENGTH
+
+    image_width = image_height = None
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            image_width, image_height = im.size
+    except Exception:
+        pass
+
     remove_target = await intent.get_removal_target_async(req.query)
+    reconstruct_prompt = None
+    if remove_target:
+        reconstruct_prompt = await intent.get_reconstruction_prompt_async(req.query, remove_target)
+    submit_kwargs = dict(
+        mode="img2img",
+        strength=strength,
+        init_image=image_bytes,
+        remove_target=remove_target,
+        reconstruct_prompt=reconstruct_prompt,
+    )
+    if image_width is not None and image_height is not None:
+        submit_kwargs["width"] = image_width
+        submit_kwargs["height"] = image_height
+
     try:
         job_id = await loop.run_in_executor(
             None,
-            lambda: image_client.submit_job(
-                req.query,
-                mode="img2img",
-                strength=strength,
-                init_image=image_bytes,
-                remove_target=remove_target,
-            ),
+            lambda: image_client.submit_job(req.query, **submit_kwargs),
         )
     except image_client.ImageServiceError as e:
         raise HTTPException(status_code=502, detail=f"Сервис изображений недоступен: {e}")

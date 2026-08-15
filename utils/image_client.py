@@ -57,15 +57,25 @@ def submit_job(
     init_image: Optional[bytes] = None,
     mask_image: Optional[bytes] = None,
     remove_target: Optional[str] = None,
+    reconstruct_prompt: Optional[str] = None,
 ) -> int:
     """Queues a job on ycplt_img, returns job_id. Does not wait for the result.
 
     remove_target (mode="img2img" only): the English name of an object to
     remove, from utils/intent.get_removal_target_async — when set,
     ycplt_img automatically segments that object and inpaints just that
-    region with its inpainting-tuned checkpoint instead of running plain
-    img2img, which has no way to execute a removal instruction on its own
-    (see ycplt_img's README "Removing a named object")."""
+    region instead of running plain img2img, which has no way to execute
+    a removal instruction on its own (see ycplt_img's README "Removing a
+    named object").
+
+    reconstruct_prompt (remove_target jobs only): from
+    utils/intent.get_reconstruction_prompt_async — set only when the
+    user's instruction also described what should appear in the removed
+    object's place, rather than just wanting it gone. When set, ycplt_img
+    paints that description into the masked region with its
+    prompt-guided inpainting checkpoint instead of its default prompt-free
+    removal model (LaMa) — see ycplt_img's srv/worker.py
+    _generate_removal_edit for why these are handled differently."""
     body: Dict[str, Any] = {
         "prompt": prompt,
         "mode": mode,
@@ -86,6 +96,8 @@ def submit_job(
         body["mask_image_b64"] = base64.b64encode(mask_image).decode("ascii")
     if remove_target:
         body["remove_target"] = remove_target
+    if reconstruct_prompt:
+        body["reconstruct_prompt"] = reconstruct_prompt
 
     result = _request("POST", "/jobs", body)
     return result["job_id"]
