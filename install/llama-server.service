@@ -28,11 +28,42 @@ WorkingDirectory=/var/www/ycplt/llama-server
 # machine (see README's "Tuning CPU inference threads"), the same
 # discipline used for N_THREADS_BATCH itself, rather than assuming this
 # fixes it outright.
+# --reasoning-format none is REQUIRED, not optional — llama-server's own
+# default ("auto") routes a thinking model's <think> block into a
+# separate message.reasoning_content JSON field instead of leaving it in
+# message.content (see llama.cpp's own tools/server/README.md). This
+# app's utils/llm.py only reads message.content, so a classifier call
+# with a small max_tokens budget (utils/tool_router.py,
+# utils/intent.py) can come back completely empty if the whole budget
+# goes to reasoning — confirmed in practice: tool_router logged raw=''
+# and silently failed to route an otherwise-correct astro_natal_chart
+# request. "none" leaves thoughts unparsed in content, matching the
+# embedded backend's own behavior exactly (utils/llm.py's
+# _THINK_BLOCK_RE already strips a properly-closed <think> block from
+# content regardless of which backend produced it).
+#
+# --ctx-size 98304 (not 32768) — REQUIRED, not a nicety. llama-server
+# splits --ctx-size evenly across --parallel slots (n_ctx_slot in its
+# own startup log), unlike the embedded backend, which gives one request
+# the WHOLE of config.N_CTX (32768). With --parallel 3 and the old
+# --ctx-size 32768, each slot only got ~11008 tokens - confirmed in
+# practice: a real astro_natal_chart request (full RAG methodology +
+# per-planet digest + sectioned-answer prompt) needed 14314 tokens and
+# was rejected outright ("exceeds the available context size (11008
+# tokens)"). 98304 = 32768 (config.N_CTX) * 3 (--parallel) gives every
+# slot the same full N_CTX headroom the embedded backend already relies
+# on for this app's heaviest techniques (horary/electional/rectification
+# can run just as large). This roughly TRIPLES the KV cache's memory
+# footprint versus the old 32768 - if that doesn't fit in available RAM,
+# reduce --parallel instead (e.g. --parallel 2 with --ctx-size 32768
+# still gives ~16384/slot, more headroom than the original 11008, at
+# the cost of one fewer concurrent conversation).
 ExecStart=/bin/bash -c '/var/www/ycplt/llama-server/llama-server \
   --model /var/www/ycplt/models/Qwen3.5-9B-UD-Q4_K_XL.gguf \
   --host 127.0.0.1 --port 4012 \
-  --parallel 3 --ctx-size 32768 \
-  --threads 4 --threads-batch $(nproc)'
+  --parallel 3 --ctx-size 98304 \
+  --threads 4 --threads-batch $(nproc) \
+  --reasoning-format none'
 Restart=on-failure
 RestartSec=5
 

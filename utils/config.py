@@ -162,15 +162,24 @@ LLAMA_SERVER_HOST = os.environ.get("YCPLT_LLAMA_SERVER_HOST", "127.0.0.1")
 LLAMA_SERVER_PORT = int(os.environ.get("YCPLT_LLAMA_SERVER_PORT", "4012"))
 LLAMA_SERVER_URL = f"http://{LLAMA_SERVER_HOST}:{LLAMA_SERVER_PORT}"
 
-# Deliberately generous, not a short "is it up" probe timeout — this
-# covers the ENTIRE request/response round trip for an actual generation
-# call, and this app's own N_CTX/max_tokens policy is "no artificial cap"
-# (see generate_sync's own docstring in utils/llm.py): a long, uncapped
-# RAG-heavy astro answer can legitimately take a long time even with
-# llama-server's own concurrency improvements helping OTHER requests stay
-# responsive meanwhile. Set to 0 (or any value <= 0) to disable the
-# timeout entirely and wait indefinitely.
-LLAMA_SERVER_TIMEOUT_SEC = int(os.environ.get("YCPLT_LLAMA_SERVER_TIMEOUT_SEC", "1200"))
+# 0 (disabled) by default — matching the embedded backend, which has NO
+# timeout at all (it's a plain in-process Python call). Real, confirmed
+# consequence of the previous 1200s (20 min) default: a genuine heavy
+# RAG answer (astro_natal_chart, full methodology + digest + sectioned
+# prompt) was still generating at n_gen=1388+ tokens, tg=2.58 tok/s, when
+# this app's own client-side timeout fired and aborted it mid-answer —
+# llama-server's own log showed "cancel task" / "stop processing", i.e.
+# the model was making real progress, just not fast enough to finish
+# inside 1200s. This app's own N_CTX/max_tokens policy is already "no
+# artificial cap" (see generate_sync's own docstring in utils/llm.py),
+# and a bigger --ctx-size (see LLAMA_SERVER_PORT's own comment and
+# install/llama-server.service) tends to slow tg further via a larger
+# KV cache to scan per token — so a fixed timeout here fights the app's
+# own design elsewhere. Set to a positive number of seconds only if you
+# specifically want a hard ceiling (e.g. to fail fast on a genuinely
+# stuck request) and are fine with heavy techniques being cut off before
+# they finish.
+LLAMA_SERVER_TIMEOUT_SEC = int(os.environ.get("YCPLT_LLAMA_SERVER_TIMEOUT_SEC", "0"))
 
 # ---------- Chat history (conversations, messages, file attachments — see db/) ----------
 DB_PATH = _resolve_path("DB_PATH", "data/chat.sqlite3")

@@ -297,13 +297,67 @@ total tokens/sec.
    llama-server \
      --model models/Qwen3.5-9B-UD-Q4_K_XL.gguf \
      --host 127.0.0.1 --port 4012 \
-     --parallel 3 --ctx-size 32768 \
-     --threads 4 --threads-batch $(nproc)
+     --parallel 3 --ctx-size 98304 \
+     --threads 4 --threads-batch $(nproc) \
+     --reasoning-format none
    ```
 
    Port `4012`, not llama-server's own upstream default of `8080` — see
    "Port allocation across the ycplt family" at the top of Installation &
    Setup.
+
+   **`--ctx-size` must be `N_CTX * --parallel`, not just `N_CTX`.**
+   llama-server splits `--ctx-size` evenly across `--parallel` slots
+   (`n_ctx_slot` in its own startup log) — the embedded backend, by
+   contrast, gives one request the WHOLE of `config.N_CTX` (32768).
+   Real, confirmed consequence of leaving `--ctx-size` at 32768 with
+   `--parallel 3`: each slot only got ~11008 tokens, and a real
+   `astro_natal_chart` request (full RAG methodology + per-planet digest
+   + sectioned-answer prompt) needing 14314 tokens was flatly rejected:
+   `HTTP 400 exceed_context_size_error`. `98304` = `32768 * 3` restores
+   the same full-`N_CTX` headroom per slot that the embedded backend
+   already relies on for this app's heaviest techniques (horary,
+   electional, and rectification can run just as large). This roughly
+   **triples the KV cache's memory footprint** versus the old 32768 —
+   if that doesn't fit in available RAM, reduce `--parallel` instead
+   (e.g. `--parallel 2` with `--ctx-size 32768` still gives ~16384/slot,
+   more headroom than the original 11008, at the cost of one fewer
+   concurrent conversation) rather than lowering `--ctx-size` below
+   `N_CTX`.
+
+   **`--reasoning-format none` is required, not optional — but it's only
+   half the fix.** Real, confirmed bug: llama-server's own default
+   (`--reasoning-format auto`) routes a "thinking" model's `<think>`
+   block into a separate `message.reasoning_content` JSON field instead
+   of leaving it in `message.content` (see llama.cpp's own
+   `tools/server/README.md`) — this app's `utils/llm.py` only reads
+   `message.content`. A classifier call with a small `max_tokens` budget
+   (`utils/tool_router.py`, `utils/intent.py`) can have its ENTIRE budget
+   consumed by reasoning under `auto`, coming back completely empty —
+   confirmed in practice: `tool_router` logged `raw=''` and silently
+   failed to route an otherwise-correct `astro_natal_chart` request.
+   `none` leaves thoughts unparsed in `content` instead, matching the
+   embedded backend's own behavior, so `_THINK_BLOCK_RE` strips a
+   properly-closed `<think>` block the same way regardless of backend.
+
+   **But `--reasoning-format` only controls WHERE an already-generated
+   think block ends up, not WHETHER the model generates one at all** —
+   confirmed in practice a second time: even with `--reasoning-format
+   none` in place, `tool_router`'s 120-token budget was STILL entirely
+   consumed by an in-progress, unclosed reasoning trace (visible this
+   time, cut off mid-thought instead of hidden in `reasoning_content`),
+   never reaching the actual tool name. The real fix is
+   `utils/llm.py`'s own `_generate_server()`, which now sends
+   `"reasoning_effort": "none"` in every request body —
+   llama-server's docs are explicit this disables reasoning/thinking
+   outright, not just where it's reported. This app never reads the
+   reasoning trace on either backend (see `_THINK_BLOCK_RE`'s own
+   comment — it exists purely to discard it), so there's no downside to
+   turning it off entirely. Being set in the request body itself (not
+   just a CLI flag) means it applies no matter how llama-server was
+   started. `_generate_server()` also falls back to `reasoning_content`
+   if `content` ever comes back empty anyway, as a last-resort second
+   line of defense.
 
    **`--threads-batch` matters, don't skip it.** llama.cpp's own CLI
    default makes `--threads-batch` equal to `--threads` if left unset —
@@ -333,22 +387,49 @@ total tokens/sec.
    Note the `YCPLT_` prefix on all three — unlike every other setting in
    `.env`. A real, reported mix-up: writing `LLM_BACKEND=server` (matching
    the unprefixed style everything else uses) is silently ignored, with no
-   warning, and this app quietly keeps using the embedded backend. `.env.example`
-   now ships these three uncommented with `YCPLT_LLM_BACKEND=server` as the
-   suggested default — copy the names exactly, or comment the block out
-   entirely to fall back to embedded.
+   warning, and this app quietly keeps using the embedded backend.
+   `install/.env.example` keeps `YCPLT_LLM_BACKEND` commented out
+   (embedded stays the default there) after the `reasoning_content` bug
+   above was found — uncomment and set these three exactly once
+   llama-server is running with `--reasoning-format none`.
 4. Restart this app. `utils/llm.load_llm()` checks `llama-server`'s
    `/health` endpoint at startup and fails fast with a clear error if it
    isn't reachable, the same guarantee a missing `MODEL_PATH` file already
    gives for the embedded backend.
 
 Revert at any time by setting `YCPLT_LLM_BACKEND=embedded` (or removing
-the line) and restarting — nothing else needs to change, matching the
-same off-by-default, single-flag-revert pattern already used for
-`ycplt_img`'s `RECONSTRUCT_ENABLED`/`KONTEXT_ENABLED`. Note that
-`install/.env.example` now ships with the server backend as the suggested
-default (matching this app's own real deployment) rather than embedded —
-comment that block out if you don't have llama-server running.
+the line — that's `install/.env.example`'s own default again) and
+restarting — nothing else needs to change, matching the same
+off-by-default, single-flag-revert pattern already used for
+`ycplt_img`'s `RECONSTRUCT_ENABLED`/`KONTEXT_ENABLED`.
+
+**Real-hardware verdict, after three rounds of fixes:** `tool_router`
+now correctly triggers `astro_natal_chart` via llama-server once
+`reasoning_effort: "none"` is set (see `_generate_server()`'s own
+comment) — confirmed with a fresh natal-chart test. Two further, real
+issues surfaced immediately after that fix, both now addressed above:
+
+1. **Context overflow**: the full RAG-heavy prompt for a real technique
+   needed 14314 tokens, but `--ctx-size 32768` split across
+   `--parallel 3` only gave each slot ~11008 — fixed by raising
+   `--ctx-size` to `98304` (`N_CTX * --parallel`, see step 2 above).
+2. **Client-side timeout**: with the larger `--ctx-size` (a bigger KV
+   cache to scan per token), generation slowed further (~2.6 tok/s
+   observed) and a long answer was still mid-generation, making real
+   progress, when this app's own `LLAMA_SERVER_TIMEOUT_SEC` (previously
+   1200s) cut the connection — llama-server's own log showed the task
+   being cancelled, not failing on its own. Now `0` (disabled) by
+   default, matching the embedded backend's own total absence of a
+   timeout (see `utils/config.py`'s own comment).
+
+A full RAG-heavy answer (e.g. a natal chart reading) takes a comparable
+~18-20+ minutes on this hardware whether generated via the embedded
+backend or via llama-server, once the technique actually gets triggered
+correctly on both — that's this model's (Qwen3.5-9B) real per-token
+generation speed on this CPU for a long, multi-section answer, not
+something either backend can fix. The concurrency benefit (not blocking
+other chats behind one long answer) is still the entire point of this
+backend; it was never meant to make any single answer faster.
 
 ## Installation & Setup
 

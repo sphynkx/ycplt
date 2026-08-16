@@ -267,11 +267,31 @@ def _generate_server(prompt: str, max_tokens: Optional[int], temperature: float)
     requests safely on its own side, so a second call landing here while
     the first is still in flight is not a race condition to guard against,
     it's the intended, fixed behavior (see config.LLM_BACKEND's own
-    comment for why this was worth doing at all)."""
+    comment for why this was worth doing at all).
+
+    reasoning_effort="none": a real, confirmed second bug beyond the
+    reasoning_content one --reasoning-format none already fixes.
+    --reasoning-format only controls WHERE an already-generated <think>
+    block ends up in the JSON response, not WHETHER the model generates
+    one at all — confirmed in practice: even with --reasoning-format
+    none in place, tool_router's tight max_tokens=120 budget was still
+    entirely consumed by an in-progress reasoning trace (visible,
+    unclosed, cut off mid-thought - e.g. "...I need to" - instead of
+    landing on the actual tool name), never reaching a usable answer.
+    llama-server's own docs (tools/server/README.md) are explicit that
+    the per-request "reasoning_effort": "none" field disables
+    reasoning/thinking outright, not just where it's reported - exactly
+    what's needed, since this app never reads the reasoning trace on
+    EITHER backend (see _THINK_BLOCK_RE below, which exists purely to
+    discard it from the embedded backend's own inline output). Setting
+    this here, in the request body itself, means it's enforced by this
+    app's own code regardless of how llama-server happens to be
+    started, rather than relying on a CLI flag someone could forget."""
     body = {
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "repeat_penalty": config.REPEAT_PENALTY,
+        "reasoning_effort": "none",
     }
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
@@ -298,7 +318,31 @@ def _generate_server(prompt: str, max_tokens: Optional[int], temperature: float)
     except urllib.error.URLError as e:
         raise RuntimeError(f"llama-server unreachable ({config.LLAMA_SERVER_URL}): {e}") from e
 
-    return payload["choices"][0]["message"]["content"]
+    message = payload["choices"][0]["message"]
+
+    # Real, confirmed bug this guards against: llama-server's own
+    # --reasoning-format defaults to "auto", which for a "thinking" model
+    # (this app's Qwen3.5-9B included) routes the <think> block into a
+    # SEPARATE message.reasoning_content field instead of leaving it
+    # inline in message.content (see llama.cpp's own
+    # tools/server/README.md). install/llama-server.service already
+    # passes --reasoning-format none specifically to avoid this — that
+    # puts reasoning back inline in content, matching the embedded
+    # backend's own behavior exactly, so _THINK_BLOCK_RE below strips it
+    # identically either way. This fallback exists only as a second line
+    # of defense (a future llama-server upgrade changing defaults, or a
+    # deployment that forgot the flag): confirmed in practice that a
+    # tight max_tokens budget (utils/tool_router.py's classifier calls)
+    # can be entirely consumed by reasoning under "auto", leaving content
+    # empty with no error — tool_router silently treated that as "no
+    # tool", not a crash, so this failure mode is easy to miss without
+    # looking at the raw response. Falling back to reasoning_content
+    # rather than returning an empty string at least surfaces SOME text
+    # instead of silently discarding a real (if incomplete) answer.
+    content = message.get("content") or ""
+    if not content and message.get("reasoning_content"):
+        content = message["reasoning_content"]
+    return content
 
 
 def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
