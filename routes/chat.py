@@ -1565,6 +1565,19 @@ async def _handle_image_edit_request(
     srv/worker.py's _generate_removal_edit); this is what decides which
     one a given message gets.
 
+    For any OTHER kind of edit (remove_target not set), the prompt sent to
+    ycplt_img is translated to English first
+    (utils/intent.get_english_edit_instruction_async) rather than sending
+    req.query as-is. Real, reported failure this fixes: a Russian edit
+    instruction produced a FLUX.1 Kontext result (ycplt_img's optional,
+    experimental general-edit model — see its README) identical to the
+    input photo, traced to its CLIP/T5 text encoders barely representing
+    Cyrillic text at all. ycplt_img itself does no translation, so it has
+    to happen here, before the job is queued — see that function's own
+    docstring for the full diagnosis. The chat history still displays
+    req.query (the user's own words) unchanged; only the internal prompt
+    sent to ycplt_img is translated.
+
     width/height are read from the actual uploaded image (real, reported
     bug: this used to never be sent at all, silently defaulting to
     image_client.submit_job's own 512x512 — harmless for a plain
@@ -1604,6 +1617,16 @@ async def _handle_image_edit_request(
     reconstruct_prompt = None
     if remove_target:
         reconstruct_prompt = await intent.get_reconstruction_prompt_async(req.query, remove_target)
+        edit_prompt = req.query  # irrelevant for LaMa; reconstruct_prompt (already English) carries the real instruction when set
+    else:
+        # Real, reported failure this fixes: a Russian instruction sent
+        # as-is to a general (non-removal) edit produced a FLUX.1 Kontext
+        # result identical to the input photo — its text encoders barely
+        # represent Cyrillic (see utils/intent.get_english_edit_instruction's
+        # own docstring for the full diagnosis). ycplt_img itself does no
+        # translation, so it has to happen here before the job is queued.
+        edit_prompt = await intent.get_english_edit_instruction_async(req.query)
+
     submit_kwargs = dict(
         mode="img2img",
         strength=strength,
@@ -1618,7 +1641,7 @@ async def _handle_image_edit_request(
     try:
         job_id = await loop.run_in_executor(
             None,
-            lambda: image_client.submit_job(req.query, **submit_kwargs),
+            lambda: image_client.submit_job(edit_prompt, **submit_kwargs),
         )
     except image_client.ImageServiceError as e:
         raise HTTPException(status_code=502, detail=f"Сервис изображений недоступен: {e}")

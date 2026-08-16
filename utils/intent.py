@@ -245,6 +245,90 @@ async def get_reconstruction_prompt_async(query: str, target: str) -> Optional[s
     return await loop.run_in_executor(None, get_reconstruction_prompt, query, target)
 
 
+_ENGLISH_EDIT_PROMPT = """You already know the message below is an
+instruction to edit an attached image (NOT a "remove one named object"
+instruction — that case is handled separately).
+
+Rewrite it as a single, clear, concise English sentence suitable as a
+prompt for an image-editing AI model. Preserve the meaning and intent
+exactly — don't add details that aren't there, don't explain your answer,
+don't add quotes around it. If the message is already in English, just
+repeat it back, correcting only obvious typos.
+
+Message: "{query}"
+English instruction:"""
+
+
+def _parse_english_edit_instruction(answer: str, fallback: str) -> str:
+    normalized = answer.strip().strip("\"'")
+    return normalized if normalized else fallback
+
+
+def get_english_edit_instruction(query: str) -> str:
+    """Translates/rephrases a general (non-remove_target) image edit
+    instruction into English before it's sent to ycplt_img as the job's
+    prompt.
+
+    Real, reported failure this exists to fix: a Russian instruction
+    ("Перерисуй фото женщины как если бы она была мужчиной") sent as-is
+    produced a FLUX.1 Kontext edit that came back identical to the input
+    photo — ycplt_img's own diagnostic logs showed its text encoders
+    (CLIP's BPE vocabulary and T5's tokenizer) badly fragmenting or
+    outright failing to represent Cyrillic text, leaving the model with
+    no real instruction signal to condition on. Re-testing the identical
+    setup with a clean English prompt produced correct tokenization.
+    FLUX/Kontext (like the base Flux/CLIP/T5 stack it's built on) is
+    trained overwhelmingly on English text — this mirrors why
+    get_removal_target/get_reconstruction_prompt above already translate
+    to English for CLIPSeg/the inpaint checkpoint, just applied to the
+    general edit-instruction case now that ycplt_img can also route a
+    plain img2img edit through Kontext (see its README "Instruction-based
+    editing (FLUX.1 Kontext, experimental)").
+
+    Deliberately NOT called for remove_target jobs: LaMa (the default
+    object-removal path) ignores the prompt entirely, and
+    reconstruct_prompt (the alternate SD-inpaint path) is already
+    generated in English by get_reconstruction_prompt above — translating
+    the raw query in that case would just be a wasted LLM call.
+
+    Returns the ORIGINAL query unchanged (never None, never raises) on
+    any error, an empty answer, or if the local LLM isn't loaded — always
+    produces a usable prompt string, so a translation failure just means
+    the edit proceeds with the original-language text exactly as before
+    this function existed, not a blocked request.
+
+    max_tokens=300 (raised from an initial 80): a "-Thinking-" style chat
+    model (see utils/llm.py's generate_sync own <think> comment) can spend
+    a large chunk of its budget on an internal reasoning trace before ever
+    reaching the actual translated sentence — 80 was tight enough that a
+    long/compound instruction risked getting cut off mid-<think>, in which
+    case generate_sync's own stripping (which only removes a CLOSED
+    <think>...</think> block) leaves the raw, unclosed trace as the
+    "answer", and that garbled text would go straight to Kontext as its
+    prompt. 300 gives real headroom for a thinking model's scratchpad
+    to actually close before the visible answer, on top of the
+    translated sentence itself (normally well under 50 tokens) — a real,
+    but comparatively small, added cost against a job that already
+    typically takes minutes to hours end to end (see ycplt_img's README
+    "Instruction-based editing (FLUX.1 Kontext, experimental)")."""
+    if llm_utils.get_llm() is None:
+        return query
+    try:
+        answer = llm_utils.generate_sync(
+            _ENGLISH_EDIT_PROMPT.format(query=query),
+            max_tokens=300,
+            temperature=0.0,
+        )
+    except Exception:
+        return query
+    return _parse_english_edit_instruction(answer, query)
+
+
+async def get_english_edit_instruction_async(query: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, get_english_edit_instruction, query)
+
+
 # --- synastry two-person text segmentation (LLM fallback) ----------------
 #
 # Why this exists: utils/astro.py's synastry free-text extraction is
