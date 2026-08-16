@@ -110,6 +110,68 @@ N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "0"))  # no usable GPU acceler
 # answers start reading as unnaturally avoidant of repeating chart terms.
 REPEAT_PENALTY = float(os.environ.get("REPEAT_PENALTY", "1.15"))
 
+# ---------- LLM backend: embedded (default) vs a separately hosted llama-server ----------
+#
+# "embedded" (default): the ORIGINAL behavior — utils/llm.py loads a single
+# llama-cpp-python Llama object directly in this process, serialized behind
+# a hand-rolled FIFO lock (see that module's _FifoLock) so two concurrent
+# /chat requests can't race on the same model instance's KV cache. This
+# works, but has a real, reported limitation: since there's only one
+# request in flight at a time system-wide, a long generation for one
+# conversation (an image-edit job's classifier calls, a long RAG-heavy
+# astro answer, ...) makes every OTHER conversation's own message —
+# even a trivial "hi, how are you" — wait in strict FIFO order behind it,
+# confirmed in practice by testing two chats at once.
+#
+# "server": routes every generate_sync/generate_async call to a
+# SEPARATELY hosted llama-server instance (the native C++ server binary
+# from the llama.cpp project itself — ggml-org/llama.cpp's tools/server,
+# NOT the same thing as the llama-cpp-python pip package's own
+# `llama_cpp.server` module, which was checked directly against its
+# source and found to serialize requests behind a single anyio.Lock just
+# like the embedded backend above — switching to THAT would gain nothing
+# but a network hop). llama-server supports real parallel request
+# handling via multiple "slots" (--parallel/-np) with continuous batching
+# (-cb, on by default) — on CPU-only hardware this does NOT meaningfully
+# raise total throughput (no idle parallel matrix units to exploit the
+# way a GPU has), but it DOES fix the actual reported problem: a short
+# request arriving mid-generation gets folded into the next decode step
+# across all active slots, instead of waiting for one long generation to
+# finish outright. See README's "Separate llama-server backend" section
+# for the full setup (building llama-server, systemd unit, choosing a
+# --parallel count for your CPU's core count).
+#
+# Defaults to "embedded" so nothing changes for anyone who hasn't set up
+# a separate llama-server instance — exactly the same off-by-default,
+# single-flag toggle pattern already used for ycplt_img's
+# RECONSTRUCT_ENABLED/KONTEXT_ENABLED, so this can be tried and reverted
+# just as easily if llama-server doesn't work out.
+LLM_BACKEND = os.environ.get("YCPLT_LLM_BACKEND", "embedded").strip().lower()
+
+# Only used when LLM_BACKEND=="server". Defaults to localhost — unlike
+# ycplt_img (a genuinely separate machine), llama-server runs on the SAME
+# box as this app: it's a second local process talking to the same GGUF
+# model file, not a remote service, so the plain loopback address is the
+# right default here. Override only if llama-server ever moves elsewhere.
+LLAMA_SERVER_HOST = os.environ.get("YCPLT_LLAMA_SERVER_HOST", "127.0.0.1")
+# 4012, not llama-server's own upstream default of 8080 — this project
+# reserves 4010+ for the whole ycplt family (ycplt=4010, ycplt_img=4011,
+# llama-server=4012, ...), one port each, specifically so they don't
+# collide with other unrelated services that commonly squat on 8080. See
+# README's "Port allocation across the ycplt family" table.
+LLAMA_SERVER_PORT = int(os.environ.get("YCPLT_LLAMA_SERVER_PORT", "4012"))
+LLAMA_SERVER_URL = f"http://{LLAMA_SERVER_HOST}:{LLAMA_SERVER_PORT}"
+
+# Deliberately generous, not a short "is it up" probe timeout — this
+# covers the ENTIRE request/response round trip for an actual generation
+# call, and this app's own N_CTX/max_tokens policy is "no artificial cap"
+# (see generate_sync's own docstring in utils/llm.py): a long, uncapped
+# RAG-heavy astro answer can legitimately take a long time even with
+# llama-server's own concurrency improvements helping OTHER requests stay
+# responsive meanwhile. Set to 0 (or any value <= 0) to disable the
+# timeout entirely and wait indefinitely.
+LLAMA_SERVER_TIMEOUT_SEC = int(os.environ.get("YCPLT_LLAMA_SERVER_TIMEOUT_SEC", "1200"))
+
 # ---------- Chat history (conversations, messages, file attachments — see db/) ----------
 DB_PATH = _resolve_path("DB_PATH", "data/chat.sqlite3")
 

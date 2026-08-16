@@ -7,6 +7,8 @@ models/*
 !models/.gitempty
 rag_data/*
 !rag_data/.gitempty
+_bench_embedded.py
+llama-server/
 
 # Local backups (RAG index/data snapshots, etc.) — not source, not tracked.
 _Xlam/

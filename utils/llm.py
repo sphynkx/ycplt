@@ -1,19 +1,33 @@
-"""Loading and calling the GGUF model via llama-cpp-python.
+"""Loading and calling the chat LLM — either embedded directly in this
+process (llama-cpp-python, the original/default behavior) or via a
+separately-hosted llama-server instance on the SAME machine that supports
+real concurrent-request handling (continuous batching / parallel slots).
+See config.LLM_BACKEND ("embedded" default, or "server").
 
-Keeps a single Llama instance per process (module-level singleton),
-available through get_llm() after load_llm() has been called at app startup.
+Every caller (utils/intent.py's classifiers, utils/tool_router.py,
+utils/interpret.py, routes/chat.py's final answer, ...) goes through
+generate_sync/generate_async/get_llm/load_llm exactly as before — the
+backend split is entirely internal to this module, so nothing outside it
+needed to change when the "server" backend was added.
 """
+import json
 import os
 import re
 import asyncio
 import threading
+import urllib.error
+import urllib.request
 from typing import Optional
-
-from llama_cpp import Llama
 
 from utils import config
 
-_llm: Optional[Llama] = None
+# Holds either a real llama_cpp.Llama instance (backend="embedded") or the
+# sentinel string "server" once config.LLM_BACKEND=="server" and
+# load_llm() has confirmed llama-server is reachable — get_llm() callers
+# throughout the codebase only ever check "is this None" (is a model
+# available at all), never call methods on it directly, so a plain
+# truthy sentinel is a safe stand-in for the server backend.
+_llm = None
 
 
 class _FifoLock:
@@ -23,6 +37,12 @@ class _FifoLock:
     OS/runtime happens to wake next gets it, which in practice is "roughly
     fair" but not guaranteed, and isn't even the point: a plain Lock only
     guarantees mutual exclusion, not ordering).
+
+    ONLY used by the "embedded" backend (see _generate_embedded) — the
+    "server" backend has no lock at all, since llama-server itself handles
+    concurrent requests safely via its own parallel slots (see that
+    backend's own comments below for why this genuinely fixes the
+    limitation this lock works around, rather than just moving it).
 
     This matters here specifically because a single /chat request already
     makes several SEQUENTIAL calls into this module of its own accord (see
@@ -76,8 +96,7 @@ class _FifoLock:
 
 
 # See _FifoLock's own docstring above for why this replaced a plain
-# threading.Lock — every generate_sync call (the one place every caller,
-# sync or async, funnels through) now goes through here.
+# threading.Lock — only used by the "embedded" backend.
 _llm_lock = _FifoLock()
 
 # Some GGUF models (e.g. Qwen3's "-Thinking-" variants) are trained to
@@ -89,16 +108,19 @@ _llm_lock = _FifoLock()
 # after switching models. This app has no use for that scratchpad (every
 # caller wants the final answer only, in the requested language), and
 # nothing downstream expects it, so it's stripped here — the one shared
-# place every caller's output passes through — rather than in each of the
-# many individual prompts/callers. A no-op for any model that doesn't emit
-# think-tags at all (today's default, Qwen2.5-3B-instruct, doesn't), so
-# this is safe to leave in regardless of which model is configured.
+# place every caller's output passes through, regardless of which backend
+# produced it, rather than in each of the many individual prompts/callers.
+# A no-op for any model that doesn't emit think-tags at all, so this is
+# safe to leave in regardless of which model/backend is configured.
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
-def load_llm() -> Llama:
-    """Loads the model from config.MODEL_PATH. Raises RuntimeError with a
-    clear message if the file is missing or not in GGUF format."""
+def _load_embedded():
+    """The original behavior: loads config.MODEL_PATH directly into this
+    process via llama-cpp-python. Raises RuntimeError with a clear message
+    if the file is missing or not in GGUF format."""
+    from llama_cpp import Llama
+
     global _llm
 
     if not os.path.exists(config.MODEL_PATH):
@@ -130,47 +152,91 @@ def load_llm() -> Llama:
     except Exception as e:
         raise RuntimeError(f"Failed to load model '{config.MODEL_PATH}': {e}")
 
-    print("Model loaded successfully.")
+    print("Model loaded successfully (embedded backend).")
     return _llm
 
 
-def get_llm() -> Optional[Llama]:
+def _check_server_reachable() -> None:
+    """Fails fast at startup if config.LLM_BACKEND=="server" but
+    llama-server isn't actually reachable at config.LLAMA_SERVER_URL —
+    the same guarantee _load_embedded() already gives for a missing model
+    file, rather than only discovering the misconfiguration on the first
+    real /chat request."""
+    req = urllib.request.Request(f"{config.LLAMA_SERVER_URL}/health", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"llama-server at {config.LLAMA_SERVER_URL} responded with HTTP {resp.status} on /health"
+                )
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"llama-server unreachable at {config.LLAMA_SERVER_URL} (config.LLM_BACKEND='server'): {e}. "
+            "Start llama-server first (see README's 'Separate llama-server backend' section), "
+            "or set YCPLT_LLM_BACKEND=embedded to use the built-in model instead."
+        ) from e
+
+
+def load_llm():
+    """Loads/connects the chat model according to config.LLM_BACKEND.
+    Raises RuntimeError with a clear message on failure either way — a
+    missing model file for "embedded", or an unreachable llama-server for
+    "server" — so a misconfiguration is caught at startup, not on the
+    first real chat message."""
+    global _llm
+
+    if config.LLM_BACKEND == "server":
+        _check_server_reachable()
+        _llm = "server"  # truthy sentinel — see this module's own top comment
+        print(f"Using llama-server backend at {config.LLAMA_SERVER_URL}.")
+        return _llm
+
+    return _load_embedded()
+
+
+def get_llm():
     return _llm
 
 
-def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
-    """Runs one generation. max_tokens=None (the default) means "no artificial
-    cap" — llama-cpp-python then generates until the model emits a stop token
-    or the context window (config.N_CTX) is full, whichever comes first.
-    Pass an explicit max_tokens only when a caller genuinely wants a shorter
-    answer (e.g. utils/intent.py's one-word classifier).
+def close_llm() -> None:
+    """Explicitly releases the embedded model before process shutdown —
+    call this from app.py's own lifespan shutdown phase, not just when it
+    feels convenient.
 
-    Serialized on _llm_lock — a real, reported gap: this app handles more
-    than one conversation at once (separate chats in the sidebar), and
-    nothing before this stopped two independent /chat requests from both
-    reaching this function at the same time on two different threads.
-    llama-cpp-python's own Llama class has no internal thread-safety guard
-    at all (checked directly against its source — no lock, no threading
-    import anywhere in it), so two concurrent create_chat_completion calls
-    against the SAME _llm instance would race on its internal context/KV
-    cache with no protection — not just "slower", but a real risk of
-    garbled output or a crash, since nothing here previously prevented it.
-    The single loaded model is a hard limit either way — genuinely
-    SIMULTANEOUS generation of two different answers isn't possible on one
-    CPU-bound model instance without a second one resident in memory (a
-    real option, just a much bigger RAM/ops cost, not something this fixes
-    by itself) — what this lock actually buys is turning an unsafe race
-    into a safe, correct, strictly-ordered FIFO queue (see _FifoLock's own
-    docstring for why "strictly ordered" needed calling out separately
-    from just "safe"): whichever request asked for the lock first is
-    guaranteed to be served first, and finishes before the next one
-    starts, instead of both corrupting each other or racing in whatever
-    order the OS happened to wake them. Chart/data computation for a
-    different conversation is NOT affected — that work doesn't touch _llm
-    at all and genuinely can run in parallel; only the actual model call
-    is serialized (and now queued) here."""
-    if _llm is None:
-        raise RuntimeError("Model is not loaded")
+    Real, reported crash this exists to fix: with no explicit close
+    anywhere in this app's own code (no shutdown handler existed at all
+    before this), the embedded Llama instance was only ever cleaned up by
+    Python's own garbage collector during interpreter shutdown
+    (llama_cpp's own Llama.__del__). On at least one real deployment
+    (Python 3.14, a recent llama-cpp-python build), that teardown ordering
+    produced `TypeError: 'NoneType' object is not callable` deep inside
+    llama_cpp's free_model — a known class of bug where a C extension's
+    __del__ references another module-level global that Python's own
+    interpreter shutdown may already have cleared by the time __del__
+    actually runs, not something specific to this app's own code (previous
+    Python/llama-cpp-python combinations on the same code apparently
+    didn't hit this ordering issue, hence "used to close cleanly").
+    Closing the model explicitly and early — during uvicorn's own graceful
+    shutdown, while the whole process (including every llama_cpp module
+    global) is still fully intact — avoids that ordering problem
+    entirely, rather than leaving cleanup to whatever order Python's own
+    finalizer happens to run in at some later, less predictable point.
+
+    Safe to call regardless of config.LLM_BACKEND: a no-op for the
+    "server" backend (there's no local model object to release there —
+    llama-server, a separate process, manages its own lifecycle), and
+    safe to call even if load_llm() was never reached (startup failed
+    before it)."""
+    global _llm
+    if config.LLM_BACKEND != "server" and _llm is not None:
+        try:
+            _llm.close()
+        except Exception as e:
+            print(f"[llm] error while closing model: {e}")
+    _llm = None
+
+
+def _generate_embedded(prompt: str, max_tokens: Optional[int], temperature: float) -> str:
     with _llm_lock:
         out = _llm.create_chat_completion(
             messages=[{"role": "user", "content": prompt}],
@@ -183,14 +249,117 @@ def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: fl
             # Russian.
             repeat_penalty=config.REPEAT_PENALTY,
         )
-    content = out["choices"][0]["message"]["content"]
+    return out["choices"][0]["message"]["content"]
+
+
+def _generate_server(prompt: str, max_tokens: Optional[int], temperature: float) -> str:
+    """Posts to llama-server's OpenAI-compatible /v1/chat/completions.
+    llama-server extends the standard OpenAI request body with extra
+    llama.cpp-specific sampling fields (repeat_penalty among them), passed
+    through directly here — no separate client library needed, same
+    stdlib-urllib-only convention utils/image_client.py already uses for
+    ycplt_img, for the same reason (a tiny, occasional HTTP client isn't
+    worth a new dependency).
+
+    No lock here at all, unlike _generate_embedded above — this is the
+    entire point of the "server" backend: llama-server's own --parallel
+    slots + continuous batching (-cb) handle multiple simultaneous
+    requests safely on its own side, so a second call landing here while
+    the first is still in flight is not a race condition to guard against,
+    it's the intended, fixed behavior (see config.LLM_BACKEND's own
+    comment for why this was worth doing at all)."""
+    body = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "repeat_penalty": config.REPEAT_PENALTY,
+    }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{config.LLAMA_SERVER_URL}/v1/chat/completions",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    # <= 0 disables the timeout entirely (urlopen(timeout=None) waits
+    # indefinitely) — see config.LLAMA_SERVER_TIMEOUT_SEC's own comment for
+    # why the default is generous rather than short: this covers a full
+    # generation, not just a liveness probe.
+    timeout = config.LLAMA_SERVER_TIMEOUT_SEC if config.LLAMA_SERVER_TIMEOUT_SEC > 0 else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"llama-server returned HTTP {e.code}: {e.read().decode('utf-8', errors='replace')}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"llama-server unreachable ({config.LLAMA_SERVER_URL}): {e}") from e
+
+    return payload["choices"][0]["message"]["content"]
+
+
+def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
+    """Runs one generation. max_tokens=None (the default) means "no artificial
+    cap" — the model then generates until it emits a stop token or the
+    context window (config.N_CTX, or llama-server's own --ctx-size) is
+    full, whichever comes first. Pass an explicit max_tokens only when a
+    caller genuinely wants a shorter answer (e.g. utils/intent.py's
+    one-word classifiers).
+
+    Dispatches to _generate_embedded or _generate_server per
+    config.LLM_BACKEND — see this module's own top comment and
+    config.LLM_BACKEND's comment for the full rationale. Every existing
+    caller (there are many, across utils/intent.py, utils/tool_router.py,
+    utils/interpret.py, routes/chat.py, ...) is unaffected by which
+    backend is active: this function's signature and return value are
+    identical either way.
+
+    embedded backend: serialized on _llm_lock — a real, reported gap: this
+    app handles more than one conversation at once (separate chats in the
+    sidebar), and nothing before this stopped two independent /chat
+    requests from both reaching this function at the same time on two
+    different threads. llama-cpp-python's own Llama class has no internal
+    thread-safety guard at all (checked directly against its source — no
+    lock, no threading import anywhere in it), so two concurrent
+    create_chat_completion calls against the SAME _llm instance would race
+    on its internal context/KV cache with no protection — not just
+    "slower", but a real risk of garbled output or a crash. The single
+    loaded model is a hard limit either way — genuinely SIMULTANEOUS
+    generation of two different answers isn't possible on one CPU-bound
+    model instance without a second one resident in memory — what this
+    lock actually buys is turning an unsafe race into a safe, correct,
+    strictly-ordered FIFO queue.
+
+    server backend: no lock — real, reported limitation of the embedded
+    backend's FIFO queue this exists to fix: a long generation for one
+    conversation made every OTHER conversation's own message, even a
+    trivial "hi, how are you", wait in strict order behind it, confirmed
+    in practice. llama-server's own --parallel slots + continuous batching
+    interleave a short request into the next decode step across all active
+    slots instead of forcing it to wait for one long generation to finish
+    outright — see config.LLM_BACKEND's own comment for the honest caveat
+    that this improves fairness/interleaving on CPU-only hardware, not raw
+    throughput (no idle parallel matrix units to exploit the way a GPU
+    would give)."""
+    if _llm is None:
+        raise RuntimeError("Model is not loaded")
+
+    if config.LLM_BACKEND == "server":
+        content = _generate_server(prompt, max_tokens, temperature)
+    else:
+        content = _generate_embedded(prompt, max_tokens, temperature)
+
     # A model that emits an unclosed <think> (truncated by max_tokens before
     # it ever reached </think>) would otherwise have its ENTIRE answer
     # eaten by a greedy strip — only strip a properly closed block, and
     # leave an unclosed one as-is (a real but rare failure mode: the caller
     # gets a visibly weird answer that at least isn't silently empty,
     # rather than this function hiding the fact that generation ran out of
-    # budget mid-thought).
+    # budget mid-thought). Applies identically regardless of which backend
+    # produced content.
     if "<think>" in content and "</think>" in content:
         content = _THINK_BLOCK_RE.sub("", content).strip()
     return content

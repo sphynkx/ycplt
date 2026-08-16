@@ -1,0 +1,40 @@
+[Unit]
+Description=llama-server - concurrent LLM backend for ycplt (llama.cpp native server)
+After=network.target
+# Starts before ycplt itself so utils/llm.load_llm()'s own /health check
+# (config.LLM_BACKEND=="server") finds it already up rather than racing it.
+# Add the matching two lines below to ycplt.service's own [Unit] section if
+# you want systemd to enforce this ordering automatically:
+#   Requires=llama-server.service
+#   After=llama-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/ycplt/llama-server
+
+# No User= — this deployment runs as root, matching ycplt.service.
+
+# --threads-batch defaults to the SAME value as --threads if left unset
+# (llama.cpp's own CLI default) — NOT the full logical core count the
+# embedded backend used (config.N_THREADS_BATCH, see that setting's own
+# comment). Real, reported consequence: a plain "say something" test
+# message took several minutes end-to-end after switching to this
+# backend, most likely explained by prompt/prefix processing now running
+# on only --threads(4) cores instead of every core. $(nproc) restores the
+# same "every core for the parallelizable prefill phase, a deliberately
+# small number for token-generation itself" split this project already
+# established was measurably faster for the embedded backend — worth
+# re-confirming with a real repeated-request measurement on this specific
+# machine (see README's "Tuning CPU inference threads"), the same
+# discipline used for N_THREADS_BATCH itself, rather than assuming this
+# fixes it outright.
+ExecStart=/bin/bash -c '/var/www/ycplt/llama-server/llama-server \
+  --model /var/www/ycplt/models/Qwen3.5-9B-UD-Q4_K_XL.gguf \
+  --host 127.0.0.1 --port 4012 \
+  --parallel 3 --ctx-size 32768 \
+  --threads 4 --threads-batch $(nproc)'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -242,6 +242,114 @@ correctly, regardless of which chat happens to be open on screen by then
 guards against a reply ever being misapplied to whichever chat is open
 when it arrives).
 
+### Separate llama-server backend (optional, off by default)
+
+The FIFO queue above is safe and correct, but it's still strictly one
+request at a time, system-wide — real, reported consequence: a long
+generation for one conversation (an image-edit job's classifier calls, a
+long RAG-heavy astro answer, ...) makes every OTHER conversation's own
+message, even a trivial "hi, how are you", visibly wait its turn behind
+it, confirmed in practice with two chats open at once.
+
+`utils/config.LLM_BACKEND` ("embedded", the default, or "server") switches
+`utils/llm.py` between the original in-process `Llama` object above and a
+separately-running **llama-server** instance — the native C++ server
+binary from the `llama.cpp` project itself (`ggml-org/llama.cpp`'s
+`tools/server`), run as its own process on the SAME machine as this app.
+It supports real concurrent request handling via multiple "slots"
+(`--parallel`/`-np`) with continuous batching (`-cb`, on by default).
+
+**Important: this is NOT the same thing as `llama-cpp-python`'s own
+bundled `llama_cpp.server` module** (`python3 -m llama_cpp.server`) —
+checked directly against its source (`llama_cpp/server/app.py`): it wraps
+a single `Llama` object behind one `anyio.Lock`, functionally identical
+to this app's own `_FifoLock` above, just with a network hop added and no
+real concurrency gained. The native `llama-server` binary (built from
+`llama.cpp`'s own source, or a matching prebuilt release for your CPU) is
+what actually has parallel slots.
+
+**Honest expectation on CPU-only hardware:** continuous batching's usual
+GPU benefit is throughput, from bigger fused matrix multiplies filling
+otherwise-idle parallel compute — CPU has no equivalent idle capacity to
+exploit; the physical cores are already the bottleneck either way. The
+real, still-genuine benefit here is **fairness/interleaving, not raw
+throughput**: with N slots, a short classifier call arriving mid-generation
+gets folded into the *next* decode step across all active slots, instead
+of waiting for one long generation to finish outright — directly fixing
+the "hi, how are you gets stuck" problem above, at little to no cost to
+total tokens/sec.
+
+**Setup:**
+
+1. Build or download `llama-server` from
+   [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (matching
+   your CPU's instruction set — AVX2/AVX512/NEON, same consideration as
+   any llama.cpp build) — a separate binary from the `llama-cpp-python`
+   pip package already used elsewhere in this project, though it reads
+   the exact same GGUF model file.
+2. Run it against the same `MODEL_PATH` this app already uses, choosing a
+   `--parallel` slot count for your CPU's core count (a starting point:
+   2-3 slots on a modest machine, 3-4 with 12+ cores and RAM to spare —
+   more slots isn't free, each needs its own share of `--ctx-size` for the
+   KV cache):
+
+   ```bash
+   llama-server \
+     --model models/Qwen3.5-9B-UD-Q4_K_XL.gguf \
+     --host 127.0.0.1 --port 4012 \
+     --parallel 3 --ctx-size 32768 \
+     --threads 4 --threads-batch $(nproc)
+   ```
+
+   Port `4012`, not llama-server's own upstream default of `8080` — see
+   "Port allocation across the ycplt family" at the top of Installation &
+   Setup.
+
+   **`--threads-batch` matters, don't skip it.** llama.cpp's own CLI
+   default makes `--threads-batch` equal to `--threads` if left unset —
+   i.e. the same small thread count (4 above) used for token GENERATION
+   would also apply to PROMPT PROCESSING, unlike the embedded backend,
+   which already defaults `N_THREADS_BATCH` to the full logical core
+   count for exactly this reason (see that setting's own comment in
+   `utils/config.py`). Real, reported consequence of leaving this unset: a
+   trivial one-line test message took several minutes end-to-end after
+   switching to this backend — most likely this (prefix/prompt processing
+   for a history- and system-prompt-heavy request, now running on only 4
+   cores instead of every core), though not yet confirmed with a controlled
+   before/after measurement on that specific machine.
+
+   Put this behind its own systemd unit for the same reasons `app.py`
+   and `ycplt_img` already have one (survives reboots, restarts on
+   crash) — see `install/llama-server.service` for a ready-to-copy unit
+   (adjust `WorkingDirectory`/model path/flags to match your own layout).
+3. Set in `.env`:
+
+   ```bash
+   YCPLT_LLM_BACKEND=server
+   YCPLT_LLAMA_SERVER_HOST=127.0.0.1
+   YCPLT_LLAMA_SERVER_PORT=4012
+   ```
+
+   Note the `YCPLT_` prefix on all three — unlike every other setting in
+   `.env`. A real, reported mix-up: writing `LLM_BACKEND=server` (matching
+   the unprefixed style everything else uses) is silently ignored, with no
+   warning, and this app quietly keeps using the embedded backend. `.env.example`
+   now ships these three uncommented with `YCPLT_LLM_BACKEND=server` as the
+   suggested default — copy the names exactly, or comment the block out
+   entirely to fall back to embedded.
+4. Restart this app. `utils/llm.load_llm()` checks `llama-server`'s
+   `/health` endpoint at startup and fails fast with a clear error if it
+   isn't reachable, the same guarantee a missing `MODEL_PATH` file already
+   gives for the embedded backend.
+
+Revert at any time by setting `YCPLT_LLM_BACKEND=embedded` (or removing
+the line) and restarting — nothing else needs to change, matching the
+same off-by-default, single-flag-revert pattern already used for
+`ycplt_img`'s `RECONSTRUCT_ENABLED`/`KONTEXT_ENABLED`. Note that
+`install/.env.example` now ships with the server backend as the suggested
+default (matching this app's own real deployment) rather than embedded —
+comment that block out if you don't have llama-server running.
+
 ## Installation & Setup
 
 Everything needed to go from a fresh checkout to a running app, in order.
@@ -249,6 +357,35 @@ Steps 1-5 are required; 6-8 are each independently optional (astrology
 charts, PDF export, and RAG document search respectively) — skip any you
 don't need, and come back to a given one later any time without redoing the
 others.
+
+### Port allocation across the ycplt family
+
+Read this before configuring anything below — it's the one thing that's
+easy to get wrong once more than one of these services is running.
+
+| Service | Default port | Runs where | Set via |
+|---|---|---|---|
+| `ycplt` (this app) | `4010` | — | `PORT` |
+| `ycplt_img` (image generation/editing) | `4011` | separate machine | `IMAGE_SERVICE_PORT` (on ycplt_img's own side), `IMAGE_SERVICE_HOST`/`IMAGE_SERVICE_PORT` (here, pointing at it) |
+| `llama-server` (optional concurrent-LLM backend) | `4012` | SAME machine as `ycplt` | `--port` on its own command line, `YCPLT_LLAMA_SERVER_PORT` (here, pointing at it) |
+
+Convention: every service in this family gets its own port starting at
+`4010`, one each, rather than reusing `8080`/`5000`/other common defaults
+that are more likely to collide with something else already running on
+the same box. `llama-server`'s own upstream default (`8080`) is
+deliberately NOT used here for that reason — if you add another service
+to this family later, give it `4013`, and so on.
+
+**A real, reported gotcha this exact numbering ran into**: after changing
+`YCPLT_LLM_BACKEND`/`YCPLT_LLAMA_SERVER_PORT` in `.env` and starting
+`llama-server` on the new port, `ycplt` itself kept behaving as if
+nothing had changed — both were configured correctly, but `ycplt`'s
+already-running process was still holding whatever config it read at ITS
+OWN last startup (`utils/config.py` reads every `YCPLT_*` environment
+variable exactly once, at import time — see that file's own module
+docstring). **Restarting `llama-server` alone is not enough — `ycplt`
+itself must ALSO be stopped and restarted** any time `.env` changes,
+including just for this backend toggle.
 
 ### 1. System packages and Python environment
 
