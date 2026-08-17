@@ -39,6 +39,33 @@ CREATE TABLE IF NOT EXISTS files (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS birth_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    date TEXT NOT NULL,              -- 'YYYY-MM-DD' — same shape utils/astro.py's
+                                      -- _build_subject() expects in fields["date"]
+    time TEXT NOT NULL DEFAULT '12:00',  -- 'HH:MM' (seconds are accepted on .zbs
+                                      -- import but not kept — see utils/astrozet.py)
+    utc_offset TEXT,                 -- raw offset exactly as given in the .zbs file
+                                      -- (e.g. '+4', '-3:30') — kept verbatim only so a
+                                      -- re-exported .zbs round-trips faithfully; NOT
+                                      -- used to resolve a timezone for the astro engine
+                                      -- (that's astro._resolve_timezone(lat, lon), an
+                                      -- offline lookup from coordinates, independent of
+                                      -- whatever offset the source program recorded)
+    place TEXT,                      -- free-text place string (.zbs Place field)
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    sex TEXT,                        -- 'M' / 'F' / '' — stored as-is, no validation
+    comment TEXT,                    -- plain text, real newline characters internally
+                                      -- (the .zbs pipe-delimited newline convention is
+                                      -- only a wire format — see utils/astrozet.py)
+    photo_path TEXT,                 -- relative path from a 'PHOTO: ...' comment
+                                      -- segment, if the source record had one
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_files_message ON files(message_id);
 """

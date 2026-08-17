@@ -41,7 +41,7 @@ def is_image_request(query: str) -> bool:
     if llm_utils.get_llm() is None:
         return False
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _CLASSIFIER_PROMPT.format(query=query),
             max_tokens=5,
             temperature=0.0,
@@ -101,7 +101,7 @@ def is_edit_instruction(query: str) -> bool:
     if llm_utils.get_llm() is None:
         return False
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _EDIT_VS_QUESTION_PROMPT.format(query=query),
             max_tokens=6,
             temperature=0.0,
@@ -163,7 +163,7 @@ def get_removal_target(query: str) -> Optional[str]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _REMOVAL_TARGET_PROMPT.format(query=query),
             max_tokens=10,
             temperature=0.0,
@@ -230,7 +230,7 @@ def get_reconstruction_prompt(query: str, target: str) -> Optional[str]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _RECONSTRUCTION_PROMPT.format(target=target, query=query),
             max_tokens=60,
             temperature=0.0,
@@ -314,7 +314,7 @@ def get_english_edit_instruction(query: str) -> str:
     if llm_utils.get_llm() is None:
         return query
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _ENGLISH_EDIT_PROMPT.format(query=query),
             max_tokens=300,
             temperature=0.0,
@@ -405,7 +405,7 @@ def split_two_person_text(query: str) -> Optional[Tuple[str, str]]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _TWO_PERSON_SPLIT_PROMPT.format(query=query),
             max_tokens=400,
             temperature=0.0,

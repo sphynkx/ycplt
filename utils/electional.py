@@ -388,7 +388,7 @@ def _classify_category_llm(purpose_text: str) -> Optional[str]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _CATEGORY_PROMPT.format(text=purpose_text), max_tokens=15, temperature=0.0,
         )
     except Exception:
@@ -460,7 +460,7 @@ def _extract_electional_fields_llm(round_text: str, require_date_time: bool = Tr
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _FIELD_EXTRACTION_PROMPT.format(text=round_text), max_tokens=200, temperature=0.0,
         )
     except Exception:
@@ -549,7 +549,7 @@ def _extract_querent_natal_fields_llm(history_text: str) -> Optional[Dict[str, s
     if llm_utils.get_llm() is None or not history_text.strip():
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _QUERENT_NATAL_PROMPT.format(text=history_text), max_tokens=100, temperature=0.0,
         )
     except Exception:
@@ -687,7 +687,7 @@ def _classify_new_electional_round(message: str) -> Optional[bool]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _NEW_ROUND_PROMPT.format(message=message), max_tokens=10, temperature=0.0,
         )
     except Exception:
@@ -785,7 +785,7 @@ def _classify_request_mode(text: str) -> str:
     if llm_utils.get_llm() is None:
         return "single"
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _MODE_PROMPT.format(text=text), max_tokens=10, temperature=0.0,
         )
     except Exception:
@@ -1147,7 +1147,7 @@ def _extract_window_days_llm(text: str, anchor_date: str) -> Optional[int]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _WINDOW_PROMPT.format(text=text), max_tokens=30, temperature=0.0,
         )
     except Exception:

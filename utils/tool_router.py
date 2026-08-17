@@ -159,7 +159,7 @@ def classify(query: str, history_context: str = "") -> ToolDecision:
         # per-token cost on a local model, only the fixed latency of
         # generating more tokens, which is worth it here to not silently
         # corrupt or drop the tool argument.
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _build_prompt(query, history_context), max_tokens=120, temperature=0.0,
         )
     except Exception as e:

@@ -345,6 +345,121 @@ def _generate_server(prompt: str, max_tokens: Optional[int], temperature: float)
     return content
 
 
+def _generate_remote_openai(prompt: str, max_tokens: Optional[int], temperature: float) -> str:
+    """Posts to OpenAI's own /v1/chat/completions — config.REMOTE_LLM_PROVIDER
+    == "openai". Same stdlib-urllib-only convention as _generate_server/
+    utils/image_client.py — a tiny, occasional HTTP client isn't worth a
+    new dependency (the official openai package) for one call shape.
+
+    Raises on ANY problem (missing key, network error, bad HTTP status,
+    malformed response) rather than trying to recover here — generate_sync
+    below is the one place that decides what "remote failed" means (an
+    unconditional, logged fallback to whatever local backend is already
+    configured), so this function's only job is "try the remote call
+    once, correctly, or raise"."""
+    if not config.REMOTE_LLM_API_KEY:
+        raise RuntimeError("REMOTE_LLM_PROVIDER=openai but REMOTE_LLM_API_KEY is not set")
+
+    body = {
+        "model": config.REMOTE_LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.REMOTE_LLM_API_KEY}",
+        },
+    )
+    # <= 0 disables the timeout entirely — see config.REMOTE_LLM_TIMEOUT_SEC's
+    # own comment for why the default is "wait indefinitely", same as the
+    # llama-server backend's own timeout setting.
+    timeout = config.REMOTE_LLM_TIMEOUT_SEC if config.REMOTE_LLM_TIMEOUT_SEC > 0 else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"OpenAI API returned HTTP {e.code}: {e.read().decode('utf-8', errors='replace')}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"OpenAI API unreachable: {e}") from e
+
+    return payload["choices"][0]["message"]["content"] or ""
+
+
+# Anthropic's Messages API has no server-side default for max_tokens (it's a
+# required field, unlike OpenAI's optional one) — this app's own callers
+# routinely pass max_tokens=None to mean "no artificial cap" (see
+# generate_sync's own docstring), so _generate_remote_claude needs its own
+# finite fallback rather than omitting the field. 4096 is generous for this
+# app's actual long-form answers (per-planet interpretation sections) while
+# still being a real, finite number Anthropic's API will accept.
+_CLAUDE_DEFAULT_MAX_TOKENS = 4096
+
+
+def _generate_remote_claude(prompt: str, max_tokens: Optional[int], temperature: float) -> str:
+    """Posts to Anthropic's own Messages API — config.REMOTE_LLM_PROVIDER ==
+    "claude". Same stdlib-urllib-only convention as _generate_remote_openai/
+    _generate_server, but a genuinely different request/response shape than
+    OpenAI's: auth is an x-api-key header (not "Authorization: Bearer ..."),
+    a required anthropic-version header, "system" is its own top-level
+    field rather than a message with role="system" (not used here — this
+    app's own prompts already fold any system-style instructions into the
+    single user-turn prompt string, same as the OpenAI path), max_tokens is
+    REQUIRED (see _CLAUDE_DEFAULT_MAX_TOKENS above), and the reply comes
+    back as a list of content blocks rather than a single message string.
+
+    Raises on ANY problem — same contract as _generate_remote_openai;
+    generate_sync is the only place that decides what "remote failed"
+    means (unconditional, logged fallback to the local backend)."""
+    if not config.REMOTE_LLM_API_KEY:
+        raise RuntimeError("REMOTE_LLM_PROVIDER=claude but REMOTE_LLM_API_KEY is not set")
+
+    body = {
+        "model": config.REMOTE_LLM_MODEL,
+        "max_tokens": max_tokens if max_tokens is not None else _CLAUDE_DEFAULT_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": config.REMOTE_LLM_API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    timeout = config.REMOTE_LLM_TIMEOUT_SEC if config.REMOTE_LLM_TIMEOUT_SEC > 0 else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"Claude API returned HTTP {e.code}: {e.read().decode('utf-8', errors='replace')}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Claude API unreachable: {e}") from e
+
+    # content is a list of blocks (e.g. [{"type": "text", "text": "..."}]);
+    # this app only ever sends plain-text prompts with no tool use, so
+    # concatenating every text block's own text covers the real response
+    # shape without assuming there's always exactly one block.
+    blocks = payload.get("content") or []
+    return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+
+
 def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
     """Runs one generation. max_tokens=None (the default) means "no artificial
     cap" — the model then generates until it emits a stop token or the
@@ -391,10 +506,37 @@ def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: fl
     if _llm is None:
         raise RuntimeError("Model is not loaded")
 
-    if config.LLM_BACKEND == "server":
-        content = _generate_server(prompt, max_tokens, temperature)
-    else:
-        content = _generate_embedded(prompt, max_tokens, temperature)
+    content: Optional[str] = None
+    if config.REMOTE_LLM_PROVIDER == "openai":
+        # Tried FIRST, unconditionally, whenever configured — but never
+        # allowed to fail the caller's request: any problem here (missing/
+        # invalid key, network error, rate limit, malformed response) is
+        # logged and this call transparently proceeds to the local backend
+        # below instead, exactly like ROUTER_MODEL_PATH's own "off/broken
+        # = fall back, never crash" behavior. Deliberately does NOT apply
+        # to classify_sync (see that function's own docstring) — only the
+        # actual long-form chat reply goes through here, since that's the
+        # real, reported pain point (18-49+ minutes locally), while
+        # classifier calls are already fast and free on local hardware.
+        try:
+            content = _generate_remote_openai(prompt, max_tokens, temperature)
+        except Exception as e:
+            print(f"[llm] REMOTE_LLM_PROVIDER=openai call failed ({e}) — falling back to the local model for this generation.")
+            content = None
+    elif config.REMOTE_LLM_PROVIDER == "claude":
+        # Same unconditional-try / logged-fallback contract as the openai
+        # branch above — see that branch's own comment.
+        try:
+            content = _generate_remote_claude(prompt, max_tokens, temperature)
+        except Exception as e:
+            print(f"[llm] REMOTE_LLM_PROVIDER=claude call failed ({e}) — falling back to the local model for this generation.")
+            content = None
+
+    if content is None:
+        if config.LLM_BACKEND == "server":
+            content = _generate_server(prompt, max_tokens, temperature)
+        else:
+            content = _generate_embedded(prompt, max_tokens, temperature)
 
     # A model that emits an unclosed <think> (truncated by max_tokens before
     # it ever reached </think>) would otherwise have its ENTIRE answer
@@ -412,3 +554,131 @@ def generate_sync(prompt: str, max_tokens: Optional[int] = None, temperature: fl
 async def generate_async(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.7) -> str:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, generate_sync, prompt, max_tokens, temperature)
+
+
+# ---------- Optional tiny router/classifier model ----------
+# Real, reported problem this exists to fix: this app makes MANY short,
+# tight-max_tokens, temperature=0.0 classifier calls per user message —
+# utils/tool_router.py's own tool-selection call, utils/intent.py's
+# several image-intent/removal-target/reconstruction/translation
+# classifiers, and similar field-extraction/mode-detection calls inside
+# utils/horary.py, utils/electional.py, utils/astro.py,
+# utils/chart_draw.py, utils/rectification_events.py. Every one of these
+# previously rode on the SAME big chat model (e.g. Qwen3.5-9B) as the
+# actual long-form answer, even though none of them need that model's
+# writing quality — they only ever need to output one short, structured
+# decision. Confirmed in practice: this router overhead is clearly
+# visible and adds real, avoidable latency to every single message,
+# independent of everything else fixed elsewhere in this file.
+#
+# config.ROUTER_MODEL_PATH (empty by default = disabled) points at a
+# SEPARATE, always-embedded, deliberately tiny model (think 0.5B-1.5B
+# parameters, even an aggressive Q1/Q2 quant — classification doesn't
+# need writing quality, just enough language understanding to follow a
+# short instruction) loaded independently of config.LLM_BACKEND/
+# MODEL_PATH. Always embedded via llama-cpp-python directly, regardless
+# of whether the main model is "embedded" or "server", because a model
+# this small gains nothing from llama-server's concurrency machinery
+# (it's already close to instant) — keeping it dead simple avoids
+# re-implementing this module's whole dual-backend complexity for a
+# component whose entire point is being fast and lightweight.
+#
+# classify_sync/classify_async are a SEPARATE pair of functions, not a
+# flag on generate_sync/generate_async, specifically so every call site
+# opts in explicitly. A call site that forgets and keeps calling
+# generate_sync for a classification prompt just keeps using the main
+# model — identical to today's behavior, safe, not silently wrong.
+_router_llm = None
+_router_lock = _FifoLock()
+
+
+def load_router_llm():
+    """Loads config.ROUTER_MODEL_PATH if set. Unlike load_llm() for the
+    main model, failure here is NON-FATAL by design: the router model is
+    a pure optimization, not a hard requirement — classify_sync already
+    falls back to the main model (via generate_sync) whenever
+    _router_llm is None, so a missing/bad router model file should
+    degrade gracefully to today's behavior, not crash startup the way a
+    missing main MODEL_PATH does for the mandatory model."""
+    global _router_llm
+
+    if not config.ROUTER_MODEL_PATH:
+        # Deliberately printed even in the "off" case — a real, reported
+        # mix-up during testing: with no startup line either way, there
+        # was no way to tell from the console whether ROUTER_MODEL_PATH
+        # had actually taken effect or was silently still empty (e.g. set
+        # in install/.env.example, a template file this app never reads,
+        # instead of the real .env — the same class of mistake as the
+        # earlier YCPLT_LLM_BACKEND prefix mix-up, see README's "Separate
+        # llama-server backend" section).
+        print("[llm] ROUTER_MODEL_PATH not set — classifier calls use the main model (this is the default).")
+        return None
+
+    from llama_cpp import Llama
+
+    if not os.path.exists(config.ROUTER_MODEL_PATH):
+        print(
+            f"[llm] ROUTER_MODEL_PATH is set but not found: {config.ROUTER_MODEL_PATH} "
+            f"— classifier calls will fall back to the main model."
+        )
+        return None
+
+    try:
+        _router_llm = Llama(
+            model_path=config.ROUTER_MODEL_PATH,
+            n_ctx=config.ROUTER_N_CTX,
+            n_threads=config.ROUTER_N_THREADS,
+            n_gpu_layers=config.N_GPU_LAYERS,
+            verbose=False,
+        )
+    except Exception as e:
+        print(f"[llm] failed to load router model ({e}) — classifier calls will fall back to the main model.")
+        _router_llm = None
+        return None
+
+    print(f"Router model loaded successfully ({config.ROUTER_MODEL_PATH}).")
+    return _router_llm
+
+
+def close_router_llm() -> None:
+    """Mirrors close_llm() for the router model — same Python 3.14 /
+    llama-cpp-python shutdown-ordering fix, same reasoning, called from
+    app.py's own lifespan shutdown phase alongside close_llm()."""
+    global _router_llm
+    if _router_llm is not None:
+        try:
+            _router_llm.close()
+        except Exception as e:
+            print(f"[llm] error while closing router model: {e}")
+    _router_llm = None
+
+
+def classify_sync(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.0) -> str:
+    """Same contract as generate_sync, for short classification/
+    extraction calls specifically (tool routing, intent detection, field
+    extraction, mode detection, ...) — see this module's own "Optional
+    tiny router/classifier model" comment above for the full rationale.
+    Falls back to generate_sync (the main model) whenever no router
+    model is loaded, so every existing caller stays correct with zero
+    configuration required. temperature defaults to 0.0 here (vs 0.7 for
+    generate_sync) since every current classifier call site already
+    wants deterministic output anyway."""
+    if _router_llm is None:
+        return generate_sync(prompt, max_tokens, temperature)
+
+    with _router_lock:
+        out = _router_llm.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            repeat_penalty=config.REPEAT_PENALTY,
+        )
+    content = out["choices"][0]["message"]["content"]
+    if "<think>" in content and "</think>" in content:
+        content = _THINK_BLOCK_RE.sub("", content).strip()
+    return content
+
+
+async def classify_async(prompt: str, max_tokens: Optional[int] = None, temperature: float = 0.0) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, classify_sync, prompt, max_tokens, temperature)

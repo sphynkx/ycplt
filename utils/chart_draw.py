@@ -82,7 +82,7 @@ def should_draw_chart(user_text: str) -> bool:
     if llm_utils.get_llm() is None:
         return True
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _SHOULD_DRAW_PROMPT.format(text=user_text), max_tokens=10, temperature=0.0,
         )
     except Exception:

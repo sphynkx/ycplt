@@ -43,6 +43,7 @@ from pydantic import BaseModel
 
 from db import repository
 from utils import astro
+from utils import astrozet
 from utils import chart_draw
 from utils import config
 from utils import electional
@@ -95,6 +96,15 @@ class ChatRequest(BaseModel):
     image_mime_type: Optional[str] = "image/png"
     # img2img strength override (0..1). None = DEFAULT_EDIT_STRENGTH.
     strength: Optional[float] = None
+
+    # Optional AstroZet .zbs file attachment — see utils/astrozet.py's
+    # "using an uploaded .zbs file" section for the full design. zbs_data
+    # is the raw file TEXT (not base64 — .zbs is already plain text, read
+    # client-side via FileReader.readAsText()), used as an additional
+    # source of birth-data/event fields alongside req.query, without
+    # replacing or editing the user's own typed message.
+    zbs_data: Optional[str] = None
+    zbs_filename: Optional[str] = "profiles.zbs"
 
 
 def _auto_title(text: str, limit: int = 40) -> str:
@@ -212,14 +222,23 @@ def _extraction_history_context(prior_texts: List[str]) -> str:
 
 
 async def _classify_tool_with_retry(
-    req: ChatRequest, prior_messages: List[Dict]
+    req: ChatRequest, prior_messages: List[Dict], zbs_context_text: str = ""
 ) -> tool_router.ToolDecision:
     """The router's normal (non-forced) classification path — extracted
     out of chat() unchanged so req.force_help (see ChatRequest and chat()
     below) can skip straight past it instead of needing to be threaded
-    through every line of it as an extra condition."""
+    through every line of it as an extra condition.
+
+    zbs_context_text (see utils/astrozet.zbs_profiles_to_spec_text): the
+    structured field/event text derived from an attached .zbs file, if
+    any. Folded into the SAME text the router classifies on (not just
+    into tool_arg downstream) so the router itself can see there's real
+    birth data/events behind the message even when the user's own typed
+    words are as short as "сделай ректификацию" with no birth data typed
+    out at all."""
+    router_query = req.query + (f"\n{zbs_context_text}" if zbs_context_text else "")
     tool_decision = await tool_router.classify_async(
-        req.query, _classifier_history_context(prior_messages)
+        router_query, _classifier_history_context(prior_messages)
     )
     # Deliberately unconditional (not just when a tool fires): "the router
     # decided no tool was needed" is exactly as important to see in the
@@ -253,7 +272,7 @@ async def _classify_tool_with_retry(
         # back to the same "no tool" outcome it would already have gotten
         # without this retry, since dropping history can't manufacture a
         # signal for a tool that isn't in the message on its own.
-        retry_decision = await tool_router.classify_async(req.query, "")
+        retry_decision = await tool_router.classify_async(router_query, "")
         print(
             f"[tool_router] retry without history: tool={retry_decision.tool_name!r} "
             f"arg={retry_decision.tool_arg!r} raw={retry_decision.raw_answer!r}"
@@ -319,6 +338,37 @@ async def chat(req: ChatRequest):
             image_bytes,
         )
 
+    # Optional AstroZet .zbs attachment (see ChatRequest.zbs_data and
+    # utils/astrozet.py's "using an uploaded .zbs file" section). Stored as
+    # a plain-text file attachment on this message (same visibility as an
+    # attached image, just downloadable text instead of inline), and
+    # converted into zbs_context_text — additional field/event text folded
+    # into tool_router's classification and tool_arg construction below,
+    # alongside req.query, WITHOUT altering req.query itself (which stays
+    # exactly what the user typed, for chat history/DB storage).
+    zbs_context_text = ""
+    if req.zbs_data:
+        profiles, parse_errors = astrozet.parse_zbs(req.zbs_data)
+        repository.add_file(
+            user_msg_id,
+            req.zbs_filename or "profiles.zbs",
+            "text/plain",
+            req.zbs_data.encode("utf-8"),
+        )
+        if parse_errors:
+            print(
+                f"[chat] .zbs attachment: {len(profiles)} profile(s) parsed, "
+                f"{len(parse_errors)} line(s) failed: "
+                f"{[(e.line_number, e.reason) for e in parse_errors]}"
+            )
+        if profiles:
+            zbs_context_text = astrozet.zbs_profiles_to_spec_text(profiles)
+            print(
+                f"[chat] .zbs attachment: {len(profiles)} profile(s) — "
+                f"subject={profiles[0].get('name')!r}, "
+                f"{len(profiles) - 1} additional record(s) (event(s)/second person)"
+            )
+
     if image_bytes is not None:
         if await intent.is_edit_instruction_async(req.query):
             return await _handle_image_edit_request(conversation_id, req, image_bytes, sent_at)
@@ -350,7 +400,7 @@ async def chat(req: ChatRequest):
         )
         print(f"[tool_router] forced by help-mode toggle: tool={tool_decision.tool_name!r}")
     else:
-        tool_decision = await _classify_tool_with_retry(req, prior_messages)
+        tool_decision = await _classify_tool_with_retry(req, prior_messages, zbs_context_text)
 
     if tool_decision.tool_name:
         prior_user_texts = _prior_user_texts(conversation_id, exclude_message_id=user_msg_id)
@@ -361,6 +411,7 @@ async def chat(req: ChatRequest):
             tool_decision,
             _extraction_history_context(prior_user_texts),
             prior_user_texts,
+            zbs_context_text=zbs_context_text,
         )
 
     return await _handle_chat_request(conversation_id, req, sent_at, prior_messages)
@@ -937,6 +988,7 @@ async def _handle_tool_request(
     decision: tool_router.ToolDecision,
     history_context: str = "",
     prior_user_texts: Optional[List[str]] = None,
+    zbs_context_text: str = "",
 ) -> dict:
     """Runs the tool utils/tool_router.py picked, then does one more LLM
     call that turns the raw tool result into a natural-language answer to
@@ -971,7 +1023,18 @@ async def _handle_tool_request(
         # info — the current message, the router's (possibly incomplete)
         # quote, and any earlier-conversation context — concatenated. A
         # field missing from one source is simply found in another.
-        tool_arg = "\n".join(filter(None, [req.query, decision.tool_arg, history_context]))
+        #
+        # zbs_context_text (utils/astrozet.zbs_profiles_to_spec_text, see
+        # ChatRequest.zbs_data) is folded in the SAME way — one more
+        # candidate source handed to the exact same extraction machinery,
+        # not a special case. For astro_rectification_events specifically,
+        # this is what supplies both the subject's birth data AND the
+        # semicolon-formatted event lines
+        # (rectification_events._extract_events_and_birth_text picks the
+        # event lines out of this same tool_arg text).
+        tool_arg = "\n".join(
+            filter(None, [req.query, zbs_context_text, decision.tool_arg, history_context])
+        )
     else:
         tool_arg = decision.tool_arg
 

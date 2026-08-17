@@ -462,7 +462,7 @@ def _classify_new_horary_round(message: str) -> Optional[bool]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _NEW_ROUND_PROMPT.format(message=message), max_tokens=10, temperature=0.0,
         )
     except Exception:
@@ -587,7 +587,7 @@ def _extract_horary_fields_llm(round_text: str) -> Optional[Dict[str, str]]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _FIELD_EXTRACTION_PROMPT.format(text=round_text), max_tokens=200, temperature=0.0,
         )
     except Exception:
@@ -659,7 +659,7 @@ def _classify_derived_chain_llm(question_text: str) -> Optional[List[int]]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _DERIVED_HOUSE_PROMPT.format(question=question_text),
             max_tokens=40,
             temperature=0.0,

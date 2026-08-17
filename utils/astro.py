@@ -1109,7 +1109,7 @@ def _extract_fields_llm(text: str) -> Optional[Dict[str, str]]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _FIELD_EXTRACTION_PROMPT.format(text=text), max_tokens=120, temperature=0.0,
         )
     except Exception:

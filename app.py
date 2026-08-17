@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 import asyncio
 
 from db.connection import init_db
-from routes import chat, conversations, export, files, pages
+from routes import chat, conversations, export, files, pages, profiles
 from utils import astro
 from utils import config
 from utils import image_jobs
@@ -36,9 +36,17 @@ from utils import rag as rag_utils
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ---------- startup ----------
+    config.log_effective_config()  # prints actual effective values of the
+                                    # settings most prone to silent typo/
+                                    # wrong-file mix-ups (see its own
+                                    # docstring) — always the very first
+                                    # thing in the console on every restart
     init_db()               # creates DB tables if they don't exist yet
     rag_utils.load_rag()    # optional: not fatal if no index is present
     llm_utils.load_llm()    # required: startup fails if this raises
+    llm_utils.load_router_llm()  # optional: no-op unless config.ROUTER_MODEL_PATH is
+                                  # set, and non-fatal even if it is but fails to load
+                                  # (see that function's own docstring)
 
     # Optional: not fatal if kerykeion/timezonefinder/geonamescache aren't
     # installed. Runs in a worker thread (not awaited synchronously here)
@@ -66,6 +74,7 @@ async def lifespan(app: FastAPI):
     # is still gracefully shutting down (not yet at interpreter teardown),
     # avoids that ordering problem.
     llm_utils.close_llm()
+    llm_utils.close_router_llm()
 
 
 app = FastAPI(title="ycplt", lifespan=lifespan)
@@ -75,6 +84,7 @@ app.include_router(chat.router)
 app.include_router(conversations.router)
 app.include_router(files.router)
 app.include_router(export.router)
+app.include_router(profiles.router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 

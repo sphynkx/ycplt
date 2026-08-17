@@ -184,7 +184,7 @@ def _classify_event_houses_llm(description: str) -> Optional[List[int]]:
     if llm_utils.get_llm() is None:
         return None
     try:
-        answer = llm_utils.generate_sync(
+        answer = llm_utils.classify_sync(
             _EVENT_HOUSE_PROMPT.format(description=description),
             max_tokens=40,
             temperature=0.0,

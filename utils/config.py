@@ -110,6 +110,49 @@ N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "0"))  # no usable GPU acceler
 # answers start reading as unnaturally avoidant of repeating chart terms.
 REPEAT_PENALTY = float(os.environ.get("REPEAT_PENALTY", "1.15"))
 
+# ---------- Optional tiny router/classifier model ----------
+# Empty by default = disabled: every classifier call (utils/tool_router.py,
+# utils/intent.py's several classifiers, and similar field-extraction/
+# mode-detection calls in utils/horary.py, utils/electional.py,
+# utils/astro.py, utils/chart_draw.py, utils/rectification_events.py) then
+# falls back to the main chat model (see utils/llm.classify_sync's own
+# docstring), i.e. today's existing behavior, unchanged.
+#
+# Real, reported problem this exists to fix: this app makes MANY short,
+# temperature=0.0, tight-max_tokens classifier calls per user message, and
+# every one of them previously rode on the SAME big model (e.g.
+# Qwen3.5-9B) as the actual long-form answer — visibly adding latency to
+# every single message even though none of these calls need that model's
+# writing quality, just enough language understanding to output one short,
+# structured decision. Point this at a deliberately tiny instruction model
+# (0.5B-1.5B parameters — a heavily quantized one, even Q2/Q1, is fine;
+# classification doesn't need writing quality) — see README's "Tiny router
+# model" section for a concrete recommendation and download link.
+#
+# Always loaded embedded (llama-cpp-python directly), regardless of
+# LLM_BACKEND above — a model this small gains nothing from llama-server's
+# concurrency machinery (it's already close to instant), so it isn't
+# worth this module's dual-backend complexity for a component whose whole
+# point is being fast and lightweight.
+ROUTER_MODEL_PATH = os.environ.get("YCPLT_ROUTER_MODEL_PATH", "").strip()
+# A few classifier calls (tool_router's own tool-selection call in
+# particular) include real conversation history and can reach several
+# thousand tokens in practice — keep enough headroom that switching to a
+# tiny model doesn't just trade one context-overflow bug for another (see
+# README's own "Context-size overflow" story for llama-server, a related
+# but distinct bug). Deliberately smaller than the main model's N_CTX
+# (32768) since classifier prompts are still far shorter than a full
+# RAG-heavy final answer.
+ROUTER_N_CTX = int(os.environ.get("YCPLT_ROUTER_N_CTX", "8192"))
+# Full logical core count by default, unlike the main model's N_THREADS
+# (deliberately low at 4 — see that setting's own comment on being
+# memory-bandwidth-bound). A model this small is more likely to fit in
+# cache and actually benefit from more threads rather than fight over
+# memory bandwidth, but this is a reasonable starting guess, not something
+# measured yet on real hardware — re-test once a real router model is in
+# place, the same discipline already applied to N_THREADS/N_THREADS_BATCH.
+ROUTER_N_THREADS = int(os.environ.get("YCPLT_ROUTER_N_THREADS", str(os.cpu_count() or 4)))
+
 # ---------- LLM backend: embedded (default) vs a separately hosted llama-server ----------
 #
 # "embedded" (default): the ORIGINAL behavior — utils/llm.py loads a single
@@ -180,6 +223,51 @@ LLAMA_SERVER_URL = f"http://{LLAMA_SERVER_HOST}:{LLAMA_SERVER_PORT}"
 # stuck request) and are fine with heavy techniques being cut off before
 # they finish.
 LLAMA_SERVER_TIMEOUT_SEC = int(os.environ.get("YCPLT_LLAMA_SERVER_TIMEOUT_SEC", "0"))
+
+# ---------- Remote LLM provider (optional, off by default) ----------
+# Off by default (empty) — every generate_sync/generate_async call (the
+# actual long-form chat reply — NOT the classifier calls covered by
+# ROUTER_MODEL_PATH above, which deliberately stay local regardless of
+# this setting: they're already fast/free, and this app's real pain point
+# is the MAIN answer's speed on local CPU hardware — a full RAG-heavy
+# technique like a natal chart or rectification can take 18-49+ minutes
+# at ~3-4 tok/s) is instead sent to an external cloud API first, with an
+# UNCONDITIONAL, automatic fallback to whatever local backend
+# (LLM_BACKEND above) is already configured on ANY failure — network
+# error, missing/invalid key, rate limit, malformed response — logged as
+# a warning, never raised to the caller. Mirrors ROUTER_MODEL_PATH's own
+# "off/broken = transparently fall back, never crash" philosophy.
+#
+# Values: "" (default, local only), "openai" (OpenAI's own
+# /v1/chat/completions API — see utils/llm.py's _generate_remote_openai),
+# or "claude" (Anthropic's own Messages API — a genuinely different
+# request/response shape from OpenAI's: content as blocks, a separate
+# top-level "system" field, x-api-key/anthropic-version headers instead of
+# a bearer token, and max_tokens is REQUIRED rather than optional — see
+# utils/llm.py's _generate_remote_claude). REMOTE_LLM_PROVIDER is named
+# generically (not e.g. USE_OPENAI) specifically so this is just one more
+# accepted value here, not a second, differently-named setting.
+REMOTE_LLM_PROVIDER = os.environ.get("REMOTE_LLM_PROVIDER", "").strip().lower()
+# Required whenever REMOTE_LLM_PROVIDER is set; ignored otherwise.
+REMOTE_LLM_API_KEY = os.environ.get("REMOTE_LLM_API_KEY", "").strip()
+# Provider-specific model name. If REMOTE_LLM_MODEL isn't set explicitly,
+# the default depends on which provider is selected: gpt-4o-mini for
+# OpenAI, claude-haiku-4-5 for Claude — in both cases the provider's own
+# fastest/cheapest current model, a reasonable default for this app's
+# actual need (a capable enough writer for astrology interpretation text,
+# not the single most powerful model available), and a free/rate-limited
+# key is far more likely to hold up against it than against a larger,
+# pricier model.
+_REMOTE_LLM_DEFAULT_MODEL = {
+    "openai": "gpt-4o-mini",
+    "claude": "claude-haiku-4-5",
+}.get(REMOTE_LLM_PROVIDER, "gpt-4o-mini")
+REMOTE_LLM_MODEL = os.environ.get("REMOTE_LLM_MODEL", "").strip() or _REMOTE_LLM_DEFAULT_MODEL
+# <= 0 disables the timeout (waits indefinitely) — same reasoning as
+# LLAMA_SERVER_TIMEOUT_SEC's own comment: this covers a real generation,
+# not just a liveness probe, so a short fixed timeout would fight this
+# app's own "no artificial cap" policy elsewhere.
+REMOTE_LLM_TIMEOUT_SEC = int(os.environ.get("REMOTE_LLM_TIMEOUT_SEC", "0"))
 
 # ---------- Chat history (conversations, messages, file attachments — see db/) ----------
 DB_PATH = _resolve_path("DB_PATH", "data/chat.sqlite3")
@@ -314,3 +402,43 @@ IMAGE_HTTP_TIMEOUT_SEC = int(os.environ.get("IMAGE_HTTP_TIMEOUT_SEC", "10"))    
 # hosts the chat LLM. Image understanding (mode="caption") is a graphics-
 # service capability, submitted as a job to ycplt_img like generation/
 # editing; see utils/image_client.py and routes/chat.py._handle_image_question.
+
+
+def log_effective_config() -> None:
+    """Prints a short summary of the settings most likely to silently
+    misconfigure — every one of these has, in real use, either used the
+    YCPLT_ prefix inconsistently (LLM_BACKEND/LLAMA_SERVER_*/ROUTER_*, see
+    their own comments above) or been edited in install/.env.example
+    instead of the real .env this app actually reads. os.environ.get()
+    has no way to warn about a typo'd or misplaced variable name on its
+    own — a wrong name just silently returns the hardcoded default, with
+    zero error — so this exists purely to make the ACTUAL effective value
+    of each one impossible to miss at startup, every single restart,
+    instead of having to guess or grep .env by hand. Called first thing
+    in app.py's lifespan, before anything else initializes."""
+    lines = ["=" * 60, "ycplt: effective configuration", "=" * 60]
+    lines.append(f"HOST:PORT            = {HOST}:{PORT}")
+    lines.append(f"MODEL_PATH           = {MODEL_PATH}")
+    lines.append(f"N_CTX / N_THREADS    = {N_CTX} / {N_THREADS} (batch threads: {N_THREADS_BATCH})")
+    lines.append(f"LLM_BACKEND          = {LLM_BACKEND!r}"
+                 + (" (main model in-process)" if LLM_BACKEND != "server" else ""))
+    if LLM_BACKEND == "server":
+        lines.append(f"  LLAMA_SERVER_URL   = {LLAMA_SERVER_URL}")
+        lines.append(f"  LLAMA_SERVER_TIMEOUT_SEC = {LLAMA_SERVER_TIMEOUT_SEC} (0 = disabled)")
+    if ROUTER_MODEL_PATH:
+        lines.append(f"ROUTER_MODEL_PATH    = {ROUTER_MODEL_PATH} (n_ctx={ROUTER_N_CTX}, n_threads={ROUTER_N_THREADS})")
+    else:
+        lines.append("ROUTER_MODEL_PATH    = (not set) — classifier calls use the main model")
+    if REMOTE_LLM_PROVIDER:
+        key_state = "set" if REMOTE_LLM_API_KEY else "MISSING"
+        lines.append(
+            f"REMOTE_LLM_PROVIDER  = {REMOTE_LLM_PROVIDER!r} (model={REMOTE_LLM_MODEL!r}, "
+            f"API key {key_state}) — main answers only, falls back to local on any failure"
+        )
+    else:
+        lines.append("REMOTE_LLM_PROVIDER  = (not set) — main answers use the local model only")
+    lines.append(f"DB_PATH              = {DB_PATH}")
+    lines.append(f"RAG_DATA_DIR         = {RAG_DATA_DIR}")
+    lines.append(f"IMAGE_SERVICE_URL    = {IMAGE_SERVICE_URL}")
+    lines.append("=" * 60)
+    print("\n".join(lines))

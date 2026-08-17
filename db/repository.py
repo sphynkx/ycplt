@@ -168,6 +168,76 @@ def get_file(file_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+# ---------- Birth profiles (AstroZet .zbs import/export) ----------
+# Storage shape is this app's own choice (see db/connection.py's
+# birth_profiles table comment) — utils/astrozet.py is only the boundary
+# format used to import/export these rows as .zbs text.
+def create_birth_profile(profile: Dict[str, Any]) -> int:
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO birth_profiles "
+            "(name, date, time, utc_offset, place, lat, lon, sex, comment, "
+            "photo_path, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                profile["name"],
+                profile["date"],
+                profile.get("time") or "12:00",
+                profile.get("utc_offset"),
+                profile.get("place"),
+                profile["lat"],
+                profile["lon"],
+                profile.get("sex"),
+                profile.get("comment"),
+                profile.get("photo_path"),
+                now,
+                now,
+            ),
+        )
+        return cur.lastrowid
+
+
+def list_birth_profiles() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM birth_profiles ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_birth_profile(profile_id: int) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM birth_profiles WHERE id = ?", (profile_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_birth_profile(profile_id: int, fields: Dict[str, Any]) -> None:
+    """Partial update — only columns present in `fields` are touched.
+    `updated_at` is always bumped."""
+    allowed = {
+        "name", "date", "time", "utc_offset", "place", "lat", "lon",
+        "sex", "comment", "photo_path",
+    }
+    columns = [k for k in fields if k in allowed]
+    if not columns:
+        return
+    set_clause = ", ".join(f"{c} = ?" for c in columns)
+    values = [fields[c] for c in columns]
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE birth_profiles SET {set_clause}, updated_at = ? WHERE id = ?",
+            (*values, time.time(), profile_id),
+        )
+
+
+def delete_birth_profile(profile_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM birth_profiles WHERE id = ?", (profile_id,))
+
+
 def list_files_for_messages(message_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
     """{message_id: [{id, filename, mime_type, size}, ...]} — no BLOB content."""
     if not message_ids:

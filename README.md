@@ -37,10 +37,12 @@ routes/
   conversations.py          — /api/conversations — list/create/history/delete
   files.py                  — /api/files/{id} — download file attachments
   pages.py                  — GET / (browser chat page)
+  profiles.py                — /api/profiles — birth-profile CRUD + AstroZet .zbs import/export
 db/
   connection.py              — SQLite connection, schema, init_db(), migrations
-  repository.py               — CRUD: conversations, messages, files
+  repository.py               — CRUD: conversations, messages, files, birth_profiles
 utils/
+  astrozet.py                 — AstroZet .zbs format: parse/export (see routes/profiles.py)
   config.py                  — all settings, loaded from .env (python-dotenv)
   llm.py                      — loads and calls the GGUF model (llama-cpp-python)
   rag.py                      — optional RAG (FAISS + sentence-transformers)
@@ -430,6 +432,173 @@ generation speed on this CPU for a long, multi-section answer, not
 something either backend can fix. The concurrency benefit (not blocking
 other chats behind one long answer) is still the entire point of this
 backend; it was never meant to make any single answer faster.
+
+### Tiny router model for classification calls (optional, off by default)
+
+Roughly 19 of the 23 call sites that talk to the LLM in this app aren't
+generating a user-facing answer at all — they're one-shot classifiers:
+`tool_router` deciding which tool (if any) to call, `intent` deciding
+whether a message is an edit vs. a question, `horary`/`electional`
+extracting a date/field from free text, and so on. Every one of these
+already used `temperature=0.0` and a tight `max_tokens` (5-400) long
+before this feature existed, because they only ever need a single short
+decision, not prose. Running all of them through the same big answer
+model (Qwen3.5-9B on this hardware) means every tool call pays that
+model's full per-token latency just to produce a one-word or
+one-sentence classification — this is the "router overhead" the app's
+own logs make very visible while a chat is waiting for `tool_router` to
+finish before it can even start the real answer.
+
+`utils/llm.py` now has a second, independent model slot for exactly
+this: `classify_sync()` / `classify_async()`, backed by `_router_llm`,
+loaded by `load_router_llm()` at startup and torn down by
+`close_router_llm()` at shutdown, both called from `app.py`'s lifespan
+next to the main model's own `load_llm()`/`close_llm()`. All 19
+classifier-style call sites now call `classify_sync()`/`classify_async()`
+instead of `generate_sync()`/`generate_async()`; the 4 genuinely
+answer-style sites (the actual chat reply in `routes/chat.py`, the
+per-planet interpretation prose in `utils/interpret.py`, and the image
+caption rephrase in `utils/image_jobs.py`) were deliberately left
+untouched — they need the big model's actual writing quality.
+
+**Off by default, zero risk**: `ROUTER_MODEL_PATH` (see below) is empty
+by default. Whenever it's unset, or set but the file doesn't load for
+any reason, `classify_sync()` transparently falls back to calling
+`generate_sync()` — i.e. today's exact behavior, unchanged. Unlike the
+main model, a bad/missing router model is **never fatal**: `load_router_llm()`
+just logs a warning and moves on. This means the feature can be added to
+a checkout with no configuration changes at all, and turned on later by
+just pointing `ROUTER_MODEL_PATH` at a real file and restarting.
+
+**Always embedded, regardless of `LLM_BACKEND`**: the router model is
+loaded in-process via `llama_cpp.Llama` even when the main model is
+using the separate `llama-server` backend above. A model this small
+gains nothing from llama-server's multi-slot concurrency machinery (the
+whole point of that backend is letting several *long* answers run in
+parallel without blocking each other) — a classification call is single,
+short, and already fast enough that adding a second network hop to a
+separate server process would likely cost more than it saves.
+
+**Choosing a model**: this needs to be small and fast above all else —
+accuracy only matters insofar as it still reliably makes the same
+narrow decisions these prompts already ask for (which tool, edit vs.
+question, yes/no). The recommended, verified model is
+[Qwen2.5-0.5B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF)
+— quantized directly by the Qwen team itself (NOT `unsloth` — an earlier
+draft of this section pointed at a non-existent `unsloth/...` repo; this
+is the real one, confirmed by fetching the page directly). A
+0.49B-parameter model, small enough that the `Q4_K_M` quant
+(`qwen2.5-0.5b-instruct-q4_k_m.gguf`) is only 491 MB and loads/runs
+almost instantly on CPU. The repo's own available quants are `Q2_K`
+(415 MB), `Q3_K_M` (432 MB), `Q4_0`/`Q4_K_M` (~430-491 MB), `Q5_0`/`Q5_K_M`
+(~490-522 MB), `Q6_K` (650 MB), `Q8_0` (676 MB) — there's no `Q1` quant
+offered at all (confirmed on the model page), and a model this small has
+very little redundancy left to cut before it stops reliably following
+instructions, so `Q4_K_M` is a reasonable default rather than chasing the
+smallest file. Download the specific `.gguf` file from that repo's
+"Files and versions" tab and point `YCPLT_ROUTER_MODEL_PATH` at it.
+
+```bash
+YCPLT_ROUTER_MODEL_PATH=models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+YCPLT_ROUTER_N_CTX=8192
+YCPLT_ROUTER_N_THREADS=12
+```
+
+**Important — this line must go in your real `.env`, not just
+`install/.env.example`** (that file is only a template this app never
+reads directly — see "Separate llama-server backend" above for the exact
+same class of mix-up with `YCPLT_LLM_BACKEND`). After setting it, restart
+the app; `utils/llm.py`'s `load_router_llm()` now always prints one of
+three lines at startup so this is never ambiguous again: "ROUTER_MODEL_PATH
+not set" (feature off, using the main model), "ROUTER_MODEL_PATH is set
+but not found" (typo'd path), or "Router model loaded successfully" —
+if you don't see any of these, the app didn't restart with the new
+setting picked up.
+
+`YCPLT_ROUTER_N_CTX` defaults to `8192` — smaller than the main model's
+`N_CTX` (32768), but generous enough for `tool_router`'s own
+history-heavy prompts, which in practice can reach several thousand
+tokens once recent chat history is included. `YCPLT_ROUTER_N_THREADS`
+defaults to this machine's full logical core count (unlike the main
+model's deliberately low `N_THREADS=4` — see "Tuning CPU inference
+threads" above); this is a reasonable starting guess for a model this
+tiny, not something measured on real hardware yet the way the main
+model's thread count was.
+
+Restart the app after changing any of these three — same as every other
+`.env` setting.
+
+### Remote LLM provider for the main answer (optional, off by default)
+
+Separate from the tiny router model above, this lets the **main chat
+answer** (the actual long-form reply — `routes/chat.py`, plus the
+per-planet interpretation prose and image-caption rephrase) be generated
+by an external API instead of the local model, when the local model's
+generation time is a problem (a full RAG-heavy answer can take 18-20+
+minutes on modest CPU hardware — see "Separate llama-server backend"
+above).
+
+**This does NOT affect classifier calls** — `tool_router`, `intent`,
+field extraction, and every other `classify_sync()`/`classify_async()`
+call site (see "Tiny router model" above) always run locally regardless
+of this setting, since routing a one-word classification through a
+network API would only add latency for no benefit.
+
+```bash
+REMOTE_LLM_PROVIDER=openai
+REMOTE_LLM_API_KEY=sk-...
+REMOTE_LLM_MODEL=gpt-4o-mini
+REMOTE_LLM_TIMEOUT_SEC=0
+```
+
+- `REMOTE_LLM_PROVIDER` — empty by default (feature off, local model
+  only). Two supported values: `openai` (OpenAI's `/v1/chat/completions`)
+  or `claude` (Anthropic's own Messages API, `utils/llm.py`'s
+  `_generate_remote_claude` — a genuinely different request/response
+  shape: `x-api-key`/`anthropic-version` headers instead of a bearer
+  token, `max_tokens` is required rather than optional, and the reply
+  comes back as a list of content blocks rather than one message
+  string). The name is deliberately generic (a provider-choice string,
+  not a boolean) so supporting a second provider was just one more
+  accepted value here, not a second, differently-named setting.
+- `REMOTE_LLM_API_KEY` — your OpenAI or Anthropic API key, matching
+  whichever `REMOTE_LLM_PROVIDER` you set. For Claude, generate one at
+  [console.anthropic.com](https://console.anthropic.com) → API Keys; a
+  key created for general inference use works fine here (no special
+  scope is required for the Messages API).
+- `REMOTE_LLM_MODEL` — if unset, defaults to the provider's own fast/cheap
+  model: `gpt-4o-mini` for `openai`, `claude-haiku-4-5` for `claude`.
+  Override explicitly if you want a different model for either provider.
+- `REMOTE_LLM_TIMEOUT_SEC` — `0` (default) means no timeout, matching
+  this app's other network calls.
+
+**Off by default, transparent fallback, never fatal**: exactly the same
+philosophy as the router model. If `REMOTE_LLM_PROVIDER` is unset, the
+main answer is generated locally, same as always. If it's set but the
+call fails for any reason (missing/invalid `REMOTE_LLM_API_KEY`, network
+error, HTTP error from the provider), `utils/llm.py` prints a warning to
+the console and silently falls back to the local model (`LLM_BACKEND`-based,
+embedded or llama-server, whichever is already configured) for that
+generation — the request never errors out to the user because of a
+remote-API problem.
+
+Restart the app after changing any of these — same as every other `.env`
+setting. Startup logging (`log_effective_config()`) prints whether
+`REMOTE_LLM_PROVIDER` is set and whether `REMOTE_LLM_API_KEY` is present
+(as "set"/"MISSING" — the key's actual value is never printed).
+
+**Troubleshooting: OpenAI `429 insufficient_quota`** — if the console
+shows `REMOTE_LLM_PROVIDER=openai call failed (OpenAI API returned HTTP
+429: ... "insufficient_quota" ...)`, this is an account-side billing/quota
+condition on OpenAI's end, not a bug in this app or a malformed request —
+the same error occurs calling OpenAI's own `openai` Python client directly
+with the same key. Check
+[platform.openai.com/settings/billing](https://platform.openai.com/settings/billing)
+for the key's plan/usage tier; a previously-working free-tier key can stop
+working if OpenAI changes free-tier availability. Either way,
+`generate_sync` already falls back to the local model automatically when
+this happens, so a bad/exhausted remote key degrades gracefully rather
+than breaking chat.
 
 ## Installation & Setup
 
@@ -827,6 +996,171 @@ working as a normal chat; `use_rag` simply has no effect (see
 | `GET /api/conversations/{id}/export` | Download a full archive (`.zip`) of one conversation: `conversation.json` (title, timestamps, every message in order) plus every file attachment's raw bytes under `files/`, referenced from the JSON by `archive_path` rather than embedded inline — keeps the JSON dump plain, readable text even for conversations with several images attached. |
 | `DELETE /api/conversations/{id}` | Delete a conversation (cascades to its messages and files). |
 | `GET /api/files/{id}` | Download a file attachment (extracted code, or a generated image). |
+| `GET /api/profiles` | List stored birth profiles (see "Birth profiles: AstroZet .zbs import/export" below). |
+| `POST /api/profiles` | Create one birth profile directly (not via a .zbs file). Body: `{name, date, time?, utc_offset?, place?, lat, lon, sex?, comment?, photo_path?}`. |
+| `GET /api/profiles/{id}` | Fetch one birth profile. 404 if it doesn't exist. |
+| `PATCH /api/profiles/{id}` | Partially update a birth profile — only the fields present in the body are changed. |
+| `DELETE /api/profiles/{id}` | Delete a birth profile. |
+| `POST /api/profiles/import` | Import every record from a .zbs file's text. Body: `{content}` (the raw file text — read client-side, not a multipart upload). Malformed lines don't abort the whole import; response includes both the created profiles and a per-line error list. |
+| `GET /api/profiles/export` | Download every stored profile as one `.zbs` file. |
+| `GET /api/profiles/{id}/export` | Download a single profile as a one-line `.zbs` file. |
+
+## Birth profiles: AstroZet .zbs import/export
+
+**API-only for now** — there's no chat-UI integration for actually *using* a
+saved profile inside a conversation yet (e.g. referencing one by name
+instead of retyping full birth data). That UX wasn't clear enough to design
+yet (a picker? a button next to the composer? a slash-command?) and was
+explicitly parked pending further discussion. What's implemented is the
+bounded, concrete half of the ask: getting real birth data into this app
+from an AstroZet `.zbs` file, and back out again.
+
+**AstroZet** is a third-party Windows astrology program. Its `.zbs` format
+is a semicolon-delimited, one-record-per-line birth-data interchange file —
+plain text, not this app's own storage shape. Per an explicit design
+choice: birth profiles are stored however is convenient for this app (see
+`db/connection.py`'s `birth_profiles` table), and `.zbs` is used only at the
+import/export boundary (`utils/astrozet.py`), not as the internal
+representation.
+
+Line shape, confirmed against a real example:
+
+```
+Name; DD.MM.YYYY; HH:MM:SS; UTC_offset; Place; Lat; Lon; Sex; Comment;
+```
+
+e.g.:
+
+```
+Иван Петров; 15.08.1985; 12:00:00; +4; Винница, Винницкая обл., Украина; 49n14; 28e29; M; Далее комментарий в свободной форме|Значок пайпа обозначает перевод строки|PHOTO: ClosePeople\plysyi.jpg|строка начинающаяся с "PHOTO: " и далее относительный путь к фото;
+```
+
+Field conversions, both directions:
+
+- **Date**: `DD.MM.YYYY` <-> this app's own `'YYYY-MM-DD'` (the shape
+  `utils/astro.py`'s `_build_subject()` expects).
+- **Time**: `HH:MM:SS` on import (seconds are read but not kept — this app
+  only stores `HH:MM`); always re-emitted as `HH:MM:00` on export.
+- **UTC offset** (e.g. `+4`): kept verbatim as a plain string, only so a
+  re-exported `.zbs` round-trips faithfully. It is **never** used to
+  resolve a timezone for the astro engine — that's always
+  `astro._resolve_timezone(lat, lon)`, an offline lookup from coordinates,
+  independent of whatever bare offset the source program recorded (which
+  doesn't account for DST, historical offset changes, etc.).
+- **Lat/Lon**: degrees + hemisphere letter + minutes, no separator (e.g.
+  `49n14` = 49°14'N, `28e29` = 28°29'E) <-> plain signed decimal degrees.
+- **Comment**: `.zbs` uses `|` as a display-newline separator; stored
+  internally as plain text with real newline characters. A segment
+  starting with `PHOTO: ` followed by a relative path is AstroZet's own
+  convention for an attached photo reference and may appear anywhere among
+  the `|`-separated segments (not necessarily last) — `utils/astrozet.py`
+  scans every segment for it rather than assuming a fixed position, and
+  stores it in its own `photo_path` column, separate from the plain
+  comment text. On export, if `photo_path` is set, a `PHOTO: <path>`
+  segment is appended back onto the comment (a legal position per the
+  format's own "may be located anywhere" rule, not necessarily its
+  original one).
+
+Import (`POST /api/profiles/import`) parses every line independently — one
+malformed record (e.g. a typo'd date) doesn't discard the rest of an
+otherwise-valid file; the response returns both the successfully created
+profiles and a per-line `{line, raw, reason}` error list for anything that
+didn't parse. Both a single profile and the full stored list can be
+exported back out as `.zbs` text (`GET /api/profiles/{id}/export` /
+`GET /api/profiles/export`) for re-importing into AstroZet itself.
+
+**Using it today (no browser UI yet — `curl` or any HTTP client):**
+
+Import a `.zbs` file (its raw text goes in the JSON body's `content` field,
+not as a file upload — read the file client-side first):
+
+```bash
+python3 -c "
+import json, sys
+print(json.dumps({'content': open(sys.argv[1], encoding='utf-8').read()}))
+" profiles.zbs > /tmp/import_body.json
+curl -X POST http://localhost:4010/api/profiles/import \
+  -H "Content-Type: application/json" \
+  -d @/tmp/import_body.json
+```
+
+(the small Python one-liner just does the JSON-escaping correctly —
+trying to inline a multi-line `.zbs` file's text directly into a shell
+string is error-prone with real quoting/newlines)
+
+List everything stored:
+
+```bash
+curl http://localhost:4010/api/profiles
+```
+
+Export everything back to one `.zbs` file (e.g. to re-import into AstroZet):
+
+```bash
+curl http://localhost:4010/api/profiles/export -o birth_profiles.zbs
+```
+
+Export a single profile:
+
+```bash
+curl http://localhost:4010/api/profiles/5/export -o profile_5.zbs
+```
+
+### Attaching a .zbs file directly to a chat message
+
+A separate, more direct use of the format: AstroZet users commonly keep
+ONE `.zbs` file per person that holds both that person's own birth-data
+record AND, on separate lines in the same file, their real life events
+(dates of a marriage, a job change, an accident, ...) — comment fields
+hold free-text explanations. That's exactly the input
+`astro_rectification_events` already wants (an approximate birth time to
+refine, plus a list of life events to test candidate times against), so
+such a file can be attached directly to a chat message instead of typing
+all of that out as prose.
+
+`ChatRequest` accepts an optional `zbs_data` field (the raw `.zbs` file
+TEXT — not base64, since it's already plain text) alongside the normal
+`query`:
+
+```bash
+curl -X POST http://localhost:4010/chat \
+  -H "Content-Type: application/json" \
+  -d "$(python3 -c "
+import json
+print(json.dumps({
+    'query': 'Сделай ректификацию для этого человека по приложенным событиям',
+    'zbs_data': open('ivan_with_events.zbs', encoding='utf-8').read(),
+}))
+")"
+```
+
+**Heuristic for telling the subject apart from events within one file**
+(confirmed with the user — AstroZet's own files don't mark this
+explicitly): the FIRST record in the file is the subject; every record
+after it is either a life event (rectification) or a second person
+(synastry) — see `utils/astrozet.zbs_profiles_to_spec_text`'s own
+docstring. Which interpretation actually applies depends entirely on
+which tool `tool_router` picks for the message's own typed instruction —
+this function doesn't try to guess that itself; it emits data for BOTH
+interpretations at once (a plain `name=...;date=...;lat=...;lon=...` line
+for the first profile, the same data again as `_a`/`_b`-suffixed keys for
+the first two profiles, and one semicolon-formatted event line per
+remaining profile) and lets whichever technique's own extraction code
+pick out only what it understands — the same "hand every candidate
+source to extraction, let each field's own resolver find what it needs"
+approach `astro._extract_fields`'s own docstring already describes for
+combining the typed message + the router's own transcription + prior
+conversation history. A `.zbs` attachment is simply one more candidate
+source, folded in the same way (`routes/chat.py`'s `zbs_context_text`) —
+it does NOT alter the user's own typed `query`, which is still what's
+shown/stored in the chat history; the raw `.zbs` text is instead stored
+as its own downloadable file attachment on that message, the same
+visibility an attached image already gets.
+
+Works today via this JSON field — there's no dedicated "attach a .zbs"
+button in the browser UI yet (the composer's 📎 button is still
+image-only); that's a natural next step if this proves useful in
+practice.
 
 ## Automatic image request routing
 
@@ -2508,3 +2842,10 @@ it.
   side already supports a mask (`mode="inpaint"`, see ycplt_img's own
   README), but nothing in the browser UI produces one yet; today an
   attached-image edit is always a whole-image img2img instruction.
+- Chat-UI integration for birth profiles — import/export against the
+  AstroZet `.zbs` format is implemented (see "Birth profiles" above), but
+  there's no browser UI yet for actually *using* a saved profile inside a
+  conversation (e.g. referencing one by name instead of retyping full
+  birth data each time). Deliberately parked: it's unclear whether that
+  should be a picker, a button next to the composer, a slash-command, or
+  something else, and this needs more thought before building it.
