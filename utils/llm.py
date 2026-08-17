@@ -603,15 +603,18 @@ def load_router_llm():
     global _router_llm
 
     if not config.ROUTER_MODEL_PATH:
-        # Deliberately printed even in the "off" case — a real, reported
-        # mix-up during testing: with no startup line either way, there
-        # was no way to tell from the console whether ROUTER_MODEL_PATH
-        # had actually taken effect or was silently still empty (e.g. set
-        # in install/.env.example, a template file this app never reads,
-        # instead of the real .env — the same class of mistake as the
-        # earlier YCPLT_LLM_BACKEND prefix mix-up, see README's "Separate
-        # llama-server backend" section).
-        print("[llm] ROUTER_MODEL_PATH not set — classifier calls use the main model (this is the default).")
+        # Only reached via an explicit opt-out (YCPLT_ROUTER_MODEL_PATH=""
+        # in the real .env) — config.ROUTER_MODEL_PATH otherwise always
+        # resolves to a real path (the documented default download
+        # location if unset). Deliberately printed either way — a real,
+        # reported mix-up during testing: with no startup line, there was
+        # no way to tell from the console whether a config change had
+        # actually taken effect (e.g. edited in install/.env.example, a
+        # template file this app never reads, instead of the real .env —
+        # the same class of mistake as the earlier YCPLT_LLM_BACKEND
+        # prefix mix-up, see README's "Separate llama-server backend"
+        # section).
+        print("[llm] ROUTER_MODEL_PATH explicitly disabled — classifier calls use the main model.")
         return None
 
     from llama_cpp import Llama

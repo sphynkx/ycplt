@@ -433,7 +433,7 @@ something either backend can fix. The concurrency benefit (not blocking
 other chats behind one long answer) is still the entire point of this
 backend; it was never meant to make any single answer faster.
 
-### Tiny router model for classification calls (optional, off by default)
+### Tiny router model for classification calls (on by default once downloaded)
 
 Roughly 19 of the 23 call sites that talk to the LLM in this app aren't
 generating a user-facing answer at all — they're one-shot classifiers:
@@ -461,14 +461,20 @@ per-planet interpretation prose in `utils/interpret.py`, and the image
 caption rephrase in `utils/image_jobs.py`) were deliberately left
 untouched — they need the big model's actual writing quality.
 
-**Off by default, zero risk**: `ROUTER_MODEL_PATH` (see below) is empty
-by default. Whenever it's unset, or set but the file doesn't load for
-any reason, `classify_sync()` transparently falls back to calling
-`generate_sync()` — i.e. today's exact behavior, unchanged. Unlike the
-main model, a bad/missing router model is **never fatal**: `load_router_llm()`
-just logs a warning and moves on. This means the feature can be added to
-a checkout with no configuration changes at all, and turned on later by
-just pointing `ROUTER_MODEL_PATH` at a real file and restarting.
+**On by default once the recommended model is downloaded, zero risk
+either way**: `ROUTER_MODEL_PATH` (see below) defaults to the exact path
+this section tells you to download the recommended model to
+(`models/qwen2.5-0.5b-instruct-q4_k_m.gguf`) — a checkout that follows
+the install steps below gets the router active automatically, with no
+`.env` editing required. If that file isn't there yet (a from-scratch
+checkout, or you simply haven't downloaded it), or it's set but fails to
+load for any reason, `classify_sync()` transparently falls back to
+calling `generate_sync()` — i.e. every classifier call just uses the
+main model, same as before this feature existed. Unlike the main model,
+a bad/missing router model is **never fatal**: `load_router_llm()` just
+logs a warning and moves on. To opt out entirely — even if the file
+exists — set `YCPLT_ROUTER_MODEL_PATH=""` explicitly (empty, but present)
+in your real `.env`.
 
 **Always embedded, regardless of `LLM_BACKEND`**: the router model is
 loaded in-process via `llama_cpp.Llama` even when the main model is
@@ -496,24 +502,29 @@ offered at all (confirmed on the model page), and a model this small has
 very little redundancy left to cut before it stops reliably following
 instructions, so `Q4_K_M` is a reasonable default rather than chasing the
 smallest file. Download the specific `.gguf` file from that repo's
-"Files and versions" tab and point `YCPLT_ROUTER_MODEL_PATH` at it.
+"Files and versions" tab and place it at `models/qwen2.5-0.5b-instruct-q4_k_m.gguf`
+(relative to the project root) — that's `ROUTER_MODEL_PATH`'s own default,
+so no `.env` change is needed once the file is there. Only set
+`YCPLT_ROUTER_MODEL_PATH` explicitly if you want a different file/location,
+or `""` (empty) to opt out of the router model entirely.
 
 ```bash
-YCPLT_ROUTER_MODEL_PATH=models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+# Only needed to override the default path, or to opt out with "":
+# YCPLT_ROUTER_MODEL_PATH=models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 YCPLT_ROUTER_N_CTX=8192
 YCPLT_ROUTER_N_THREADS=12
 ```
 
-**Important — this line must go in your real `.env`, not just
-`install/.env.example`** (that file is only a template this app never
-reads directly — see "Separate llama-server backend" above for the exact
-same class of mix-up with `YCPLT_LLM_BACKEND`). After setting it, restart
-the app; `utils/llm.py`'s `load_router_llm()` now always prints one of
-three lines at startup so this is never ambiguous again: "ROUTER_MODEL_PATH
-not set" (feature off, using the main model), "ROUTER_MODEL_PATH is set
-but not found" (typo'd path), or "Router model loaded successfully" —
-if you don't see any of these, the app didn't restart with the new
-setting picked up.
+**Startup logging makes this unambiguous either way** — `utils/llm.py`'s
+`load_router_llm()` always prints one of: "ROUTER_MODEL_PATH is set but
+not found" (the default file hasn't been downloaded yet, or a custom path
+is wrong — classifier calls fall back to the main model), "Router model
+loaded successfully", or "(explicitly disabled)" if you set
+`YCPLT_ROUTER_MODEL_PATH=""`. If you change `YCPLT_ROUTER_N_CTX`/
+`YCPLT_ROUTER_N_THREADS`, that goes in your real `.env`, not just
+`install/.env.example` (that file is only a template this app never reads
+directly — see "Separate llama-server backend" above for the exact same
+class of mix-up with `YCPLT_LLM_BACKEND`) — restart the app afterward.
 
 `YCPLT_ROUTER_N_CTX` defaults to `8192` — smaller than the main model's
 `N_CTX` (32768), but generous enough for `tool_router`'s own

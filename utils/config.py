@@ -134,7 +134,31 @@ REPEAT_PENALTY = float(os.environ.get("REPEAT_PENALTY", "1.15"))
 # concurrency machinery (it's already close to instant), so it isn't
 # worth this module's dual-backend complexity for a component whose whole
 # point is being fast and lightweight.
-ROUTER_MODEL_PATH = os.environ.get("YCPLT_ROUTER_MODEL_PATH", "").strip()
+#
+# Defaults to the exact path README's "Tiny router model" section tells
+# you to download the recommended model to — a fresh checkout that
+# follows the documented install steps (download the model, drop it at
+# this path) gets the router active with zero .env editing required, the
+# same way MODEL_PATH's own default assumes the documented model has been
+# downloaded to models/. This is NOT the same thing as inventing a hidden
+# default for an unrelated/undocumented setting — the file this points at
+# is spelled out in the docs, so "the default is accurate" only holds
+# because the install steps make it true. If the file isn't there yet
+# (not downloaded, or a completely from-scratch checkout with no models/
+# populated), load_router_llm() below degrades gracefully exactly like any
+# other missing/bad router model file: a clear startup warning, then a
+# transparent fallback to the main model — never fatal.
+#
+# Set YCPLT_ROUTER_MODEL_PATH="" explicitly (present in .env but empty) to
+# opt back OUT of the router model entirely — distinct from leaving the
+# variable unset, which now means "use the documented default path above".
+_raw_router_model_path = os.environ.get("YCPLT_ROUTER_MODEL_PATH")
+if _raw_router_model_path is not None and _raw_router_model_path.strip() == "":
+    ROUTER_MODEL_PATH = ""
+else:
+    ROUTER_MODEL_PATH = _resolve_path(
+        "YCPLT_ROUTER_MODEL_PATH", "models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    )
 # A few classifier calls (tool_router's own tool-selection call in
 # particular) include real conversation history and can reach several
 # thousand tokens in practice — keep enough headroom that switching to a
@@ -426,9 +450,13 @@ def log_effective_config() -> None:
         lines.append(f"  LLAMA_SERVER_URL   = {LLAMA_SERVER_URL}")
         lines.append(f"  LLAMA_SERVER_TIMEOUT_SEC = {LLAMA_SERVER_TIMEOUT_SEC} (0 = disabled)")
     if ROUTER_MODEL_PATH:
-        lines.append(f"ROUTER_MODEL_PATH    = {ROUTER_MODEL_PATH} (n_ctx={ROUTER_N_CTX}, n_threads={ROUTER_N_THREADS})")
+        _router_file_state = "" if os.path.exists(ROUTER_MODEL_PATH) else " — FILE NOT FOUND, will fall back to the main model"
+        lines.append(
+            f"ROUTER_MODEL_PATH    = {ROUTER_MODEL_PATH} (n_ctx={ROUTER_N_CTX}, "
+            f"n_threads={ROUTER_N_THREADS}){_router_file_state}"
+        )
     else:
-        lines.append("ROUTER_MODEL_PATH    = (not set) — classifier calls use the main model")
+        lines.append("ROUTER_MODEL_PATH    = (explicitly disabled) — classifier calls use the main model")
     if REMOTE_LLM_PROVIDER:
         key_state = "set" if REMOTE_LLM_API_KEY else "MISSING"
         lines.append(
